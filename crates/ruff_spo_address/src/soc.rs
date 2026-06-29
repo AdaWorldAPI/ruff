@@ -39,6 +39,11 @@ pub const MAX_SIBLINGS_PER_TIER: usize = u8::MAX as usize;
 /// inherited — don't lock a `[u64; 4]` "quadruplet"; `D` is class-conditioned.)
 pub const FIELD_MASK_CAP: usize = MAX_SIBLINGS_PER_TIER;
 
+/// God-object threshold: a class with this many members (or more) overflows the
+/// per-tier `u8` rank and **triggers SoC branching** (decompose, don't widen).
+/// Equals `MAX_SIBLINGS_PER_TIER + 1` (255 representable → the 256th overflows).
+pub const GOD_OBJECT_MEMBERS: usize = MAX_SIBLINGS_PER_TIER + 1; // 256
+
 /// The verdict for a class whose sibling set exceeds [`MAX_SIBLINGS_PER_TIER`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SocVerdict {
@@ -104,7 +109,7 @@ pub fn soc_findings(triples: &[Triple]) -> Vec<SocFinding> {
 
     let mut out = Vec::new();
     for (class, members) in &members_by_class {
-        if members.len() <= MAX_SIBLINGS_PER_TIER {
+        if members.len() < GOD_OBJECT_MEMBERS {
             continue;
         }
         let funcs = members.iter().filter(|(_, is_fn)| *is_fn).count();
@@ -157,6 +162,77 @@ pub fn law_holds(triples: &[Triple]) -> bool {
     soc_findings(triples)
         .iter()
         .all(|f| f.verdict != SocVerdict::Counterexample)
+}
+
+/// One SoC-clean branch a god object decomposes into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocBranch {
+    /// `has_field` data → one masked `ClassView` (the distinct types fit one `FieldMask`).
+    DataView { fields: usize, distinct_types: usize },
+    /// `has_field` data whose distinct types exceed `FIELD_MASK_CAP` → paginate
+    /// into `views` `ClassView`s via the class hierarchy.
+    PaginatedDataView { fields: usize, distinct_types: usize, views: usize },
+    /// `has_function` behaviour → `ActionDef`s rooted in reusable OGAR adapters
+    /// (the logic is extracted as ontology, not reimplemented per class).
+    BehaviourActions { funcs: usize },
+}
+
+/// A god object (`>= GOD_OBJECT_MEMBERS`) and the branches it decomposes into.
+#[derive(Debug, Clone)]
+pub struct SocPlan {
+    /// The over-cap class IRI.
+    pub class: String,
+    /// Total members.
+    pub members: usize,
+    /// The classification that motivated the branching.
+    pub verdict: SocVerdict,
+    /// The SoC-clean branches: data → `ClassView`(s), behaviour → `ActionDef`s.
+    pub branches: Vec<SocBranch>,
+}
+
+/// **SoC branching.** For every god object (`>= GOD_OBJECT_MEMBERS` members),
+/// emit the decomposition plan instead of merely classifying it:
+///
+/// - `has_field` data → a [`SocBranch::DataView`] (one masked `ClassView`) if its
+///   distinct `field_type`s fit one `FieldMask`, else a
+///   [`SocBranch::PaginatedDataView`] across `ceil(distinct / FIELD_MASK_CAP)`
+///   views (paginate via class hierarchy);
+/// - `has_function` behaviour → a [`SocBranch::BehaviourActions`] (ActionDefs
+///   rooted in reusable OGAR adapters — logic extracted as ontology).
+///
+/// This is the data⊥behaviour split the `Conflation` verdict names, made
+/// executable: branch, never widen.
+#[must_use]
+pub fn soc_branches(triples: &[Triple]) -> Vec<SocPlan> {
+    soc_findings(triples)
+        .into_iter()
+        .map(|f| {
+            let mut branches = Vec::new();
+            if f.data > 0 {
+                if f.distinct_field_types <= FIELD_MASK_CAP {
+                    branches.push(SocBranch::DataView {
+                        fields: f.data,
+                        distinct_types: f.distinct_field_types,
+                    });
+                } else {
+                    branches.push(SocBranch::PaginatedDataView {
+                        fields: f.data,
+                        distinct_types: f.distinct_field_types,
+                        views: f.distinct_field_types.div_ceil(FIELD_MASK_CAP),
+                    });
+                }
+            }
+            if f.funcs > 0 {
+                branches.push(SocBranch::BehaviourActions { funcs: f.funcs });
+            }
+            SocPlan {
+                class: f.class,
+                members: f.members,
+                verdict: f.verdict,
+                branches,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -308,6 +384,48 @@ mod tests {
         let god = soc_findings(&mk(FIELD_MASK_CAP + 1));
         assert_eq!(god[0].distinct_field_types, FIELD_MASK_CAP + 1);
         assert_eq!(god[0].verdict, SocVerdict::Counterexample);
+    }
+
+    #[test]
+    fn conflation_god_object_branches_data_and_behaviour() {
+        let mut tr = Vec::new();
+        for i in 0..200 {
+            let m = format!("F.f{i}");
+            tr.push(t("F", "has_field", &m));
+            tr.push(t(&m, "field_type", "str"));
+        }
+        for i in 0..100 {
+            tr.push(t("F", "has_function", &format!("F.fn{i}")));
+        }
+        let plans = soc_branches(&tr);
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].branches.contains(&SocBranch::DataView { fields: 200, distinct_types: 1 }));
+        assert!(plans[0].branches.contains(&SocBranch::BehaviourActions { funcs: 100 }));
+    }
+
+    #[test]
+    fn wide_data_god_object_paginates_views() {
+        let mut tr = Vec::new();
+        for i in 0..300 {
+            let m = format!("P.f{i}");
+            tr.push(t("P", "has_field", &m));
+            tr.push(t(&m, "field_type", &format!("T{i}")));
+        }
+        let plans = soc_branches(&tr);
+        assert_eq!(
+            plans[0].branches,
+            vec![SocBranch::PaginatedDataView {
+                fields: 300,
+                distinct_types: 300,
+                views: 300usize.div_ceil(FIELD_MASK_CAP),
+            }]
+        );
+    }
+
+    #[test]
+    fn under_threshold_yields_no_plan() {
+        let tr = vec![t("S", "has_field", "S.a"), t("S.a", "field_type", "i32")];
+        assert!(soc_branches(&tr).is_empty());
     }
 
     #[test]
