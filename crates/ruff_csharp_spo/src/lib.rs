@@ -25,7 +25,10 @@
 //! bug surfaces as a hard [`ParseError`] (line + offending predicate) rather
 //! than silent drift into the store.
 
+mod schema;
+
 pub use ruff_spo_triplet::{ParseError, Predicate, Triple, from_ndjson};
+pub use schema::{SQL_COLUMN_TYPES, SchemaReport, extract_schema};
 
 /// The default IRI namespace prefix every C# subject/object carries, e.g.
 /// `csharp:Invoice` / `csharp:Invoice.number`. Mirrors `ruff_cpp_spo`'s

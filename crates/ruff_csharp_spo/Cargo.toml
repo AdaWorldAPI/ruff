@@ -13,5 +13,9 @@ name = "ruff_csharp_spo"
 [dependencies]
 ruff_spo_triplet = { workspace = true }
 
+[dev-dependencies]
+# End-to-end address test: schema-stratum fields -> expand -> mint_factored.
+ruff_spo_address = { path = "../ruff_spo_address" }
+
 [lints]
 workspace = true
