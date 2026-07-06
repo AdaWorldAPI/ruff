@@ -167,6 +167,9 @@ fn walk_class_body_for_defs(
                 writes: Vec::new(),
                 calls: Vec::new(),
                 guarded_writes: Vec::new(),
+                // Odoo-decorator facts — no Ruby source; always empty here.
+                constrains: Vec::new(),
+                onchange: Vec::new(),
             };
             if let Some(fn_body) = d.body.as_deref() {
                 walk_method_body(fn_body, known_relations, &mut func);
