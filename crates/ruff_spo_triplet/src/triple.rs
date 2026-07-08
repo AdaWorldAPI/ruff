@@ -510,6 +510,22 @@ pub enum Predicate {
     /// nodes via its private config map. **Default tier is
     /// [`Provenance::Inferred`]**.
     SelectsView,
+
+    /// `(screen, invokes_action, "<resource>#<member_action>")` — a **mutating
+    /// UI action affordance**: a button/link that triggers a non-GET HTTP verb
+    /// (a Rails `button_to`, or `link_to … method: :patch|:put|:delete|:post`,
+    /// or a form submit), as opposed to a plain [`Self::NavigatesTo`] GET link.
+    /// The object names the ACTION the affordance invokes (the route helper's
+    /// resource + member-action stem, e.g. `work_package#complete`), NOT a
+    /// screen — the same discipline as [`Self::SelectsView`]: it keeps
+    /// `navigates_to` a pure screen→screen graph and gives codegen a distinct
+    /// "emit a button" affordance separate from "emit a link". The HTTP verb
+    /// rides the harvested edge struct (frontend-side), not the SPO object, so
+    /// the object stays a stable action identifier. **Default tier is
+    /// [`Provenance::Inferred`]**: syntax-only ERB scan (the verb is read from
+    /// the `method:` kwarg / `button_to` default, not resolved through the
+    /// router).
+    InvokesAction,
 }
 
 impl Predicate {
@@ -590,6 +606,7 @@ impl Predicate {
             // UI-navigation plane
             Self::NavigatesTo => "navigates_to",
             Self::SelectsView => "selects_view",
+            Self::InvokesAction => "invokes_action",
         }
     }
 
@@ -676,6 +693,7 @@ impl Predicate {
             // UI-navigation plane
             "navigates_to" => Self::NavigatesTo,
             "selects_view" => Self::SelectsView,
+            "invokes_action" => Self::InvokesAction,
             _ => return None,
         })
     }
@@ -761,6 +779,7 @@ impl Predicate {
         // UI-navigation plane
         Self::NavigatesTo,
         Self::SelectsView,
+        Self::InvokesAction,
     ];
 
     /// The default provenance tier for this predicate, per the Odoo
@@ -812,7 +831,8 @@ impl Predicate {
             // UI-navigation: syntax-only form-open detection; the two-statement
             // local-tracking case is heuristic (SemanticModel would resolve it).
             | Self::NavigatesTo
-            | Self::SelectsView => Provenance::Inferred,
+            | Self::SelectsView
+            | Self::InvokesAction => Provenance::Inferred,
             // C++ machine-plane declarative surface (the 10 remaining of 13)
             Self::InheritsFrom
             | Self::HasField
@@ -974,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_count_locked_at_66() {
+    fn predicate_count_locked_at_67() {
         // The exact count is part of the schema contract: 7 core (Odoo
         // Python) + 32 OpenProject AR-shape (PR #15 added
         // `association_kind`; #18 added `class_name`; #21 added
@@ -1001,9 +1021,15 @@ mod tests {
         // assignment; the object is a tab/page FIELD, not a screen, split out
         // of `navigates_to` so the screen→screen graph never carries dangling
         // non-screen nodes; codex P2 on #64) = 66.
+        // + 1 UI-action plane (`invokes_action` — a mutating button/link
+        // affordance (`button_to` / `link_to method:` / form submit); the
+        // object names the ACTION (resource#member), not a screen, split out
+        // of `navigates_to` for the same reason `selects_view` is: a button is
+        // not a GET link, and codegen emits it differently. Ruby ERB arm,
+        // sibling of the field-set + nav arms) = 67.
         // Council review of any new variant means this number changes — the
         // test must change with the source.
-        assert_eq!(Predicate::ALL.len(), 66);
+        assert_eq!(Predicate::ALL.len(), 67);
     }
 
     #[test]

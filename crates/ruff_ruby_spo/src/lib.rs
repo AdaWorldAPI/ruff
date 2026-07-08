@@ -34,6 +34,7 @@ use ruff_spo_triplet::{
     Function, GemDsl, Model, ModelGraph, ScopeDecl, StiInfo, UsingRef, Validation,
 };
 
+mod actions;
 mod functions;
 mod navigation;
 mod parse;
@@ -42,6 +43,10 @@ mod schema;
 mod views;
 mod walk;
 
+pub use actions::{
+    ActionScanReport, ActionVerb, RubyActionEdge, extract_action_edges,
+    extract_action_edges_with_report,
+};
 pub use navigation::{
     NavScanReport, NavShape, NavVocab, RubyNavEdge, extract_nav_edges,
     extract_nav_edges_with_report,
