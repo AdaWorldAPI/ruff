@@ -497,6 +497,19 @@ pub enum Predicate {
     /// `var f = new T(); …; f.Show();` local-tracking is heuristic (a
     /// `SemanticModel` upgrade would resolve the receiver's type authoritatively).
     NavigatesTo,
+
+    /// `(class, selects_view, tab_field)` — a UI-selector navigation: the class
+    /// activates a named tab/page/view by ASSIGNING a navigation-selector
+    /// property (e.g. DevExpress `ribbon.SelectedRibbonTabItem = tab_x`). The
+    /// object is the **selector value** (a tab/page field), deliberately NOT a
+    /// screen class — keeping [`Predicate::NavigatesTo`] a pure screen→screen
+    /// graph (codex P2 on #64: selector values as `navigates_to` targets would
+    /// pollute the screen graph with dangling non-screen nodes). Syntax-only
+    /// harvesting cannot resolve which screen a tab shows (that wiring lives in
+    /// Designer code / runtime); the consumer bridges selector values to screen
+    /// nodes via its private config map. **Default tier is
+    /// [`Provenance::Inferred`]**.
+    SelectsView,
 }
 
 impl Predicate {
@@ -576,6 +589,7 @@ impl Predicate {
             Self::ColumnNotNull => "column_not_null",
             // UI-navigation plane
             Self::NavigatesTo => "navigates_to",
+            Self::SelectsView => "selects_view",
         }
     }
 
@@ -661,6 +675,7 @@ impl Predicate {
             "column_not_null" => Self::ColumnNotNull,
             // UI-navigation plane
             "navigates_to" => Self::NavigatesTo,
+            "selects_view" => Self::SelectsView,
             _ => return None,
         })
     }
@@ -745,6 +760,7 @@ impl Predicate {
         Self::ColumnNotNull,
         // UI-navigation plane
         Self::NavigatesTo,
+        Self::SelectsView,
     ];
 
     /// The default provenance tier for this predicate, per the Odoo
@@ -795,7 +811,8 @@ impl Predicate {
             | Self::Calls
             // UI-navigation: syntax-only form-open detection; the two-statement
             // local-tracking case is heuristic (SemanticModel would resolve it).
-            | Self::NavigatesTo => Provenance::Inferred,
+            | Self::NavigatesTo
+            | Self::SelectsView => Provenance::Inferred,
             // C++ machine-plane declarative surface (the 10 remaining of 13)
             Self::InheritsFrom
             | Self::HasField
@@ -957,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_count_locked_at_65() {
+    fn predicate_count_locked_at_66() {
         // The exact count is part of the schema contract: 7 core (Odoo
         // Python) + 32 OpenProject AR-shape (PR #15 added
         // `association_kind`; #18 added `class_name`; #21 added
@@ -980,9 +997,13 @@ mod tests {
         // + 1 UI-navigation plane (`navigates_to` — the WinForms form→form
         // Klickweg edge; the "form→route" the README anticipates, feeding the
         // OGAR EdgeBlock nav graph + the consumer 1:1 connectivity check) = 65.
+        // + 1 UI-selector plane (`selects_view` — ribbon/tab selector
+        // assignment; the object is a tab/page FIELD, not a screen, split out
+        // of `navigates_to` so the screen→screen graph never carries dangling
+        // non-screen nodes; codex P2 on #64) = 66.
         // Council review of any new variant means this number changes — the
         // test must change with the source.
-        assert_eq!(Predicate::ALL.len(), 65);
+        assert_eq!(Predicate::ALL.len(), 66);
     }
 
     #[test]

@@ -72,13 +72,13 @@ namespace NavShapes
 
     // Ribbon/tab selector idiom: navigate by assigning a nav-selector property
     // (the panel-swap top-nav — no `.Show()`, no `new Screen()`).
-    //   RibbonHost -> tab_reports   (ribbon.SelectedRibbonTabItem = tab_reports)
+    //   RibbonHost -selects_view-> tab_reports  (ribbon.SelectedRibbonTabItem = ...)
     // A non-selector property (`SelectedIndex`) must NOT emit an edge.
     public class RibbonHost : Form
     {
         private void Nav_Click(object sender, EventArgs e)
         {
-            ribbon.SelectedRibbonTabItem = tab_reports;  // -> navigates_to tab_reports
+            ribbon.SelectedRibbonTabItem = tab_reports;  // -> selects_view tab_reports
             combo.SelectedIndex = fallbackIndex;          // SelectedIndex not a nav selector: NO edge
         }
     }
