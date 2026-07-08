@@ -35,12 +35,17 @@ use ruff_spo_triplet::{
 };
 
 mod functions;
+mod navigation;
 mod parse;
 mod representers;
 mod schema;
 mod views;
 mod walk;
 
+pub use navigation::{
+    NavScanReport, NavShape, NavVocab, RubyNavEdge, extract_nav_edges,
+    extract_nav_edges_with_report,
+};
 pub use representers::{RepresenterDecl, RepresenterFieldSet, extract_representer_field_sets};
 pub use schema::{SchemaReport, extract_app_with_schema};
 pub use views::{
