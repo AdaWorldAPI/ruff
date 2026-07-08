@@ -146,10 +146,10 @@ mod tests {
             "\n",
             r#"{"s":"csharp:HostControl","p":"navigates_to","o":"csharp:ChildControl","f":1.0,"c":0.9}"#,
             "\n",
-            r#"{"s":"csharp:RibbonHost","p":"navigates_to","o":"csharp:tab_reports","f":1.0,"c":0.9}"#,
+            r#"{"s":"csharp:RibbonHost","p":"selects_view","o":"csharp:tab_reports","f":1.0,"c":0.9}"#,
             "\n",
         );
-        let triples = load(ndjson).expect("navigates_to is in the closed vocab");
+        let triples = load(ndjson).expect("navigates_to + selects_view are in the closed vocab");
         assert_eq!(triples.len(), 5);
         assert_eq!(triples[0].p, "navigates_to");
         assert_eq!(triples[0].s, "csharp:MainScreen");
@@ -157,7 +157,10 @@ mod tests {
         // the UserControl-SPA edge (field-instantiation, no .Show())
         assert_eq!(triples[3].s, "csharp:HostControl");
         assert_eq!(triples[3].o, "csharp:ChildControl");
-        // the ribbon/tab selector-assignment edge (X.SelectedRibbonTabItem = tab)
+        // the ribbon/tab selector-assignment fact: the object is a tab FIELD,
+        // not a screen, so it rides `selects_view` — `navigates_to` stays a
+        // pure screen→screen graph (codex P2 on #64).
+        assert_eq!(triples[4].p, "selects_view");
         assert_eq!(triples[4].s, "csharp:RibbonHost");
         assert_eq!(triples[4].o, "csharp:tab_reports");
     }

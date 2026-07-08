@@ -491,11 +491,14 @@ static void EmitNavArm(
     // where <NavProp> is a configured navigation selector (default
     // SelectedRibbonTabItem / SelectedTabPage / SelectedPage / SelectedTab). The
     // target is the assigned identifier (the tab/page field, e.g. a DevExpress
-    // RibbonTabItem), NOT a screen class — so it is emitted directly, not gated
-    // on `screenTypes`. This captures the top-level nav a panel-swap shell wires
-    // through the ribbon, which neither the `.Show()` nor the instantiation pass
-    // sees. Only a bare-identifier RHS is taken (an index literal / expression
-    // is a mode toggle, not a named destination).
+    // RibbonTabItem), NOT a screen class — so it is emitted as `selects_view`,
+    // never `navigates_to` (codex P2 on #64): `navigates_to` stays a pure
+    // screen→screen graph, and selector VALUES live on their own predicate so
+    // the screen graph never carries dangling non-screen nodes. Syntax-only
+    // cannot resolve which screen a tab shows (Designer/runtime wiring); the
+    // consumer bridges selector values to screen nodes via its config map.
+    // Only a bare-identifier RHS is taken (an index literal / expression is a
+    // mode toggle, not a named destination).
     foreach (var asgn in root.DescendantNodesAndSelf().OfType<AssignmentExpressionSyntax>())
     {
         if (asgn.Left is not MemberAccessExpressionSyntax lhs
@@ -509,7 +512,7 @@ static void EmitNavArm(
         {
             continue;
         }
-        triples.Add(new Triple($"{ns}:{className}", "navigates_to", $"{ns}:{target}", f, c));
+        triples.Add(new Triple($"{ns}:{className}", "selects_view", $"{ns}:{target}", f, c));
     }
 }
 
