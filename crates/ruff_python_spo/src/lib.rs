@@ -46,8 +46,13 @@ use ruff_python_ast::Expr;
 use ruff_spo_triplet::{Field, Function, Model, ModelGraph};
 
 mod functions;
+mod navigation;
 mod parse;
 mod walk;
+
+pub use navigation::{
+    NavScanReport, NavVocab, PyNavEdge, extract_nav_edges, extract_nav_edges_with_report,
+};
 
 /// The IRI namespace prefix for every Odoo subject/object.
 pub const NAMESPACE: &str = "odoo";
