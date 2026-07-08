@@ -54,6 +54,14 @@ var ns = "csharp";
 var mutatorNames = new HashSet<string>(defaultMutatorNames, StringComparer.Ordinal);
 var mutatorPrefixes = new List<string>();
 var mutatorReceivers = new List<string>();
+// Navigation-selector property names: an assignment `X.<Prop> = target` where
+// <Prop> is one of these is a nav edge to `target` (the ribbon/tab-swap idiom,
+// e.g. DevExpress `ribbon.SelectedRibbonTabItem = menu_tab_X`). Configurable so
+// a bespoke shell can add its own selector; the default set is the common
+// WinForms/DevExpress ones.
+var navSelectProps = new HashSet<string>(
+    new[] { "SelectedRibbonTabItem", "SelectedTabPage", "SelectedPage", "SelectedTab" },
+    StringComparer.Ordinal);
 var positional = new List<string>();
 
 for (var i = 0; i < args.Length; i++)
@@ -72,6 +80,9 @@ for (var i = 0; i < args.Length; i++)
         case "--mutator-receivers" when i + 1 < args.Length:
             mutatorReceivers = SplitCsv(args[++i]);
             break;
+        case "--nav-select-props" when i + 1 < args.Length:
+            navSelectProps = new HashSet<string>(SplitCsv(args[++i]), StringComparer.Ordinal);
+            break;
         default:
             positional.Add(args[i]);
             break;
@@ -83,7 +94,7 @@ if (positional.Count < 1)
     Console.Error.WriteLine(
         "usage: csharp-spo-harvest <source-root> [out.ndjson] " +
         "[--ns <name>] [--mutator-names a,b,c] [--mutator-prefixes add_,del_] " +
-        "[--mutator-receivers mysql]");
+        "[--mutator-receivers mysql] [--nav-select-props SelectedRibbonTabItem,SelectedTab]");
     return 2;
 }
 
@@ -228,7 +239,7 @@ foreach (var rootNode in parsed)
                         // edge (navigates_to). Subject is the CLASS that
                         // navigates (not the method), so a screen's edges are
                         // the union over all its handlers.
-                        EmitNavArm(triples, ns, name, m.Body, m.ExpressionBody, screenTypes, f, c);
+                        EmitNavArm(triples, ns, name, m.Body, m.ExpressionBody, screenTypes, navSelectProps, f, c);
                         break;
                     }
 
@@ -397,6 +408,7 @@ static void EmitNavArm(
     BlockSyntax? body,
     ArrowExpressionClauseSyntax? expressionBody,
     HashSet<string> screenTypes,
+    HashSet<string> navSelectProps,
     double f,
     double c)
 {
@@ -469,6 +481,31 @@ static void EmitNavArm(
     {
         var target = BareName(oce.Type);
         if (target == className || !screenTypes.Contains(target) || !seen.Add(target))
+        {
+            continue;
+        }
+        triples.Add(new Triple($"{ns}:{className}", "navigates_to", $"{ns}:{target}", f, c));
+    }
+
+    // Selector-assignment idiom — the ribbon/tab top-nav: `X.<NavProp> = target`
+    // where <NavProp> is a configured navigation selector (default
+    // SelectedRibbonTabItem / SelectedTabPage / SelectedPage / SelectedTab). The
+    // target is the assigned identifier (the tab/page field, e.g. a DevExpress
+    // RibbonTabItem), NOT a screen class — so it is emitted directly, not gated
+    // on `screenTypes`. This captures the top-level nav a panel-swap shell wires
+    // through the ribbon, which neither the `.Show()` nor the instantiation pass
+    // sees. Only a bare-identifier RHS is taken (an index literal / expression
+    // is a mode toggle, not a named destination).
+    foreach (var asgn in root.DescendantNodesAndSelf().OfType<AssignmentExpressionSyntax>())
+    {
+        if (asgn.Left is not MemberAccessExpressionSyntax lhs
+            || !navSelectProps.Contains(lhs.Name.Identifier.Text)
+            || asgn.Right is not IdentifierNameSyntax rhs)
+        {
+            continue;
+        }
+        var target = rhs.Identifier.Text;
+        if (target == className || !seen.Add(target))
         {
             continue;
         }
