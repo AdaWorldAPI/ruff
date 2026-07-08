@@ -1,14 +1,17 @@
 using System;
+using System.Text;
 using System.Windows.Forms;
 
 // Synthetic WinForms navigation fixture — exercises the `navigates_to` arm
 // (EmitNavArm). GENERIC screen names only: the harvester machinery is agnostic
 // and real corpora are pointed at via a path, never vendored (README
-// "Provenance / non-vendoring"). Expected edges out of MainScreen:
-//   MainScreen -> OrderScreen     (one-liner  new X().Show())
-//   MainScreen -> SettingsScreen  (one-liner  new X().ShowDialog())
-//   MainScreen -> CustomerScreen  (two-stmt   var f = new X(); ...; f.Show())
-// SaveFileDialog is a framework CommonDialog and must NOT produce an edge.
+// "Provenance / non-vendoring"). Expected edges:
+//   MainScreen -> OrderScreen      (one-liner  new X().Show())
+//   MainScreen -> SettingsScreen   (one-liner  new X().ShowDialog())
+//   MainScreen -> CustomerScreen   (two-stmt   var f = new X(); ...; f.Show())
+//   HostControl -> ChildControl    (UserControl-SPA: field = new X(); NO .Show())
+// SaveFileDialog is a framework CommonDialog and must NOT produce an edge; a
+// non-screen helper (`new StringBuilder()`) must NOT produce an edge either.
 namespace NavShapes
 {
     public class MainScreen : Form
@@ -46,4 +49,37 @@ namespace NavShapes
     public class SettingsScreen : Form { }
 
     public class CustomerScreen : Form { }
+
+    // UserControl-SPA host: navigates by instantiating a screen-typed
+    // UserControl into a field — NO `.Show()`. This is the idiom a ribbon /
+    // panel-swap app uses (and the one the `.Show()`-only harvester missed).
+    public class HostControl : UserControl
+    {
+        private ChildControl _child;
+
+        private void Open_Click(object sender, EventArgs e)
+        {
+            _child = new ChildControl(this);   // -> navigates_to ChildControl
+            var sb = new StringBuilder();       // non-screen: NO edge
+            sb.Append(_child.Name);
+        }
+    }
+
+    public class ChildControl : UserControl
+    {
+        public ChildControl(Control owner) { }
+    }
+
+    // Ribbon/tab selector idiom: navigate by assigning a nav-selector property
+    // (the panel-swap top-nav — no `.Show()`, no `new Screen()`).
+    //   RibbonHost -> tab_reports   (ribbon.SelectedRibbonTabItem = tab_reports)
+    // A non-selector property (`SelectedIndex`) must NOT emit an edge.
+    public class RibbonHost : Form
+    {
+        private void Nav_Click(object sender, EventArgs e)
+        {
+            ribbon.SelectedRibbonTabItem = tab_reports;  // -> navigates_to tab_reports
+            combo.SelectedIndex = fallbackIndex;          // SelectedIndex not a nav selector: NO edge
+        }
+    }
 }

@@ -126,13 +126,15 @@ mod tests {
         assert_eq!(triples[0].s, "csharp:Widget.SetDefaults");
     }
 
-    /// The UI-navigation arm — the WinForms form→form `navigates_to` Klickweg
-    /// edge (`EmitNavArm`). Subject is the CLASS that navigates, object is the
-    /// target form class. Shaped exactly as the harvester emits it (verified by
+    /// The UI-navigation arm — the WinForms `navigates_to` Klickweg edge
+    /// (`EmitNavArm`). Subject is the CLASS that navigates, object is the target
+    /// screen class. Shaped exactly as the harvester emits it (verified by
     /// running the real harvester over `harvester/fixtures/nav_shapes.cs`, which
-    /// yields exactly these three edges — the `SaveFileDialog` CommonDialog is
-    /// excluded). A clean load is the standing proof the nav arm stays inside
-    /// the closed vocabulary.
+    /// yields exactly these FOUR edges): three via `Form.Show()`/`ShowDialog()`
+    /// and one via the UserControl-SPA idiom (`HostControl` field-instantiates
+    /// `ChildControl`, no `.Show()`). The `SaveFileDialog` CommonDialog and the
+    /// non-screen `StringBuilder` are both excluded. A clean load is the
+    /// standing proof the nav arm stays inside the closed vocabulary.
     #[test]
     fn loads_and_validates_nav_arm_ndjson() {
         let ndjson = concat!(
@@ -142,12 +144,22 @@ mod tests {
             "\n",
             r#"{"s":"csharp:MainScreen","p":"navigates_to","o":"csharp:CustomerScreen","f":1.0,"c":0.9}"#,
             "\n",
+            r#"{"s":"csharp:HostControl","p":"navigates_to","o":"csharp:ChildControl","f":1.0,"c":0.9}"#,
+            "\n",
+            r#"{"s":"csharp:RibbonHost","p":"navigates_to","o":"csharp:tab_reports","f":1.0,"c":0.9}"#,
+            "\n",
         );
         let triples = load(ndjson).expect("navigates_to is in the closed vocab");
-        assert_eq!(triples.len(), 3);
+        assert_eq!(triples.len(), 5);
         assert_eq!(triples[0].p, "navigates_to");
         assert_eq!(triples[0].s, "csharp:MainScreen");
         assert_eq!(triples[2].o, "csharp:CustomerScreen");
+        // the UserControl-SPA edge (field-instantiation, no .Show())
+        assert_eq!(triples[3].s, "csharp:HostControl");
+        assert_eq!(triples[3].o, "csharp:ChildControl");
+        // the ribbon/tab selector-assignment edge (X.SelectedRibbonTabItem = tab)
+        assert_eq!(triples[4].s, "csharp:RibbonHost");
+        assert_eq!(triples[4].o, "csharp:tab_reports");
     }
 
     /// A predicate the .NET tool must never emit. `load` (via `from_ndjson`)
