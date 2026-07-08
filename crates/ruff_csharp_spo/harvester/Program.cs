@@ -102,19 +102,41 @@ var isMutatorCall = BuildMutatorPredicate(mutatorNames, mutatorPrefixes, mutator
 
 var triples = new List<Triple>();
 
+// Parse every file once — reused by the screen-type pre-pass and the main pass.
+var parsed = new List<SyntaxNode>();
 foreach (var file in Directory.EnumerateFiles(root, "*.cs", SearchOption.AllDirectories))
 {
-    SyntaxNode rootNode;
     try
     {
-        rootNode = CSharpSyntaxTree.ParseText(File.ReadAllText(file)).GetRoot();
+        parsed.Add(CSharpSyntaxTree.ParseText(File.ReadAllText(file)).GetRoot());
     }
     catch (IOException ex)
     {
         Console.Error.WriteLine($"skip {file}: {ex.Message}");
-        continue;
     }
+}
 
+// Pre-pass — the SCREEN-TYPE universe: every class whose base type is
+// `UserControl` or ends in `Form` (`Form` / `XtraForm` / `Office2007Form` / …).
+// Agnostic + syntactic (no app-specific prefixes): a WinForms/DevExpress screen
+// is a UserControl/Form subclass. This is what lets the nav arm emit an edge on
+// the UserControl-SPA idiom `field = new SomeScreen(...)` — the common case in
+// a ribbon/panel-swap app — and not only on the MDI idiom `new Form().Show()`.
+var screenTypes = new HashSet<string>(StringComparer.Ordinal);
+foreach (var preRoot in parsed)
+{
+    foreach (var type in preRoot.DescendantNodes().OfType<TypeDeclarationSyntax>())
+    {
+        if (type.BaseList is not null
+            && type.BaseList.Types.Any(b => IsScreenBase(BareName(b.Type))))
+        {
+            screenTypes.Add(type.Identifier.Text);
+        }
+    }
+}
+
+foreach (var rootNode in parsed)
+{
     // class / struct / record / interface declarations all share TypeDeclarationSyntax.
     foreach (var type in rootNode.DescendantNodes().OfType<TypeDeclarationSyntax>())
     {
@@ -206,7 +228,7 @@ foreach (var file in Directory.EnumerateFiles(root, "*.cs", SearchOption.AllDire
                         // edge (navigates_to). Subject is the CLASS that
                         // navigates (not the method), so a screen's edges are
                         // the union over all its handlers.
-                        EmitNavArm(triples, ns, name, m.Body, m.ExpressionBody, f, c);
+                        EmitNavArm(triples, ns, name, m.Body, m.ExpressionBody, screenTypes, f, c);
                         break;
                     }
 
@@ -374,6 +396,7 @@ static void EmitNavArm(
     string className,
     BlockSyntax? body,
     ArrowExpressionClauseSyntax? expressionBody,
+    HashSet<string> screenTypes,
     double f,
     double c)
 {
@@ -431,7 +454,33 @@ static void EmitNavArm(
         }
         triples.Add(new Triple($"{ns}:{className}", "navigates_to", $"{ns}:{target}", f, c));
     }
+
+    // UserControl-SPA idiom — the dominant case in a ribbon/panel-swap app:
+    // `field = new SomeScreen(...)` (no `.Show()`; the instance is hosted into a
+    // panel elsewhere). A screen instantiating another SCREEN TYPE (pre-pass
+    // set) is a navigation edge. This is syntax-only reachability — it does NOT
+    // distinguish a *stack* (composition: a screen embeds a sub-view) from a
+    // *jump* (navigation: a screen opens another): both spell `new Screen()`.
+    // So it harvests the composition+navigation CLOSURE; splitting stack vs jump
+    // needs more signal (is the instance added to own layout vs a content host)
+    // and is left to the consumer. Framework dialogs never enter `screenTypes`
+    // (they end in `Dialog`, not `Form`), so they cannot be emitted here.
+    foreach (var oce in root.DescendantNodesAndSelf().OfType<ObjectCreationExpressionSyntax>())
+    {
+        var target = BareName(oce.Type);
+        if (target == className || !screenTypes.Contains(target) || !seen.Add(target))
+        {
+            continue;
+        }
+        triples.Add(new Triple($"{ns}:{className}", "navigates_to", $"{ns}:{target}", f, c));
+    }
 }
+
+// A "screen" base type, syntactically: `UserControl` or any name ending in
+// `Form` (`Form` / `XtraForm` / `Office2007Form` / `RibbonForm` / …). Used by
+// the screen-type pre-pass. Agnostic — no app-specific class-name prefixes.
+static bool IsScreenBase(string baseName) =>
+    baseName == "UserControl" || baseName.EndsWith("Form", StringComparison.Ordinal);
 
 // J1 helper — `X == null` / `X is null` -> the tested member `X`; else null.
 // The C# analogue of Ruby's `self.X.blank?`/`.nil?` guard.
