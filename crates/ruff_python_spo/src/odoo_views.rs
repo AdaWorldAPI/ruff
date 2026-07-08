@@ -51,9 +51,14 @@
 //!   deliberate extension, not a default.
 //! - **Widget/attrs semantics** — `widget="monetary"`, `invisible`,
 //!   `readonly` modifiers: presentation, not projection membership.
-//! - **Dotted sub-fields** (`partner_id.name` inside `optional`/`groups`
-//!   expressions) — only the arch `<field name="…"/>` element's own name
-//!   counts, first hop only, mirroring the sibling arms' multi-hop stance.
+//! - **Nested (relation-hop) sub-fields** — a field element nested inside
+//!   another (`<field name="invoice_line_ids"><field name="quantity"/>
+//!   </field>`) names a COMODEL field, not a this-model field; the depth-0
+//!   rule excludes it from `referenced` (counting it would poison the mask
+//!   whenever names collide across models — `date` exists on both
+//!   `account.move` and `account.move.line`). The `(outer, inner)` hop PAIRS
+//!   are a consumer refinement (odoo-rs `view_mask.rs::ViewFields::
+//!   relation_hops`) this set-level arm does not carry.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -157,46 +162,91 @@ struct ViewRecord {
 }
 
 /// Stateful line scan of one XML file for `ir.ui.view` records, applying the
-/// meta/arch split: field names count only after the `<field name="arch"`
-/// line of the current record.
+/// meta/arch split AND the relation-hop split: inside the arch, only
+/// **depth-0** field elements (direct children of the view's own markup)
+/// count as this-model fields. A field nested INSIDE another field element
+/// (`<field name="invoice_line_ids"><field name="quantity"/></field>`) names
+/// a COMODEL field — counting it would poison the this-model projection
+/// whenever names collide across models (`date` exists on both
+/// `account.move` and `account.move.line`). This mirrors the hop-splitting
+/// semantics odoo-rs's consumer-side `view_mask.rs` proved on the real
+/// `account_move_form_view.xml`; the hop PAIRS themselves stay a consumer
+/// refinement this set-level arm does not carry.
 fn scan_view_records(content: &str) -> Vec<ViewRecord> {
+    // FULL-TEXT, position-ordered token scan — deliberately NOT line-based.
+    // Real Odoo XML wraps long tags across lines (a search-view field with a
+    // filter_domain routinely closes its `/>` two lines later); a line-based
+    // scan misreads such a tag as a non-self-closing open, the depth counter
+    // leaks, and everything after is swallowed as "nested" (measured on
+    // `view_account_invoice_filter`: 13 referenced fields collapsed to 1
+    // before this fix).
     let mut records = Vec::new();
     let mut current: Option<ViewRecord> = None;
     let mut in_arch = false;
+    let mut depth = 0usize;
 
-    for line in content.lines() {
-        let t = line.trim();
-        if t.starts_with("<record") {
-            // Any record open closes the previous context (records don't nest).
-            if let Some(rec) = current.take() {
-                records.push(rec);
+    for tok in xml_tokens(content) {
+        match tok {
+            XmlToken::RecordOpen { id, is_view } => {
+                // Any record open closes the previous context (records don't
+                // nest).
+                if let Some(rec) = current.take() {
+                    records.push(rec);
+                }
+                in_arch = false;
+                depth = 0;
+                if is_view {
+                    current = Some(ViewRecord {
+                        id,
+                        model: None,
+                        arch_fields: Vec::new(),
+                    });
+                }
             }
-            in_arch = false;
-            if t.contains("model=\"ir.ui.view\"") {
-                current = Some(ViewRecord {
-                    id: attr_value(t, "id"),
-                    model: None,
-                    arch_fields: Vec::new(),
-                });
+            XmlToken::RecordClose => {
+                if let Some(rec) = current.take() {
+                    records.push(rec);
+                }
+                in_arch = false;
+                depth = 0;
             }
-        } else if t.starts_with("</record>") {
-            if let Some(rec) = current.take() {
-                records.push(rec);
-            }
-            in_arch = false;
-        } else if let Some(rec) = current.as_mut() {
-            // A line can carry SEVERAL field elements (real Odoo arch XML
-            // inlines them: `<form><field name="partner_id"/></form>`), so
-            // scan every `<field` occurrence, not just a line-leading one.
-            for name in field_element_names(t) {
+            XmlToken::FieldOpen {
+                name,
+                self_closing,
+                text,
+            } => {
+                let Some(rec) = current.as_mut() else {
+                    continue;
+                };
                 if in_arch {
-                    rec.arch_fields.push(name);
-                } else if name == "arch" {
-                    in_arch = true;
-                } else if name == "model"
-                    && let Some(value) = tag_text(t)
-                {
-                    rec.model = Some(value);
+                    if depth == 0
+                        && let Some(n) = &name
+                    {
+                        rec.arch_fields.push(n.clone());
+                    }
+                    if !self_closing {
+                        depth += 1;
+                    }
+                } else if name.as_deref() == Some("arch") {
+                    if !self_closing {
+                        in_arch = true;
+                        depth = 0;
+                    }
+                } else if name.as_deref() == Some("model") {
+                    if let Some(value) = text {
+                        rec.model = Some(value);
+                    }
+                }
+            }
+            XmlToken::FieldClose => {
+                if current.is_some() && in_arch {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        // The close with depth 0 is the arch wrapper's own
+                        // `</field>`.
+                        in_arch = false;
+                    }
                 }
             }
         }
@@ -207,34 +257,110 @@ fn scan_view_records(content: &str) -> Vec<ViewRecord> {
     records
 }
 
-/// The `name="…"` of every `<field` element on this line, in order. A line
-/// can carry several (inline arch markup); each occurrence's `name` attribute
-/// is read from the slice starting at that occurrence.
-fn field_element_names(line: &str) -> Vec<String> {
-    line.match_indices("<field")
-        .filter_map(|(idx, _)| {
-            let slice = &line[idx..];
-            // The name attr must belong to THIS element: stop at the tag end.
-            let tag_end = slice.find('>').unwrap_or(slice.len());
-            attr_value(&slice[..tag_end], "name")
-        })
-        .collect()
+/// One record/field open-or-close token in document order.
+enum XmlToken {
+    /// A `<record …>` open, with its `id` and whether it declares
+    /// `model="ir.ui.view"`.
+    RecordOpen { id: Option<String>, is_view: bool },
+    /// A `</record>` close.
+    RecordClose,
+    /// A `<field …>` / `<field …/>` open: its `name` attribute, whether the
+    /// tag self-closes, and — for a plain open — the simple text right after
+    /// the tag (the `<field name="model">a.b</field>` value shape).
+    FieldOpen {
+        name: Option<String>,
+        self_closing: bool,
+        text: Option<String>,
+    },
+    /// A `</field>` close.
+    FieldClose,
 }
 
-/// The value of `key="…"` inside a single-line XML tag, if present.
-fn attr_value(line: &str, key: &str) -> Option<String> {
-    let pat = format!("{key}=\"");
-    let start = line.find(&pat)? + pat.len();
-    let end = line[start..].find('"')? + start;
-    Some(line[start..end].to_string())
+/// All record/field tokens in `content`, ordered by byte position. Tag
+/// slices run to the tag's own `>` wherever it is — across newlines — so a
+/// multi-line tag classifies correctly.
+fn xml_tokens(content: &str) -> Vec<XmlToken> {
+    let mut toks: Vec<(usize, XmlToken)> = Vec::new();
+    for (idx, _) in content.match_indices("<record") {
+        if !tag_name_boundary(content, idx + "<record".len()) {
+            continue;
+        }
+        let tag = tag_slice(content, idx);
+        toks.push((
+            idx,
+            XmlToken::RecordOpen {
+                id: attr_value(tag, "id"),
+                is_view: attr_value(tag, "model").as_deref() == Some("ir.ui.view"),
+            },
+        ));
+    }
+    for (idx, _) in content.match_indices("</record") {
+        toks.push((idx, XmlToken::RecordClose));
+    }
+    for (idx, _) in content.match_indices("<field") {
+        if !tag_name_boundary(content, idx + "<field".len()) {
+            continue;
+        }
+        let tag = tag_slice(content, idx);
+        let self_closing = tag.trim_end().ends_with('/');
+        let text = if self_closing {
+            None
+        } else {
+            simple_text_after(content, idx + tag.len())
+        };
+        toks.push((
+            idx,
+            XmlToken::FieldOpen {
+                name: attr_value(tag, "name"),
+                self_closing,
+                text,
+            },
+        ));
+    }
+    for (idx, _) in content.match_indices("</field") {
+        toks.push((idx, XmlToken::FieldClose));
+    }
+    toks.sort_by_key(|(idx, _)| *idx);
+    toks.into_iter().map(|(_, tok)| tok).collect()
 }
 
-/// The text content of a one-line `<tag …>text</tag>` element, if present.
-fn tag_text(line: &str) -> Option<String> {
-    let start = line.find('>')? + 1;
-    let end = line[start..].find('<')? + start;
-    let text = line[start..end].trim();
+/// The tag slice starting at `idx`, up to (excluding) its own `>` — wherever
+/// that is, newlines included. An unterminated tag runs to end-of-content.
+fn tag_slice(content: &str, idx: usize) -> &str {
+    match content[idx..].find('>') {
+        Some(rel) => &content[idx..idx + rel],
+        None => &content[idx..],
+    }
+}
+
+/// Whether the character at `pos` terminates a tag NAME (whitespace, `/`,
+/// `>`, or end-of-content) — rejects `<fields…`/`<recording…` false matches.
+fn tag_name_boundary(content: &str, pos: usize) -> bool {
+    content
+        .as_bytes()
+        .get(pos)
+        .is_none_or(|b| b.is_ascii_whitespace() || *b == b'/' || *b == b'>')
+}
+
+/// The simple text between a tag's `>` (at `tag_end`, i.e. the index OF the
+/// `>`) and the next `<`, trimmed — the `<field name="model">a.b</field>`
+/// value shape. `None` when the tag is unterminated or the text is empty.
+fn simple_text_after(content: &str, tag_end: usize) -> Option<String> {
+    if content.as_bytes().get(tag_end) != Some(&b'>') {
+        return None;
+    }
+    let after = tag_end + 1;
+    let rel = content[after..].find('<')?;
+    let text = content[after..after + rel].trim();
     (!text.is_empty()).then(|| text.to_string())
+}
+
+/// The value of `key="…"` inside a tag slice, if present.
+fn attr_value(tag: &str, key: &str) -> Option<String> {
+    let pat = format!("{key}=\"");
+    let start = tag.find(&pat)? + pat.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
 }
 
 /// Recursively collect every `*.xml` file under `dir` (sorted for
@@ -433,6 +559,127 @@ mod tests {
         // The xpath's @name-in-expr is NOT a field element; only the added
         // <field name="amount_total"/> counts.
         assert_eq!(sets[0].referenced, vec!["amount_total".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// (5) Relation-hop exclusion: a field element nested inside another
+    /// (`invoice_line_ids` → `quantity`/`date`) names a COMODEL field and
+    /// must NOT enter `referenced` — even when the inner name collides with
+    /// a this-model field (`date` here is on BOTH models; only the top-level
+    /// occurrence counts). Depth returns to 0 after the nest closes, so a
+    /// later top-level field is still captured. Mirrors odoo-rs
+    /// `view_mask.rs`'s proven hop-splitting semantics.
+    #[test]
+    fn nested_relation_fields_are_excluded_from_referenced() {
+        let root = scratch("hops");
+        write(
+            &root,
+            "views/v.xml",
+            r#"<odoo>
+    <record id="view_move_form" model="ir.ui.view">
+        <field name="model">account.move</field>
+        <field name="arch" type="xml">
+            <form>
+                <field name="date"/>
+                <field name="invoice_line_ids">
+                    <list>
+                        <field name="quantity"/>
+                        <field name="date"/>
+                    </list>
+                </field>
+                <field name="partner_id"/>
+            </form>
+        </field>
+    </record>
+</odoo>
+"#,
+        );
+        let mut target = move_target();
+        target.fields.push("invoice_line_ids".to_string());
+        let sets = extract_odoo_view_field_sets(&root, &[target]);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert_eq!(
+            sets[0].referenced,
+            vec![
+                "date".to_string(),
+                "invoice_line_ids".to_string(),
+                "partner_id".to_string()
+            ],
+            "comodel fields (quantity, nested date) must not enter referenced; \
+             the post-nest top-level partner_id must still be captured"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// (5c) A field tag WRAPPED ACROSS LINES (real search-view shape: a long
+    /// `filter_domain` pushes the closing `/>` onto a later line) must still
+    /// classify as self-closing — a line-based scan misread it as an open,
+    /// leaked the depth counter, and swallowed every following field as
+    /// "nested" (measured: `view_account_invoice_filter` collapsed 13→1
+    /// referenced before the full-text tokenizer).
+    #[test]
+    fn multi_line_field_tag_does_not_leak_depth() {
+        let root = scratch("multiline");
+        write(
+            &root,
+            "views/v.xml",
+            r#"<odoo>
+    <record id="view_account_invoice_filter" model="ir.ui.view">
+        <field name="model">account.move</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="partner_id" string="Partner"
+                       filter_domain="['|', ('partner_id', 'ilike', self), ('ref', 'ilike', self)]"
+                       />
+                <field name="date"/>
+                <field name="amount_total"/>
+            </search>
+        </field>
+    </record>
+</odoo>
+"#,
+        );
+        let sets = extract_odoo_view_field_sets(&root, &[move_target()]);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert_eq!(
+            sets[0].referenced,
+            vec![
+                "amount_total".to_string(),
+                "date".to_string(),
+                "partner_id".to_string()
+            ],
+            "the wrapped tag is self-closing; the fields after it are top-level, not nested"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// (5b) Inline nesting on ONE line still splits hops correctly — the
+    /// token walk is position-ordered, not line-scoped.
+    #[test]
+    fn inline_nested_relation_fields_are_excluded() {
+        let root = scratch("hops_inline");
+        write(
+            &root,
+            "views/v.xml",
+            r#"<odoo>
+    <record id="v" model="ir.ui.view">
+        <field name="model">account.move</field>
+        <field name="arch" type="xml">
+            <form><field name="line_ids"><field name="debit"/></field><field name="date"/></form>
+        </field>
+    </record>
+</odoo>
+"#,
+        );
+        let mut target = move_target();
+        target.fields.push("line_ids".to_string());
+        let sets = extract_odoo_view_field_sets(&root, &[target]);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert_eq!(
+            sets[0].referenced,
+            vec!["date".to_string(), "line_ids".to_string()],
+            "inline-nested debit is a comodel field; date after the nest is top-level"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
