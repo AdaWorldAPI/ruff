@@ -10,6 +10,7 @@ using System.Windows.Forms;
 //   MainScreen -> SettingsScreen   (one-liner  new X().ShowDialog())
 //   MainScreen -> CustomerScreen   (two-stmt   var f = new X(); ...; f.Show())
 //   HostControl -> ChildControl    (UserControl-SPA: field = new X(); NO .Show())
+//   QualifiedHost -> QualifiedChild (qualified: field = new Ns.X(); qualifier stripped)
 // SaveFileDialog is a framework CommonDialog and must NOT produce an edge; a
 // non-screen helper (`new StringBuilder()`) must NOT produce an edge either.
 namespace NavShapes
@@ -70,6 +71,21 @@ namespace NavShapes
         public ChildControl(Control owner) { }
     }
 
+    // Namespace-qualified hosting — the dominant idiom in namespace-organized
+    // apps: `field = new Nested.QualifiedChild(...)`. The nav arm normalizes
+    // the qualifier away (LastSegment), so this resolves to the SAME screen
+    // node as a bare `new QualifiedChild(...)` would:
+    //   QualifiedHost -> QualifiedChild
+    public class QualifiedHost : UserControl
+    {
+        private Nested.QualifiedChild _q;
+
+        private void Open_Click(object sender, EventArgs e)
+        {
+            _q = new Nested.QualifiedChild(this);  // -> navigates_to QualifiedChild
+        }
+    }
+
     // Ribbon/tab selector idiom: navigate by assigning a nav-selector property
     // (the panel-swap top-nav — no `.Show()`, no `new Screen()`).
     //   RibbonHost -selects_view-> tab_reports  (ribbon.SelectedRibbonTabItem = ...)
@@ -81,5 +97,13 @@ namespace NavShapes
             ribbon.SelectedRibbonTabItem = tab_reports;  // -> selects_view tab_reports
             combo.SelectedIndex = fallbackIndex;          // SelectedIndex not a nav selector: NO edge
         }
+    }
+}
+
+namespace NavShapes.Nested
+{
+    public class QualifiedChild : System.Windows.Forms.UserControl
+    {
+        public QualifiedChild(object owner) { }
     }
 }

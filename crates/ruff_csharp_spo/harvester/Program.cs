@@ -139,7 +139,7 @@ foreach (var preRoot in parsed)
     foreach (var type in preRoot.DescendantNodes().OfType<TypeDeclarationSyntax>())
     {
         if (type.BaseList is not null
-            && type.BaseList.Types.Any(b => IsScreenBase(BareName(b.Type))))
+            && type.BaseList.Types.Any(b => IsScreenBase(LastSegment(BareName(b.Type)))))
         {
             screenTypes.Add(type.Identifier.Text);
         }
@@ -434,7 +434,7 @@ static void EmitNavArm(
     {
         if (decl.Initializer?.Value is ObjectCreationExpressionSyntax oce)
         {
-            localType[decl.Identifier.Text] = BareName(oce.Type);
+            localType[decl.Identifier.Text] = LastSegment(BareName(oce.Type));
         }
     }
 
@@ -455,7 +455,7 @@ static void EmitNavArm(
         string? target = mac.Expression switch
         {
             // `new TargetForm(...).Show()`
-            ObjectCreationExpressionSyntax oce => BareName(oce.Type),
+            ObjectCreationExpressionSyntax oce => LastSegment(BareName(oce.Type)),
             // `f.Show()` where `f` was `new TargetForm()` earlier in the body
             IdentifierNameSyntax id when localType.TryGetValue(id.Identifier.Text, out var t) => t,
             _ => null,
@@ -479,7 +479,7 @@ static void EmitNavArm(
     // (they end in `Dialog`, not `Form`), so they cannot be emitted here.
     foreach (var oce in root.DescendantNodesAndSelf().OfType<ObjectCreationExpressionSyntax>())
     {
-        var target = BareName(oce.Type);
+        var target = LastSegment(BareName(oce.Type));
         if (target == className || !screenTypes.Contains(target) || !seen.Add(target))
         {
             continue;
@@ -637,6 +637,19 @@ static string BareName(TypeSyntax type)
     var s = type.ToString();
     var lt = s.IndexOf('<');
     return lt >= 0 ? s[..lt] : s;
+}
+
+// The last identifier segment of a possibly namespace-qualified name:
+// `con_x.uc_Screen` -> `uc_Screen`, `DevExpress.XtraBars.RibbonForm` ->
+// `RibbonForm`. Used ONLY by the navigation arm (screen-type matching + nav
+// targets) so qualified instantiations — `field = new some.ns.Screen(...)`,
+// the dominant hosting idiom in namespace-organized WinForms apps — resolve to
+// the same screen node as their bare declaration. `inherits_from` /
+// `field_type` keep the name as written (their wire contract).
+static string LastSegment(string name)
+{
+    var dot = name.LastIndexOf('.');
+    return dot >= 0 ? name[(dot + 1)..] : name;
 }
 
 // Mirrors ruff_spo_triplet::Triple field-for-field; the JSON keys are exactly
