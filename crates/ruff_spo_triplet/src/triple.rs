@@ -485,7 +485,7 @@ pub enum Predicate {
     // which screen opens which. The dead-link class of bug is this fact going
     // unmodelled — the transcode has the screens (ClassViews) but not the
     // edges between them.
-    /// `(class, navigates_to, TargetForm)` — a WinForms navigation edge: the
+    /// `(class, navigates_to, TargetForm)` — a `WinForms` navigation edge: the
     /// class opens `TargetForm` via `new TargetForm().Show()` / `.ShowDialog()`
     /// in a method body (typically a button-click handler). Subject is the
     /// CLASS that navigates, object is the target form class — a screen→screen
@@ -495,7 +495,7 @@ pub enum Predicate {
     /// connectivity check. **Default tier is [`Provenance::Inferred`]**:
     /// syntax-only form-open detection, and the two-statement
     /// `var f = new T(); …; f.Show();` local-tracking is heuristic (a
-    /// SemanticModel upgrade would resolve the receiver's type authoritatively).
+    /// `SemanticModel` upgrade would resolve the receiver's type authoritatively).
     NavigatesTo,
 }
 
