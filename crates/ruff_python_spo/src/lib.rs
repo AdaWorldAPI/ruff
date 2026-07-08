@@ -30,7 +30,7 @@
 //! existing cross-frontend [`ruff_spo_triplet::Predicate::InheritsFrom`] +
 //! the frontend-agnostic [`Model::inherits`] carrier) — a genuine `_inherit`
 //! (the model declares its own `_name` and inherits behaviour/fields from a
-//! *different* parent) becomes an is_a edge; a bare-`_inherit` reopen (no
+//! *different* parent) becomes an `is_a` edge; a bare-`_inherit` reopen (no
 //! `_name`, so `_inherit` IS the model identity) does not self-edge. Selection
 //! enums (`selection_value`) still need a predicate variant the closed
 //! `Predicate` enum does not yet carry — a remaining follow-up.
@@ -175,6 +175,11 @@ fn resolve_name(class: &RawClass) -> Option<String> {
         .map(|dotted| dotted.replace('.', "_"))
 }
 
+/// Per-model accumulator: the raw fields + methods (borrowed from the input
+/// classes) plus the deduped inherit-parent set, keyed by resolved model name
+/// in [`build_graph`]'s phase 1.
+type ModelAccum<'a> = (Vec<&'a RawField>, Vec<&'a RawMethod>, BTreeSet<String>);
+
 /// Assemble raw classes into a [`ModelGraph`].
 ///
 /// Classes that resolve to the same model (Odoo `_inherit` reopens across
@@ -190,8 +195,7 @@ fn build_graph(classes: &[RawClass], namespace: &str) -> ModelGraph {
     // with the model's own name excluded — a bare-`_inherit` reopen resolves
     // its identity FROM `_inherit`, so `parent == model_name` is that reopen,
     // not an is_a edge.
-    let mut by_model: HashMap<String, (Vec<&RawField>, Vec<&RawMethod>, BTreeSet<String>)> =
-        HashMap::new();
+    let mut by_model: HashMap<String, ModelAccum> = HashMap::new();
     for class in classes {
         let Some(model_name) = resolve_name(class) else {
             continue;
@@ -254,7 +258,6 @@ fn build_graph(classes: &[RawClass], namespace: &str) -> ModelGraph {
                         writes: m.writes.clone(),
                         guarded_writes: m.guarded_writes.clone(),
                         calls: m.calls.clone(),
-                        ..Default::default()
                     })
                     .collect(),
                 name,
