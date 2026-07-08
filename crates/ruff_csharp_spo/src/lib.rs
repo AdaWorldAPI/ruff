@@ -146,15 +146,20 @@ mod tests {
             "\n",
             r#"{"s":"csharp:HostControl","p":"navigates_to","o":"csharp:ChildControl","f":1.0,"c":0.9}"#,
             "\n",
+            r#"{"s":"csharp:RibbonHost","p":"navigates_to","o":"csharp:tab_reports","f":1.0,"c":0.9}"#,
+            "\n",
         );
         let triples = load(ndjson).expect("navigates_to is in the closed vocab");
-        assert_eq!(triples.len(), 4);
+        assert_eq!(triples.len(), 5);
         assert_eq!(triples[0].p, "navigates_to");
         assert_eq!(triples[0].s, "csharp:MainScreen");
         assert_eq!(triples[2].o, "csharp:CustomerScreen");
         // the UserControl-SPA edge (field-instantiation, no .Show())
         assert_eq!(triples[3].s, "csharp:HostControl");
         assert_eq!(triples[3].o, "csharp:ChildControl");
+        // the ribbon/tab selector-assignment edge (X.SelectedRibbonTabItem = tab)
+        assert_eq!(triples[4].s, "csharp:RibbonHost");
+        assert_eq!(triples[4].o, "csharp:tab_reports");
     }
 
     /// A predicate the .NET tool must never emit. `load` (via `from_ndjson`)
