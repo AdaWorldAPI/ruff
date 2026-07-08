@@ -47,12 +47,20 @@ use ruff_spo_triplet::{Field, Function, Model, ModelGraph};
 
 mod functions;
 mod navigation;
+mod odoo_nav;
+mod odoo_views;
 mod parse;
 mod templates;
 mod walk;
 
 pub use navigation::{
     NavScanReport, NavVocab, PyNavEdge, extract_nav_edges, extract_nav_edges_with_report,
+};
+pub use odoo_nav::{
+    OdooNavEdge, OdooNavScanReport, extract_odoo_nav_edges, extract_odoo_nav_edges_with_report,
+};
+pub use odoo_views::{
+    OdooViewScanReport, extract_odoo_view_field_sets, extract_odoo_view_field_sets_with_report,
 };
 pub use templates::{
     ViewFieldSet, ViewScanReport, ViewTarget, extract_template_field_sets,

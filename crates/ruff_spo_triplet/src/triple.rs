@@ -500,7 +500,7 @@ pub enum Predicate {
 
     /// `(class, selects_view, tab_field)` — a UI-selector navigation: the class
     /// activates a named tab/page/view by ASSIGNING a navigation-selector
-    /// property (e.g. DevExpress `ribbon.SelectedRibbonTabItem = tab_x`). The
+    /// property (e.g. `DevExpress` `ribbon.SelectedRibbonTabItem = tab_x`). The
     /// object is the **selector value** (a tab/page field), deliberately NOT a
     /// screen class — keeping [`Predicate::NavigatesTo`] a pure screen→screen
     /// graph (codex P2 on #64: selector values as `navigates_to` targets would
