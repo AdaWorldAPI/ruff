@@ -48,10 +48,15 @@ use ruff_spo_triplet::{Field, Function, Model, ModelGraph};
 mod functions;
 mod navigation;
 mod parse;
+mod templates;
 mod walk;
 
 pub use navigation::{
     NavScanReport, NavVocab, PyNavEdge, extract_nav_edges, extract_nav_edges_with_report,
+};
+pub use templates::{
+    ViewFieldSet, ViewScanReport, ViewTarget, extract_template_field_sets,
+    extract_template_field_sets_with_report,
 };
 
 /// The IRI namespace prefix for every Odoo subject/object.
