@@ -36,6 +36,7 @@ use ruff_spo_triplet::{
 
 mod actions;
 mod functions;
+mod menu;
 mod navigation;
 mod parse;
 mod representers;
@@ -48,6 +49,7 @@ pub use actions::{
     ActionScanReport, ActionVerb, RubyActionEdge, extract_action_edges,
     extract_action_edges_with_report,
 };
+pub use menu::{MenuScanReport, extract_menu_edges, extract_menu_edges_with_report};
 pub use navigation::{
     NavScanReport, NavShape, NavVocab, RubyNavEdge, extract_nav_edges,
     extract_nav_edges_with_report,
