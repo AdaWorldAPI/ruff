@@ -54,15 +54,22 @@
 //! `lance_graph_contract`.
 
 mod codebook;
+mod concept_split;
 mod corpus;
 mod expand;
 mod ir;
 mod ndjson;
 mod reassemble;
 mod recipe;
+mod structured_names;
+mod surface_schema;
 mod triple;
 
 pub use codebook::{CodebookBinding, CodebookCheck, check_model_graph, concept_key};
+pub use concept_split::{
+    ConceptConvention, RekeyOutcome, ResidualMethod, ResidualReason, SplitName, rekey_model,
+    split_method_name, tokenize_method_name,
+};
 pub use corpus::{group_functions, reassemble_model_graph};
 pub use expand::expand;
 pub use ir::{
@@ -75,6 +82,8 @@ pub use ir::{
 pub use ndjson::{ParseError, from_ndjson, to_ndjson};
 pub use reassemble::{cpp_projection, reassemble};
 pub use recipe::{RecipeCentroid, classify, is_recoverable};
+pub use structured_names::{NameGrammar, StructuredName, Tier, parse_structured_name, part_of_edges};
+pub use surface_schema::{SchemaSurface, SurfaceConvention, SurfaceKind, classify_surface};
 pub use triple::{EntityKind, Predicate, Provenance, Triple};
 
 #[cfg(test)]
