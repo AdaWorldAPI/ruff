@@ -42,6 +42,7 @@ mod representers;
 mod schema;
 mod views;
 mod walk;
+mod widgets;
 
 pub use actions::{
     ActionScanReport, ActionVerb, RubyActionEdge, extract_action_edges,
@@ -56,6 +57,10 @@ pub use schema::{SchemaReport, extract_app_with_schema};
 pub use views::{
     ViewFieldSet, ViewScanReport, ViewTarget, extract_view_field_sets,
     extract_view_field_sets_with_report,
+};
+pub use widgets::{
+    RubyWidgetEdge, WidgetKind, WidgetScanReport, extract_widget_edges,
+    extract_widget_edges_with_report,
 };
 
 /// The namespace prefix for `OpenProject` subjects/objects.
