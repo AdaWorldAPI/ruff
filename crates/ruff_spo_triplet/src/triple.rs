@@ -526,6 +526,21 @@ pub enum Predicate {
     /// the `method:` kwarg / `button_to` default, not resolved through the
     /// router).
     InvokesAction,
+
+    /// `(screen.field, renders_as, "widget:<kind>")` — the **widget type** a
+    /// form field is rendered with: `text` / `select` (dropdown) / `checkbox` /
+    /// `textarea` / `date` / `number` / `radio` / `hidden` / `email` /
+    /// `password` / `file`, read from the Rails form-builder helper
+    /// (`f.text_field` → text, `f.select` → select, `f.check_box` → checkbox …).
+    /// The `views` arm's `ViewFieldSet` harvests *which* fields a view shows;
+    /// this harvests *how* each renders — the missing half that lets codegen
+    /// emit an `<input>` vs a `<select>` vs a `<checkbox>` generically instead
+    /// of a hand-built form. The widget kind is a **reusable shape type** (an
+    /// `OGAR` `ClassView` the field `is_a`); the object names it, the field is
+    /// the subject. **Default tier is [`Provenance::Inferred`]**:
+    /// syntax-only ERB scan (the form-builder helper name, not a resolved view
+    /// object).
+    RendersAs,
 }
 
 impl Predicate {
@@ -607,6 +622,7 @@ impl Predicate {
             Self::NavigatesTo => "navigates_to",
             Self::SelectsView => "selects_view",
             Self::InvokesAction => "invokes_action",
+            Self::RendersAs => "renders_as",
         }
     }
 
@@ -694,6 +710,7 @@ impl Predicate {
             "navigates_to" => Self::NavigatesTo,
             "selects_view" => Self::SelectsView,
             "invokes_action" => Self::InvokesAction,
+            "renders_as" => Self::RendersAs,
             _ => return None,
         })
     }
@@ -780,6 +797,7 @@ impl Predicate {
         Self::NavigatesTo,
         Self::SelectsView,
         Self::InvokesAction,
+        Self::RendersAs,
     ];
 
     /// The default provenance tier for this predicate, per the Odoo
@@ -832,7 +850,8 @@ impl Predicate {
             // local-tracking case is heuristic (SemanticModel would resolve it).
             | Self::NavigatesTo
             | Self::SelectsView
-            | Self::InvokesAction => Provenance::Inferred,
+            | Self::InvokesAction
+            | Self::RendersAs => Provenance::Inferred,
             // C++ machine-plane declarative surface (the 10 remaining of 13)
             Self::InheritsFrom
             | Self::HasField
@@ -994,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_count_locked_at_67() {
+    fn predicate_count_locked_at_68() {
         // The exact count is part of the schema contract: 7 core (Odoo
         // Python) + 32 OpenProject AR-shape (PR #15 added
         // `association_kind`; #18 added `class_name`; #21 added
@@ -1029,7 +1048,11 @@ mod tests {
         // sibling of the field-set + nav arms) = 67.
         // Council review of any new variant means this number changes — the
         // test must change with the source.
-        assert_eq!(Predicate::ALL.len(), 67);
+        // + 1 UI-widget plane (`renders_as` — the form-field widget type
+        // (text/select/checkbox/…); the "how a field renders" half that pairs
+        // with `ViewFieldSet`'s "which fields", so codegen emits the right
+        // input element. Ruby ERB form-builder arm) = 68.
+        assert_eq!(Predicate::ALL.len(), 68);
     }
 
     #[test]
