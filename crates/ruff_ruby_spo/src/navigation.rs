@@ -68,6 +68,11 @@ pub enum NavShape {
     ErbClick,
     /// Shape B — a controller *redirect* edge (`redirect_to`/`redirect_back`).
     ControllerRedirect,
+    /// Shape C — a [`crate::menu`] side-nav registration edge
+    /// (`Redmine::MenuManager`-style `<menu>.push :label, …`), source fixed
+    /// to the synthetic `"menu"` root. The Rails twin of the Odoo `<menuitem>`
+    /// root (ruff #66) and op-nexgen's hand-authored `nav::MENU_NAV_EDGES`.
+    MenuItem,
 }
 
 /// One navigation edge: `source` screen navigates to `target` screen.
@@ -237,7 +242,9 @@ pub fn extract_nav_edges_with_report(
 
 /// Walk `dir` recursively, appending every file (sorted for determinism).
 /// Shape discrimination happens at the call site by extension / suffix.
-fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>) {
+/// `pub(crate)`: reused by [`crate::menu`], which walks the same tree
+/// looking for `.rb` files rather than `.erb`/`_controller.rb`.
+pub(crate) fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -253,7 +260,8 @@ fn collect_source_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// `path` relative to `root`, `/`-joined (a stable id, not reopened).
-fn relative_path(root: &Path, path: &Path) -> String {
+/// `pub(crate)`: reused by [`crate::menu`] (same file-id convention).
+pub(crate) fn relative_path(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -293,8 +301,10 @@ fn controller_source_screen(path: &Path) -> String {
 
 /// Every route-helper token (`<stem>_path` / `<stem>_url`) on `line`.
 /// `<stem>` is a lowercase Ruby identifier run; the helper is the whole
-/// `<stem>_path`/`<stem>_url` token, on a word boundary.
-fn route_helpers(line: &str) -> Vec<String> {
+/// `<stem>_path`/`<stem>_url` token, on a word boundary. `pub(crate)`:
+/// reused by [`crate::menu`] as the route-helper fallback when a `push`
+/// call names its target with a path helper instead of `controller:`.
+pub(crate) fn route_helpers(line: &str) -> Vec<String> {
     let chars: Vec<char> = line.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -318,8 +328,9 @@ fn route_helpers(line: &str) -> Vec<String> {
 
 /// The resource stem of a route helper: drop the trailing `_path`/`_url`
 /// and any leading `new_`/`edit_` action prefix. `edit_project_path` →
-/// `project`; `projects_path` → `projects`.
-fn resource_stem(helper: &str) -> String {
+/// `project`; `projects_path` → `projects`. `pub(crate)`: reused by
+/// [`crate::menu`].
+pub(crate) fn resource_stem(helper: &str) -> String {
     let base = helper
         .strip_suffix("_path")
         .or_else(|| helper.strip_suffix("_url"))
@@ -334,7 +345,8 @@ fn resource_stem(helper: &str) -> String {
 /// `work_package`↔`work_packages`). NOT a full inflector — only the
 /// trailing-`s` case, which covers the overwhelming majority of Rails
 /// resource routes; irregular plurals are out of scope (documented).
-fn screen_matches(stem: &str, screen: &str) -> bool {
+/// `pub(crate)`: reused by [`crate::menu`].
+pub(crate) fn screen_matches(stem: &str, screen: &str) -> bool {
     if stem == screen {
         return true;
     }
