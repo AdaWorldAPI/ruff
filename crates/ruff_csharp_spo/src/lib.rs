@@ -189,4 +189,31 @@ mod tests {
             err.message
         );
     }
+    /// The UI-CONFIG arm (Phase 0 labyrinth recon, the room map) —
+    /// `surfaces_concept` / `handles_event` / `contains_control`
+    /// (`EmitUiConfigArm` + the `--room-aliases` config binding). One line
+    /// per predicate, shaped exactly as `harvester/Program.cs` emits it
+    /// (verified against a real WinForms corpus: screen-classified types,
+    /// Designer `+=` wiring, `Controls.Add` containment, directory→concept
+    /// alias rows). The Klickweg EDGES ride the nav-arm test above; this
+    /// pins the room-map half. A clean load is the standing proof the
+    /// config plane stays inside the closed vocabulary.
+    #[test]
+    fn loads_and_validates_ui_config_arm_ndjson() {
+        let ndjson = concat!(
+            // room-alias concept binding (Authoritative — config-declared)
+            r#"{"s":"csharp:uc_cipher_main","p":"surfaces_concept","o":"cipher_key","f":0.95,"c":0.9}"#,
+            "\n",
+            // Designer event wiring `this.btnSave.Click += new EventHandler(this.btnSave_Click)`
+            r#"{"s":"csharp:uc_cipher_main.btnSave","p":"handles_event","o":"Click:csharp:uc_cipher_main.btnSave_Click","f":0.95,"c":0.9}"#,
+            "\n",
+            // Designer containment `this.panel1.Controls.Add(this.grid)`
+            r#"{"s":"csharp:uc_cipher_main.panel1","p":"contains_control","o":"csharp:uc_cipher_main.grid","f":0.95,"c":0.9}"#,
+            "\n",
+        );
+        let triples = load(ndjson).expect("every UI-config-arm predicate is in the closed vocab");
+        assert_eq!(triples.len(), 3);
+        assert_eq!(triples[0].o, "cipher_key");
+    }
+
 }

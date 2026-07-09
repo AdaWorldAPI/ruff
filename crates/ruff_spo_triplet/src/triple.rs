@@ -541,6 +541,34 @@ pub enum Predicate {
     /// syntax-only ERB scan (the form-builder helper name, not a resolved view
     /// object).
     RendersAs,
+
+    // ───── UI-config plane (Phase 0 labyrinth recon, the room map) ─────
+    //
+    // The config half of the navigation harvest: [`Self::NavigatesTo`] /
+    // [`Self::SelectsView`] carry the Klickweg EDGES; these three carry the
+    // ROOM MAP a concept re-keying pass navigates by — which concept a
+    // screen surfaces (corpus-owner config), how its controls wire to
+    // handlers, and how its control tree nests. A WinForms app carries
+    // this in `.Designer.cs` + room-directory conventions; a Rails app in
+    // ERB partial trees + route scopes. (MedCare transcode doctrine
+    // Phase 0 — `MedCare-rs/.claude/knowledge/medcare-transcode-doctrine.md`.)
+    /// `(screen, surfaces_concept, concept)` — a room-alias config row binds
+    /// this screen's room (its source directory / name family, e.g.
+    /// `con_lab` → `lab`) to a domain concept. Authoritative: the binding
+    /// is a machine-readable config-table row supplied by the corpus owner
+    /// (data-as-config), not a heuristic — the config IS the claim.
+    SurfacesConcept,
+    /// `(screen.control, handles_event, "<event>:<handler-IRI>")` — Designer
+    /// event wiring: `this.<control>.<Event> += new …(this.<Handler>)`.
+    /// Object rides the established `<discriminant>:<target>` object-slot
+    /// encoding (like [`Self::HasCallback`]'s `<phase>:<target>`).
+    /// Authoritative: the `+=` subscription names both ends unambiguously.
+    HandlesEvent,
+    /// `(parent, contains_control, screen.control)` — Designer containment:
+    /// `this.<parent>.Controls.Add(this.<child>)` (parent = the screen class
+    /// IRI when the receiver is the screen itself). Authoritative: the
+    /// containment call is machine-readable syntax.
+    ContainsControl,
 }
 
 impl Predicate {
@@ -623,6 +651,10 @@ impl Predicate {
             Self::SelectsView => "selects_view",
             Self::InvokesAction => "invokes_action",
             Self::RendersAs => "renders_as",
+            // UI-config plane (room map)
+            Self::SurfacesConcept => "surfaces_concept",
+            Self::HandlesEvent => "handles_event",
+            Self::ContainsControl => "contains_control",
         }
     }
 
@@ -711,6 +743,10 @@ impl Predicate {
             "selects_view" => Self::SelectsView,
             "invokes_action" => Self::InvokesAction,
             "renders_as" => Self::RendersAs,
+            // UI-config plane (room map)
+            "surfaces_concept" => Self::SurfacesConcept,
+            "handles_event" => Self::HandlesEvent,
+            "contains_control" => Self::ContainsControl,
             _ => return None,
         })
     }
@@ -798,6 +834,10 @@ impl Predicate {
         Self::SelectsView,
         Self::InvokesAction,
         Self::RendersAs,
+        // UI-config plane (room map)
+        Self::SurfacesConcept,
+        Self::HandlesEvent,
+        Self::ContainsControl,
     ];
 
     /// The default provenance tier for this predicate, per the Odoo
@@ -835,7 +875,13 @@ impl Predicate {
             | Self::InverseName
             | Self::RelationKind
             | Self::WritesField
-            | Self::WritesIfBlank => Provenance::Authoritative,
+            | Self::WritesIfBlank
+            // Navigation plane: the `+=` wiring and `Controls.Add` name both
+            // ends in machine-readable syntax; the room-alias binding is a
+            // corpus-owner config row (the config IS the claim).
+            | Self::SurfacesConcept
+            | Self::HandlesEvent
+            | Self::ContainsControl => Provenance::Authoritative,
             // Body-inferred (heuristic by definition) — including the two
             // C++ metaprogramming-residual predicates (macro provenance,
             // single-TU template instantiation visibility) and the
@@ -1013,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_count_locked_at_68() {
+    fn predicate_count_locked_at_71() {
         // The exact count is part of the schema contract: 7 core (Odoo
         // Python) + 32 OpenProject AR-shape (PR #15 added
         // `association_kind`; #18 added `class_name`; #21 added
@@ -1052,7 +1098,12 @@ mod tests {
         // (text/select/checkbox/…); the "how a field renders" half that pairs
         // with `ViewFieldSet`'s "which fields", so codegen emits the right
         // input element. Ruby ERB form-builder arm) = 68.
-        assert_eq!(Predicate::ALL.len(), 68);
+        // + 3 UI-config plane (`surfaces_concept` / `handles_event` /
+        // `contains_control` — the Phase 0 labyrinth-recon ROOM MAP: the
+        // corpus-owner room→concept binding, Designer event wiring, and
+        // control-tree containment a concept re-keying pass navigates by;
+        // MedCare transcode doctrine Phase 0) = 71.
+        assert_eq!(Predicate::ALL.len(), 71);
     }
 
     #[test]
