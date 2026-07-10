@@ -15,7 +15,10 @@
 //! cargo run -p ruff_spo_triplet --example rekey_exam -- <harvest.ndjson> <exam.conf>
 //! ```
 //!
-//! Config format (one directive per line; `#` comments):
+//! Config format (one directive per line; `#` comments) — parsed by
+//! [`ruff_spo_triplet::parse`] (the `ruff_spo_triplet::exam_config` module
+//! owns the authoritative directive-vocabulary doc; reproduced here for
+//! convenience since this example is the reference oracle for the format):
 //! ```text
 //! verb=add:create        # method-name verb token -> canonical verb
 //! scope=pf               # scope token stripped after the verb
@@ -47,76 +50,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use ruff_spo_triplet::{
-    ConceptConvention, Model, ModelGraph, NameGrammar, SurfaceConvention, SurfaceKind,
-    check_model_graph, classify_surface, from_ndjson, parse_structured_name,
-    reassemble_model_graph, rekey_model,
+    Model, ModelGraph, check_model_graph, classify_surface, from_ndjson, parse,
+    parse_structured_name, reassemble_model_graph, rekey_model,
 };
-
-struct ExamConfig {
-    convention: ConceptConvention,
-    surfaces: SurfaceConvention,
-    grammar: NameGrammar,
-    codebook: Vec<(String, u16)>,
-    expect: Vec<String>,
-}
-
-fn parse_config(text: &str) -> ExamConfig {
-    let mut convention = ConceptConvention::default();
-    let mut surfaces = SurfaceConvention::default();
-    let mut grammar = NameGrammar::default();
-    let mut codebook = Vec::new();
-    let mut expect = Vec::new();
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "verb" => {
-                if let Some((tok, canon)) = value.split_once(':') {
-                    convention
-                        .verbs
-                        .push((tok.trim().to_string(), canon.trim().to_string()));
-                }
-            }
-            "scope" => convention.scopes.push(value.trim().to_string()),
-            "alias" => {
-                if let Some((from, to)) = value.split_once(':') {
-                    convention
-                        .concept_aliases
-                        .push((from.trim().to_string(), to.trim().to_string()));
-                }
-            }
-            "codebook" => {
-                if let Some((name, id)) = value.split_once(':') {
-                    let id = id.trim().trim_start_matches("0x");
-                    if let Ok(id) = u16::from_str_radix(id, 16) {
-                        codebook.push((name.trim().to_string(), id));
-                    }
-                }
-            }
-            "expect" => expect.push(value.trim().to_string()),
-            "surface" => {
-                if let Some((tok, kind)) = value.split_once(':')
-                    && let Some(kind) = SurfaceKind::from_config_token(kind.trim())
-                {
-                    surfaces.surfaces.push((tok.trim().to_string(), kind));
-                }
-            }
-            "grammar_strip" => grammar.strip_prefixes.push(value.trim().to_string()),
-            "grammar_marker" => grammar.marker = value.trim().to_string(),
-            "grammar_tier" => grammar.tier_names.push(value.trim().to_string()),
-            _ => {}
-        }
-    }
-    ExamConfig {
-        convention,
-        surfaces,
-        grammar,
-        codebook,
-        expect,
-    }
-}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -125,7 +61,7 @@ fn main() {
         std::process::exit(2);
     };
     let ndjson = std::fs::read_to_string(&ndjson_path).expect("read harvest ndjson");
-    let conf = parse_config(&std::fs::read_to_string(&conf_path).expect("read exam config"));
+    let conf = parse(&std::fs::read_to_string(&conf_path).expect("read exam config"));
 
     let triples = from_ndjson(&ndjson).expect("harvest validates against the closed vocab");
     // Derive the corpus namespace from the first class anchor (same rule
