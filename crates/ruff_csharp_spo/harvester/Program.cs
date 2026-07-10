@@ -348,6 +348,17 @@ return 0;
 //   contains_control `this.<parent>.Controls.Add(this.<child>)`
 //                    → (Class.parent|Class, contains_control, ns:Class.child)
 //                    Authoritative: machine-readable containment call.
+//   docked_at        `this.<ctrl>.Dock = System.Windows.Forms.DockStyle.<Style>;`
+//                    (also matches the unqualified `DockStyle.<Style>` form —
+//                    only the outermost member-access segment is read either way)
+//                    → (Class.ctrl, docked_at, "<style, lowercase>")
+//                    Authoritative: DockStyle is a closed WinForms enum.
+//   tab_order        `this.<ctrl>.TabIndex = <N>;`
+//                    → (Class.ctrl, tab_order, "<N>")
+//                    Authoritative: TabIndex is a machine-readable int literal.
+//   opens_popup      `this.<ctrl>.ContextMenuStrip = this.<menuCtrl>;`
+//                    → (Class.ctrl, opens_popup, ns:Class.menuCtrl)
+//                    Authoritative: machine-readable Designer assignment.
 //
 // The Klickweg EDGES (navigates_to / selects_view) are EmitNavArm's job —
 // this arm carries only the room map. Syntax-only, no SemanticModel.
@@ -429,6 +440,55 @@ static void EmitUiConfigArm(
                             0.95,
                             0.90));
                     }
+                    break;
+                }
+
+            // Designer layout: <control-chain>.Dock = System.Windows.Forms.DockStyle.<Style>
+            // (also matches the unqualified `DockStyle.<Style>` form — LastIdentifier
+            // only reads the outermost member-access segment either way).
+            case AssignmentExpressionSyntax dockAsg
+                when dockAsg.IsKind(SyntaxKind.SimpleAssignmentExpression)
+                     && dockAsg.Left is MemberAccessExpressionSyntax { Name.Identifier.Text: "Dock" } dockAccess
+                     && LastIdentifier(dockAsg.Right) is { } dockStyle:
+                {
+                    triples.Add(new Triple(
+                        SubjectOf(dockAccess.Expression),
+                        "docked_at",
+                        dockStyle.ToLowerInvariant(),
+                        0.95,
+                        0.90));
+                    break;
+                }
+
+            // Designer layout: <control-chain>.TabIndex = <N>.
+            case AssignmentExpressionSyntax tabAsg
+                when tabAsg.IsKind(SyntaxKind.SimpleAssignmentExpression)
+                     && tabAsg.Left is MemberAccessExpressionSyntax { Name.Identifier.Text: "TabIndex" } tabAccess
+                     && tabAsg.Right is LiteralExpressionSyntax
+                        { RawKind: (int)SyntaxKind.NumericLiteralExpression } tabLiteral:
+                {
+                    triples.Add(new Triple(
+                        SubjectOf(tabAccess.Expression),
+                        "tab_order",
+                        tabLiteral.Token.ValueText,
+                        0.95,
+                        0.90));
+                    break;
+                }
+
+            // Designer popup wiring: <control-chain>.ContextMenuStrip = this.<menuCtrl>.
+            case AssignmentExpressionSyntax menuAsg
+                when menuAsg.IsKind(SyntaxKind.SimpleAssignmentExpression)
+                     && menuAsg.Left is MemberAccessExpressionSyntax
+                        { Name.Identifier.Text: "ContextMenuStrip" } menuAccess
+                     && menuAsg.Right is MemberAccessExpressionSyntax:
+                {
+                    triples.Add(new Triple(
+                        SubjectOf(menuAccess.Expression),
+                        "opens_popup",
+                        SubjectOf(menuAsg.Right),
+                        0.95,
+                        0.90));
                     break;
                 }
 
