@@ -27,6 +27,11 @@
 //!                        # grid / localization). Methods matching a surface
 //!                        # row are classified OUT of the concept plane
 //!                        # before residue accounting (doctrine Phase 3).
+//! grammar_strip=form     # structured-name grammar (doctrine Phase 5):
+//! grammar_marker=f       # leading tokens to strip / the numbered-path
+//! grammar_tier=form      # marker / tier names outermost-first. Residues
+//! grammar_tier=section   # that parse land on the PROTOCOL plane
+//!                        # (part_of tree nodes), not the unbound ledger.
 //! ```
 
 #![expect(
@@ -37,13 +42,15 @@
 use std::collections::BTreeMap;
 
 use ruff_spo_triplet::{
-    ConceptConvention, Model, ModelGraph, SurfaceConvention, SurfaceKind, check_model_graph,
-    classify_surface, from_ndjson, reassemble_model_graph, rekey_model,
+    ConceptConvention, Model, ModelGraph, NameGrammar, SurfaceConvention, SurfaceKind,
+    check_model_graph, classify_surface, from_ndjson, parse_structured_name,
+    reassemble_model_graph, rekey_model,
 };
 
 struct ExamConfig {
     convention: ConceptConvention,
     surfaces: SurfaceConvention,
+    grammar: NameGrammar,
     codebook: Vec<(String, u16)>,
     expect: Vec<String>,
 }
@@ -51,6 +58,7 @@ struct ExamConfig {
 fn parse_config(text: &str) -> ExamConfig {
     let mut convention = ConceptConvention::default();
     let mut surfaces = SurfaceConvention::default();
+    let mut grammar = NameGrammar::default();
     let mut codebook = Vec::new();
     let mut expect = Vec::new();
     for line in text.lines() {
@@ -90,12 +98,16 @@ fn parse_config(text: &str) -> ExamConfig {
                     surfaces.surfaces.push((tok.trim().to_string(), kind));
                 }
             }
+            "grammar_strip" => grammar.strip_prefixes.push(value.trim().to_string()),
+            "grammar_marker" => grammar.marker = value.trim().to_string(),
+            "grammar_tier" => grammar.tier_names.push(value.trim().to_string()),
             _ => {}
         }
     }
     ExamConfig {
         convention,
         surfaces,
+        grammar,
         codebook,
         expect,
     }
@@ -137,6 +149,13 @@ fn main() {
     let mut residue_histogram: BTreeMap<String, usize> = BTreeMap::new();
     let mut surface_histogram: BTreeMap<String, usize> = BTreeMap::new();
     let mut surface_total = 0usize;
+    // Protocol plane (doctrine Phase 5): un-aliased residues whose spelling
+    // parses against the structured-name grammar are name-embedded tree
+    // addresses (CRF form/section coordinates) — part_of nodes, never
+    // unbound concepts.
+    let grammar_armed = !conf.grammar.marker.is_empty() || !conf.grammar.tier_names.is_empty();
+    let mut protocol_histogram: BTreeMap<String, usize> = BTreeMap::new();
+    let mut protocol_total = 0usize;
     for model in &graph.models {
         let outcome = rekey_model(model, &conf.convention);
         keyed_total += outcome.keyed.len();
@@ -147,6 +166,24 @@ fn main() {
                 *surface_histogram
                     .entry(format!("{:?}/{}", surface.kind, surface.surface))
                     .or_default() += 1;
+                continue;
+            }
+            if grammar_armed
+                && !split.aliased
+                && let Some(parsed) = parse_structured_name(&split.concept, &conf.grammar)
+            {
+                protocol_total += 1;
+                let mut path = String::new();
+                for (tier, n) in &parsed.tiers {
+                    if !path.is_empty() {
+                        path.push('/');
+                    }
+                    path.push_str(&format!("{tier}_{n}"));
+                }
+                if !parsed.residue.is_empty() {
+                    path.push_str(&format!(" (+{})", parsed.residue.join("_")));
+                }
+                *protocol_histogram.entry(path).or_default() += 1;
                 continue;
             }
             *concept_methods.entry(split.concept.clone()).or_default() += 1;
@@ -180,6 +217,14 @@ fn main() {
         surfaces.sort_by(|a, b| b.1.cmp(a.1));
         for (surface, n) in surfaces {
             println!("  {n:5}  {surface}");
+        }
+    }
+    if protocol_total > 0 {
+        println!("protocol nodes (structured-name plane, part_of tree): {protocol_total} methods");
+        let mut nodes: Vec<(&String, &usize)> = protocol_histogram.iter().collect();
+        nodes.sort_by(|a, b| b.1.cmp(a.1));
+        for (node, n) in nodes {
+            println!("  {n:5}  {node}");
         }
     }
     println!("concepts bound ({}):", check.bound.len());
