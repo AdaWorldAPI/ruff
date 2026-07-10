@@ -184,14 +184,33 @@ fn main() {
             concept_methods.get(&b.concept).copied().unwrap_or(0)
         );
     }
-    println!("unbound concept residues (next config facts), top 15:");
-    let mut unbound: Vec<(&String, &usize)> = residue_histogram
+    // Split the unbound residues into concept CANDIDATES (multi-token
+    // residues — a real concept name is almost always compound, e.g.
+    // `external_practice`) and the WEAK-TOKEN TAIL (single bare tokens
+    // like `data`/`form`/`chart`/`range` that substring-collide with
+    // framework/lifecycle noise and rank misleadingly against genuine
+    // candidates). A single-token residue is one with no `_` separator
+    // after re-keying. Report them apart so the concept-candidate ranking
+    // is not polluted by generic dictionary words.
+    let unbound: Vec<(&String, &usize)> = residue_histogram
         .iter()
         .filter(|(c, _)| !check.bound.iter().any(|b| &b.concept == *c))
         .collect();
-    unbound.sort_by(|a, b| b.1.cmp(a.1));
-    for (concept, n) in unbound.into_iter().take(15) {
+    let (weak_tail, candidates): (Vec<_>, Vec<_>) =
+        unbound.into_iter().partition(|(c, _)| !c.contains('_'));
+    println!("unbound concept residues (next config facts), top 15:");
+    let mut candidates = candidates;
+    candidates.sort_by(|a, b| b.1.cmp(a.1));
+    for (concept, n) in candidates.into_iter().take(15) {
         println!("  {n:5}  {concept}");
+    }
+    if !weak_tail.is_empty() {
+        println!("weak-token tail (single-token residues, ranked separately):");
+        let mut weak_tail = weak_tail;
+        weak_tail.sort_by(|a, b| b.1.cmp(a.1));
+        for (concept, n) in weak_tail.into_iter().take(10) {
+            println!("  {n:5}  {concept}");
+        }
     }
 
     // The exam gate: every expected concept bound, nonzero.
