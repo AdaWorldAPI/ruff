@@ -86,9 +86,13 @@ pub struct SchemaSurface {
 /// surface — an ordinary domain action or slag).
 ///
 /// When more than one surface token is present in the name (e.g. both
-/// `option` and `template`), the FIRST one in name order wins — the
-/// convention is read left-to-right, same as the verb+concept+facet
-/// grammar it sits inside.
+/// `option` and `template` in `add_option_widget_template`), the LAST
+/// one in name order wins: the trailing table-kind token names the
+/// actual storage (`… option … template` reads "a TEMPLATE of options"),
+/// so `get_option_*_template` / `add_option_*_template` classify as
+/// [`SurfaceKind::TemplateSource`], never as an enum source. Every
+/// matched surface token is excluded from the residue — the residue is
+/// the concept+facet material only.
 #[must_use]
 pub fn classify_surface(
     name: &str,
@@ -103,24 +107,25 @@ pub fn classify_surface(
         return None;
     }
 
-    let mut matched: Option<(usize, SurfaceKind, String)> = None;
+    let mut surface_indices: Vec<usize> = Vec::new();
+    let mut matched: Option<(SurfaceKind, String)> = None;
     for (idx, tok) in tokens.iter().enumerate().skip(1) {
         if let Some((_, kind)) = conv
             .surfaces
             .iter()
             .find(|(surface_tok, _)| surface_tok.eq_ignore_ascii_case(tok))
         {
-            matched = Some((idx, *kind, tok.clone()));
-            break;
+            surface_indices.push(idx);
+            matched = Some((*kind, tok.clone()));
         }
     }
 
-    let (surface_idx, kind, surface) = matched?;
+    let (kind, surface) = matched?;
 
     let residue = tokens
         .into_iter()
         .enumerate()
-        .filter(|(idx, _)| *idx != 0 && *idx != surface_idx)
+        .filter(|(idx, _)| *idx != 0 && !surface_indices.contains(idx))
         .map(|(_, tok)| tok)
         .collect();
 
@@ -160,18 +165,18 @@ mod tests {
     }
 
     /// `add_option_widget_template` — BOTH `option` and `template` are
-    /// present as surface tokens. Naive intuition says "it ends in
-    /// `_template`, so it's a TemplateSource" — but the rule is
-    /// first-match-in-name-order, and `option` (index 1) comes before
-    /// `template` (index 3). So this classifies as EnumSource on
-    /// `option`, with `template` folded into the residue.
+    /// present as surface tokens. The LAST match in name order wins: the
+    /// trailing table-kind token names the actual storage ("a TEMPLATE
+    /// of options"), so `add_option_*_template` is a TemplateSource —
+    /// never an enum source (codex P2 on PR #72). Every matched surface
+    /// token leaves the residue: only the concept material remains.
     #[test]
-    fn first_matching_surface_token_in_name_order_wins() {
+    fn last_matching_surface_token_in_name_order_wins() {
         let result =
             classify_surface("add_option_widget_template", &verbs(), &convention()).unwrap();
-        assert_eq!(result.kind, SurfaceKind::EnumSource);
-        assert_eq!(result.surface, "option");
-        assert_eq!(result.residue, vec!["widget", "template"]);
+        assert_eq!(result.kind, SurfaceKind::TemplateSource);
+        assert_eq!(result.surface, "template");
+        assert_eq!(result.residue, vec!["widget"]);
     }
 
     /// `get_invoice` — verb present, but no surface token anywhere in the
