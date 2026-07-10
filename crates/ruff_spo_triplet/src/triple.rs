@@ -511,12 +511,17 @@ pub enum Predicate {
     /// [`Provenance::Inferred`]**.
     SelectsView,
 
-    /// `(screen, invokes_action, "<resource>#<member_action>")` — a **mutating
+    /// `(screen, invokes_action, "<ns>:<stem>")` — a **mutating
     /// UI action affordance**: a button/link that triggers a non-GET HTTP verb
     /// (a Rails `button_to`, or `link_to … method: :patch|:put|:delete|:post`,
     /// or a form submit), as opposed to a plain [`Self::NavigatesTo`] GET link.
-    /// The object names the ACTION the affordance invokes (the route helper's
-    /// resource + member-action stem, e.g. `work_package#complete`), NOT a
+    /// The object names the ACTION the affordance invokes — the BARE route
+    /// helper stem (e.g. `complete_work_package`), no `#` separator (S3
+    /// finding 7 drive-by fix: earlier revisions of this doc claimed the
+    /// object was `"<resource>#<member_action>"`; the actual emitted object
+    /// is `format!("{namespace}:{}", target)` — the same bare-stem shape
+    /// `ruff_ruby_spo::routes::RoutesTo`'s subject uses, which is exactly
+    /// what makes the two arms joinable), NOT a
     /// screen — the same discipline as [`Self::SelectsView`]: it keeps
     /// `navigates_to` a pure screen→screen graph and gives codegen a distinct
     /// "emit a button" affordance separate from "emit a link". The HTTP verb
@@ -569,6 +574,35 @@ pub enum Predicate {
     /// IRI when the receiver is the screen itself). Authoritative: the
     /// containment call is machine-readable syntax.
     ContainsControl,
+
+    // ───── Rails routes.rb stratum (config-as-data) ─────
+    //
+    // The routing layer the UI-navigation/action arms couldn't supply:
+    // `InvokesAction`'s object is a route-helper STEM that, until now,
+    // resolved to nothing. This arm mints the missing hop — helper stem →
+    // `controller#action` — so button → route → controller → mutation
+    // traces become joinable (`ruff_ruby_spo::routes::RouteTable::resolve`
+    // is the runtime joint; these two predicates are its SPO projection).
+    /// `(ns:<stem>, routes_to, "<verb>:<controller>#<action>")` — a Rails
+    /// route declaration (`resources`/`resource` canonical action, a
+    /// `member`/`collection` verb call, or a standalone `get`/`post`/…)
+    /// resolved to its controller#action. One triple per (stem, verb) —
+    /// canonical `show`/`update`/`destroy` share a stem but differ by verb,
+    /// so the verb rides the object's `<verb>:` discriminant (the same
+    /// compounding idiom [`Self::HasCallback`]'s `<phase>:<target>` object
+    /// uses). Subject is byte-identical to [`Self::InvokesAction`]'s object
+    /// (`format!("{namespace}:{}", stem)`) — the join contract the whole
+    /// arm exists to supply. Authoritative: the route declaration names
+    /// both the helper stem and the controller#action in machine-readable
+    /// DSL syntax.
+    RoutesTo,
+    /// `(ns:<stem>, route_scope, "member"|"collection"|"canonical"|
+    /// "standalone")` — which Rails route-scope family produced the stem
+    /// (closed 4-value vocab), emitted for EVERY stemmed route declaration.
+    /// Explicit beats closed-world absence for a triple-only consumption
+    /// path. Authoritative: the scope is structurally determined by which
+    /// DSL block/kwarg the route was declared under.
+    RouteScope,
 }
 
 impl Predicate {
@@ -655,6 +689,9 @@ impl Predicate {
             Self::SurfacesConcept => "surfaces_concept",
             Self::HandlesEvent => "handles_event",
             Self::ContainsControl => "contains_control",
+            // Rails routes.rb stratum
+            Self::RoutesTo => "routes_to",
+            Self::RouteScope => "route_scope",
         }
     }
 
@@ -747,6 +784,9 @@ impl Predicate {
             "surfaces_concept" => Self::SurfacesConcept,
             "handles_event" => Self::HandlesEvent,
             "contains_control" => Self::ContainsControl,
+            // Rails routes.rb stratum
+            "routes_to" => Self::RoutesTo,
+            "route_scope" => Self::RouteScope,
             _ => return None,
         })
     }
@@ -838,6 +878,9 @@ impl Predicate {
         Self::SurfacesConcept,
         Self::HandlesEvent,
         Self::ContainsControl,
+        // Rails routes.rb stratum
+        Self::RoutesTo,
+        Self::RouteScope,
     ];
 
     /// The default provenance tier for this predicate, per the Odoo
@@ -947,6 +990,13 @@ impl Predicate {
             // Schema-stratum extension: the constraint is a machine-readable
             // migration-DSL literal — same certainty tier as `writes_field`.
             Self::ColumnNotNull => Provenance::Authoritative,
+            // Rails routes.rb stratum: own standalone arm (mirrors
+            // `ColumnNotNull`'s style) — a route declaration names its
+            // helper stem, verb, controller, and action in machine-readable
+            // DSL syntax; the scope-family classification is structurally
+            // determined by which block/kwarg wraps the declaration. Both
+            // Authoritative.
+            Self::RoutesTo | Self::RouteScope => Provenance::Authoritative,
         }
     }
 }
@@ -1059,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_count_locked_at_71() {
+    fn predicate_count_locked_at_73() {
         // The exact count is part of the schema contract: 7 core (Odoo
         // Python) + 32 OpenProject AR-shape (PR #15 added
         // `association_kind`; #18 added `class_name`; #21 added
@@ -1103,7 +1153,12 @@ mod tests {
         // corpus-owner room→concept binding, Designer event wiring, and
         // control-tree containment a concept re-keying pass navigates by;
         // MedCare transcode doctrine Phase 0) = 71.
-        assert_eq!(Predicate::ALL.len(), 71);
+        // + 2 Rails routes.rb stratum (2026-07-10: `routes_to` / `route_scope`
+        // — the routing-layer arm that mints the missing helper-stem →
+        // controller#action hop `InvokesAction`'s object needed to resolve
+        // against; gap (b) from the RAILS-COVERAGE-KIT gap ledger,
+        // `ruff_ruby_spo::routes`) = 73.
+        assert_eq!(Predicate::ALL.len(), 73);
     }
 
     #[test]

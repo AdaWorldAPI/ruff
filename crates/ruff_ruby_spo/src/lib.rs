@@ -40,6 +40,7 @@ mod menu;
 mod navigation;
 mod parse;
 mod representers;
+mod routes;
 mod schema;
 mod views;
 mod walk;
@@ -55,6 +56,10 @@ pub use navigation::{
     extract_nav_edges_with_report,
 };
 pub use representers::{RepresenterDecl, RepresenterFieldSet, extract_representer_field_sets};
+pub use routes::{
+    RouteEntry, RouteScanReport, RouteScopeKind, RouteTable, RouteVerb, extract_routes,
+    extract_routes_with_report,
+};
 pub use schema::{SchemaReport, extract_app_with_schema};
 pub use views::{
     ViewFieldSet, ViewScanReport, ViewTarget, extract_view_field_sets,
