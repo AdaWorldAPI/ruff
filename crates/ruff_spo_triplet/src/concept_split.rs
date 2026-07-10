@@ -205,7 +205,10 @@ pub fn rekey_model(model: &Model, conv: &ConceptConvention) -> RekeyOutcome {
 
 /// The single source of truth behind both [`split_method_name`] (which
 /// discards the failure reason) and [`rekey_model`] (which needs it).
-fn try_split_method_name(name: &str, conv: &ConceptConvention) -> Result<SplitName, ResidualReason> {
+fn try_split_method_name(
+    name: &str,
+    conv: &ConceptConvention,
+) -> Result<SplitName, ResidualReason> {
     let tokens = tokenize_method_name(name);
     let mut iter = tokens.iter();
     let first = iter.next().ok_or(ResidualReason::NoVerbPrefix)?;
@@ -317,10 +320,7 @@ mod tests {
     fn tokenizer_folds_consecutive_uppercase_acronyms_into_one_token() {
         // "ADD" is a run of uppercase letters with no lowercase in between:
         // it folds to a single "add" token, not three.
-        assert_eq!(
-            tokenize_method_name("ADD_Widget"),
-            vec!["add", "widget"]
-        );
+        assert_eq!(tokenize_method_name("ADD_Widget"), vec!["add", "widget"]);
     }
 
     #[test]
@@ -363,7 +363,8 @@ mod tests {
     fn verb_match_is_case_insensitive() {
         let mut conv = convention();
         conv.verbs = vec![("ADD".to_string(), "create".to_string())];
-        let split = split_method_name("add_Widget", &conv).expect("verb matches case-insensitively");
+        let split =
+            split_method_name("add_Widget", &conv).expect("verb matches case-insensitively");
         assert_eq!(split.verb, "create");
     }
 
@@ -424,16 +425,24 @@ mod tests {
         // Only the LEADING "all" strips (contiguous-from-verb rule); the
         // later "static" token is mid-residue, not a leading scope, so it
         // survives into the joined concept.
-        let split =
-            split_method_name("del_AllOrderLineTotals_StaticModule", &convention()).expect("splits");
+        let split = split_method_name("del_AllOrderLineTotals_StaticModule", &convention())
+            .expect("splits");
         assert_eq!(split.concept, "order_line_totals_static_module");
         assert!(!split.aliased);
     }
 
     #[test]
     fn aliased_flag_is_true_only_when_an_alias_matched() {
-        assert!(split_method_name("add_widget", &convention()).expect("splits").aliased);
-        assert!(!split_method_name("del_static_orderline", &convention()).expect("splits").aliased);
+        assert!(
+            split_method_name("add_widget", &convention())
+                .expect("splits")
+                .aliased
+        );
+        assert!(
+            !split_method_name("del_static_orderline", &convention())
+                .expect("splits")
+                .aliased
+        );
     }
 
     // ── residual reasons ────────────────────────────────────────────────
@@ -481,7 +490,10 @@ mod tests {
         // remaining = ["cipher", "values", "static", "module"]: the full
         // concatenation has no alias, so it falls back to the individual
         // "cipher" token alias.
-        assert_eq!(keyed["del_AllCipherValues_StaticModule"].concept, "cipher_alone");
+        assert_eq!(
+            keyed["del_AllCipherValues_StaticModule"].concept,
+            "cipher_alone"
+        );
         assert_eq!(keyed["get_combo_cipher_typ"].concept, "cipher_kind");
 
         assert_eq!(

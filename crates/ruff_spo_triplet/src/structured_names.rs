@@ -196,7 +196,10 @@ mod tests {
             parsed.tiers,
             vec![("form".to_string(), 2), ("section".to_string(), 3)]
         );
-        assert_eq!(parsed.residue, vec!["wing".to_string(), "relevant".to_string()]);
+        assert_eq!(
+            parsed.residue,
+            vec!["wing".to_string(), "relevant".to_string()]
+        );
     }
 
     #[test]

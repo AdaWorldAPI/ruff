@@ -82,7 +82,9 @@ pub use ir::{
 pub use ndjson::{ParseError, from_ndjson, to_ndjson};
 pub use reassemble::{cpp_projection, reassemble};
 pub use recipe::{RecipeCentroid, classify, is_recoverable};
-pub use structured_names::{NameGrammar, StructuredName, Tier, parse_structured_name, part_of_edges};
+pub use structured_names::{
+    NameGrammar, StructuredName, Tier, parse_structured_name, part_of_edges,
+};
 pub use surface_schema::{SchemaSurface, SurfaceConvention, SurfaceKind, classify_surface};
 pub use triple::{EntityKind, Predicate, Provenance, Triple};
 

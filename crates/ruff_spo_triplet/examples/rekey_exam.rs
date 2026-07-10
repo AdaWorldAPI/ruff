@@ -22,6 +22,11 @@
 //! alias=ciphers:cipher_key     # residue -> canonical concept
 //! codebook=cipher_key:0x0B01   # concept -> classid (the oracle rows)
 //! expect=cipher_key      # concept that MUST bind for the exam to pass
+//! surface=grid:grid      # surface token -> kind (config-as-schema plane;
+//!                        # kinds: enum_source / template_source / subtab /
+//!                        # grid / localization). Methods matching a surface
+//!                        # row are classified OUT of the concept plane
+//!                        # before residue accounting (doctrine Phase 3).
 //! ```
 
 #![expect(
@@ -32,18 +37,20 @@
 use std::collections::BTreeMap;
 
 use ruff_spo_triplet::{
-    ConceptConvention, Model, ModelGraph, check_model_graph, from_ndjson, reassemble_model_graph,
-    rekey_model,
+    ConceptConvention, Model, ModelGraph, SurfaceConvention, SurfaceKind, check_model_graph,
+    classify_surface, from_ndjson, reassemble_model_graph, rekey_model,
 };
 
 struct ExamConfig {
     convention: ConceptConvention,
+    surfaces: SurfaceConvention,
     codebook: Vec<(String, u16)>,
     expect: Vec<String>,
 }
 
 fn parse_config(text: &str) -> ExamConfig {
     let mut convention = ConceptConvention::default();
+    let mut surfaces = SurfaceConvention::default();
     let mut codebook = Vec::new();
     let mut expect = Vec::new();
     for line in text.lines() {
@@ -76,11 +83,19 @@ fn parse_config(text: &str) -> ExamConfig {
                 }
             }
             "expect" => expect.push(value.trim().to_string()),
+            "surface" => {
+                if let Some((tok, kind)) = value.split_once(':')
+                    && let Some(kind) = SurfaceKind::from_config_token(kind.trim())
+                {
+                    surfaces.surfaces.push((tok.trim().to_string(), kind));
+                }
+            }
             _ => {}
         }
     }
     ExamConfig {
         convention,
+        surfaces,
         codebook,
         expect,
     }
@@ -106,15 +121,34 @@ fn main() {
     let graph = reassemble_model_graph(&triples, &namespace);
 
     // Re-key every model; accumulate concept -> method count, plus the slag.
+    // Schema surfaces (doctrine Phase 3, config-as-schema) are pulled OUT of
+    // the concept plane FIRST: a method matching a `surface=` row is config
+    // plumbing wearing a method's clothes (grid autosize, localization pass,
+    // enum/template getters), never a domain action.
+    let verb_tokens: Vec<String> = conf
+        .convention
+        .verbs
+        .iter()
+        .map(|(tok, _)| tok.clone())
+        .collect();
     let mut concept_methods: BTreeMap<String, usize> = BTreeMap::new();
     let mut keyed_total = 0usize;
     let mut residual_total = 0usize;
     let mut residue_histogram: BTreeMap<String, usize> = BTreeMap::new();
+    let mut surface_histogram: BTreeMap<String, usize> = BTreeMap::new();
+    let mut surface_total = 0usize;
     for model in &graph.models {
         let outcome = rekey_model(model, &conf.convention);
         keyed_total += outcome.keyed.len();
         residual_total += outcome.residuals.len();
-        for (_, split) in &outcome.keyed {
+        for (name, split) in &outcome.keyed {
+            if let Some(surface) = classify_surface(name, &verb_tokens, &conf.surfaces) {
+                surface_total += 1;
+                *surface_histogram
+                    .entry(format!("{:?}/{}", surface.kind, surface.surface))
+                    .or_default() += 1;
+                continue;
+            }
             *concept_methods.entry(split.concept.clone()).or_default() += 1;
             if !split.aliased {
                 *residue_histogram.entry(split.concept.clone()).or_default() += 1;
@@ -126,9 +160,7 @@ fn main() {
     // SAME check the codebook-DTO seam uses (Boundary-4: one fold).
     let mut concept_graph = ModelGraph::new("exam");
     for concept in concept_methods.keys() {
-        concept_graph
-            .models
-            .push(Model::new(concept.clone()));
+        concept_graph.models.push(Model::new(concept.clone()));
     }
     let rows: Vec<(&str, u16)> = conf
         .codebook
@@ -142,6 +174,14 @@ fn main() {
         "models: {}   methods keyed: {keyed_total}   slag ledger: {residual_total}",
         graph.models.len()
     );
+    if surface_total > 0 {
+        println!("schema surfaces (config-as-schema plane): {surface_total} methods");
+        let mut surfaces: Vec<(&String, &usize)> = surface_histogram.iter().collect();
+        surfaces.sort_by(|a, b| b.1.cmp(a.1));
+        for (surface, n) in surfaces {
+            println!("  {n:5}  {surface}");
+        }
+    }
     println!("concepts bound ({}):", check.bound.len());
     for b in &check.bound {
         println!(
