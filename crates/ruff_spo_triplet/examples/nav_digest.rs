@@ -19,9 +19,12 @@
 //! Config format: identical directive language to `rekey_exam`'s exam
 //! config (see that example's doc comment, or
 //! `ruff_spo_triplet::exam_config::parse`'s doc comment, for the full
-//! vocabulary) — this oracle only reads the `alias=` and `codebook=` rows,
-//! since navigation-plane resolution needs no verb/scope/surface/grammar
-//! convention.
+//! vocabulary) — this oracle only reads the `alias=`, `codebook=`, and
+//! `region=` rows, since navigation-plane resolution needs no
+//! verb/scope/surface/grammar convention. `region=<dock-token>:<region>`
+//! rows bind a `docked_at` dock token to a region name for the `[regions]`
+//! section; a dock token with no row renders `unmapped:<token>` instead of
+//! dropping.
 //!
 //! Output format: see [`ruff_spo_triplet::build_nav_digest`]'s doc comment
 //! for the exact, diffable digest shape — every section sorted

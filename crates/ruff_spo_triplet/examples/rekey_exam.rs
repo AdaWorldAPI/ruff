@@ -39,6 +39,13 @@
 //!                        # marker-less mode would silently eat un-aliased
 //!                        # `<concept>_<digit>` residues (see the armed
 //!                        # gate in main).
+//! region=top:top_bar     # dock token -> region name (the six-region
+//!                        # layout frame: top_bar/left_nav/right_panel/
+//!                        # bottom_bar/center/popup canonically — region
+//!                        # names are free strings from config, not
+//!                        # hardcoded here). Read by the `nav_digest`
+//!                        # oracle's `[regions]` section, not by this
+//!                        # exam (which has no dock/region facts to bind).
 //! ```
 
 #![expect(

@@ -32,6 +32,13 @@ pub struct ExamConfig {
     pub codebook: Vec<(String, u16)>,
     /// Concepts that MUST bind for the exam to pass.
     pub expect: Vec<String>,
+    /// `(dock token, region name)` rows binding a WinForms `Dock` value to
+    /// a canonical region name (the six-region layout frame: `top_bar` /
+    /// `left_nav` / `right_panel` / `bottom_bar` / `center` / `popup`,
+    /// canonically — but region names are free strings supplied by config;
+    /// the parser does not hardcode them). A dock token with no row here
+    /// is reported by consumers as `unmapped:<token>` rather than dropped.
+    pub regions: Vec<(String, String)>,
 }
 
 /// Parse an exam-config file.
@@ -58,12 +65,21 @@ pub struct ExamConfig {
 ///                        # marker-less mode would silently eat un-aliased
 ///                        # `<concept>_<digit>` residues (see the armed
 ///                        # gate in `rekey_exam`'s `main`).
+/// region=top:top_bar     # dock token -> region name (the six-region
+///                        # layout frame: top_bar/left_nav/right_panel/
+///                        # bottom_bar/center/popup canonically — region
+///                        # names are free strings from config, not
+///                        # hardcoded here; an unmapped dock token is a
+///                        # consumer-side `unmapped:<token>` fallback).
 /// ```
 ///
 /// A malformed `codebook=` row (non-hex id, or no `:` separator) is
 /// silently dropped — same "unrecognised is ignored" discipline as an
 /// unknown key. An `surface=` row whose kind token doesn't match
-/// [`SurfaceKind::from_config_token`] is dropped the same way.
+/// [`SurfaceKind::from_config_token`] is dropped the same way. A
+/// `region=` row with no `:` separator is dropped identically; the
+/// parser does not validate the dock-token or region-name spelling
+/// (that's a consumer-side lookup, not a parse-time constraint).
 #[must_use]
 pub fn parse(text: &str) -> ExamConfig {
     let mut convention = ConceptConvention::default();
@@ -71,6 +87,7 @@ pub fn parse(text: &str) -> ExamConfig {
     let mut grammar = NameGrammar::default();
     let mut codebook = Vec::new();
     let mut expect = Vec::new();
+    let mut regions = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let Some((key, value)) = line.split_once('=') else {
@@ -111,6 +128,11 @@ pub fn parse(text: &str) -> ExamConfig {
             "grammar_strip" => grammar.strip_prefixes.push(value.trim().to_string()),
             "grammar_marker" => grammar.marker = value.trim().to_string(),
             "grammar_tier" => grammar.tier_names.push(value.trim().to_string()),
+            "region" => {
+                if let Some((tok, region)) = value.split_once(':') {
+                    regions.push((tok.trim().to_string(), region.trim().to_string()));
+                }
+            }
             _ => {}
         }
     }
@@ -120,6 +142,7 @@ pub fn parse(text: &str) -> ExamConfig {
         grammar,
         codebook,
         expect,
+        regions,
     }
 }
 
@@ -209,5 +232,23 @@ mod tests {
     fn bad_hex_codebook_row_is_skipped() {
         let cfg = parse("codebook=cipher_key:not_hex\ncodebook=widget:0x10\n");
         assert_eq!(cfg.codebook, vec![("widget".to_string(), 0x10)]);
+    }
+
+    #[test]
+    fn region_directive_parses() {
+        let cfg = parse("region=top:top_bar\nregion=fill:center\n");
+        assert_eq!(
+            cfg.regions,
+            vec![
+                ("top".to_string(), "top_bar".to_string()),
+                ("fill".to_string(), "center".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_region_row_with_no_separator_is_skipped() {
+        let cfg = parse("region=bogus\nregion=left:left_nav\n");
+        assert_eq!(cfg.regions, vec![("left".to_string(), "left_nav".to_string())]);
     }
 }

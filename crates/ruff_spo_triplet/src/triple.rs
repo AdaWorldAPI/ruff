@@ -603,6 +603,34 @@ pub enum Predicate {
     /// path. Authoritative: the scope is structurally determined by which
     /// DSL block/kwarg the route was declared under.
     RouteScope,
+
+    // ───── UI-layout plane (WinForms Designer dock/tab-order/popup) ─────
+    //
+    // The declarative layout-INTENT facts a WinForms `.Designer.cs` file
+    // carries per control, distinct from the topology facts in the
+    // UI-navigation plane above: which of the six region docks a control
+    // snaps to (`Dock = DockStyle.*`), its keyboard/tab traversal order
+    // (`TabIndex = N`), and which context menu it opens
+    // (`ContextMenuStrip = ...`). All three ride a property ASSIGNMENT in
+    // generated Designer code — machine-readable AST literals, the same
+    // certainty tier as [`Self::HandlesEvent`] / [`Self::ContainsControl`].
+    /// `(screen.control, docked_at, "<dock-token>")` — a `Dock =
+    /// DockStyle.<Top|Left|Right|Bottom|Fill|None>` assignment, object
+    /// lowercased (`top`/`left`/`right`/`bottom`/`fill`/`none`).
+    /// Authoritative: the Designer's `Dock` property assignment is a
+    /// machine-readable enum literal.
+    DockedAt,
+    /// `(screen.control, tab_order, "<N>")` — a `TabIndex = N` assignment,
+    /// object the decimal integer verbatim. Authoritative: same
+    /// declarative-literal certainty as [`Self::DockedAt`].
+    TabOrder,
+    /// `(screen.control, opens_popup, screen.menuControl)` — a
+    /// `ContextMenuStrip = this.<menuControl>` assignment: the control
+    /// opens the named `ContextMenuStrip` on right-click. Object is the
+    /// menu control's own IRI (`ns:Screen.menuControl`), the same
+    /// target-IRI object-slot shape as [`Self::HandlesEvent`].
+    /// Authoritative: the assignment names the menu control unambiguously.
+    OpensPopup,
 }
 
 impl Predicate {
@@ -692,6 +720,10 @@ impl Predicate {
             // Rails routes.rb stratum
             Self::RoutesTo => "routes_to",
             Self::RouteScope => "route_scope",
+            // UI-layout plane
+            Self::DockedAt => "docked_at",
+            Self::TabOrder => "tab_order",
+            Self::OpensPopup => "opens_popup",
         }
     }
 
@@ -787,6 +819,10 @@ impl Predicate {
             // Rails routes.rb stratum
             "routes_to" => Self::RoutesTo,
             "route_scope" => Self::RouteScope,
+            // UI-layout plane
+            "docked_at" => Self::DockedAt,
+            "tab_order" => Self::TabOrder,
+            "opens_popup" => Self::OpensPopup,
             _ => return None,
         })
     }
@@ -795,8 +831,9 @@ impl Predicate {
     /// closed-vocab round-trip test and by any consumer that needs to
     /// enumerate the whole surface (e.g. the ndjson validator).
     ///
-    /// **Length invariant:** `ALL.len() == 62` (7 core + 32 AR-shape +
-    /// 18 C++ machine-plane + 3 Odoo-relational + 2 body-mutation). A new
+    /// **Length invariant:** `ALL.len() == 76` (7 core + 32 AR-shape +
+    /// 18 C++ machine-plane + 3 Odoo-relational + 4 body-mutation +
+    /// 4 UI-navigation + 3 UI-config + 2 Rails-routes + 3 UI-layout). A new
     /// variant added to [`Predicate`] **must** be appended here in the same
     /// order, or the closed-vocab round-trip test fails.
     pub const ALL: &'static [Predicate] = &[
@@ -881,6 +918,10 @@ impl Predicate {
         // Rails routes.rb stratum
         Self::RoutesTo,
         Self::RouteScope,
+        // UI-layout plane
+        Self::DockedAt,
+        Self::TabOrder,
+        Self::OpensPopup,
     ];
 
     /// The default provenance tier for this predicate, per the Odoo
@@ -924,7 +965,13 @@ impl Predicate {
             // corpus-owner config row (the config IS the claim).
             | Self::SurfacesConcept
             | Self::HandlesEvent
-            | Self::ContainsControl => Provenance::Authoritative,
+            | Self::ContainsControl
+            // UI-layout plane: Dock / TabIndex / ContextMenuStrip are
+            // property assignments in generated Designer code — the same
+            // machine-readable-literal certainty as the room-map facts.
+            | Self::DockedAt
+            | Self::TabOrder
+            | Self::OpensPopup => Provenance::Authoritative,
             // Body-inferred (heuristic by definition) — including the two
             // C++ metaprogramming-residual predicates (macro provenance,
             // single-TU template instantiation visibility) and the
@@ -1109,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_count_locked_at_73() {
+    fn predicate_count_locked_at_76() {
         // The exact count is part of the schema contract: 7 core (Odoo
         // Python) + 32 OpenProject AR-shape (PR #15 added
         // `association_kind`; #18 added `class_name`; #21 added
@@ -1158,7 +1205,13 @@ mod tests {
         // controller#action hop `InvokesAction`'s object needed to resolve
         // against; gap (b) from the RAILS-COVERAGE-KIT gap ledger,
         // `ruff_ruby_spo::routes`) = 73.
-        assert_eq!(Predicate::ALL.len(), 73);
+        // + 3 UI-layout plane (`docked_at` / `tab_order` / `opens_popup` —
+        // the WinForms Designer declarative layout-intent facts: which
+        // region a control docks to, its tab traversal order, and which
+        // context menu it opens. The region-grammar arm — Designer
+        // `Dock` / `TabIndex` / `ContextMenuStrip` property assignments,
+        // all Authoritative) = 76.
+        assert_eq!(Predicate::ALL.len(), 76);
     }
 
     #[test]
