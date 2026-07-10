@@ -943,7 +943,13 @@ pub(crate) fn model_name_for_table(table: &str) -> String {
 }
 
 /// Singularise one `snake_case` segment (the table's final word).
-fn singularize(seg: &str, full_table: &str, irregular: &[(&str, &str)]) -> String {
+///
+/// `pub(crate)` (E4, the routes.rb harvest arm): the ALGORITHM is shared
+/// crate-wide — `crate::routes::singularize_local` calls this with its own
+/// routes-local `IRREGULAR` table — while the constant `IRREGULAR` table
+/// above stays fn-local to this module (routes.rs duplicates the pairs it
+/// needs rather than importing this module's private constant).
+pub(crate) fn singularize(seg: &str, full_table: &str, irregular: &[(&str, &str)]) -> String {
     if let Some((_, singular)) = irregular.iter().find(|(t, _)| *t == full_table) {
         return (*singular).to_string();
     }
