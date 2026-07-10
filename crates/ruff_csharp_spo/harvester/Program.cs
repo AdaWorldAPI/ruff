@@ -64,6 +64,16 @@ var navSelectProps = new HashSet<string>(
     StringComparer.Ordinal);
 var positional = new List<string>();
 
+// ── UI-config plane (Phase 0 labyrinth recon, the room map) ──
+// Data-as-config: the corpus owner supplies the room→concept alias table
+// (`--room-aliases con_lab=lab_value,…`, keyed by source-directory name —
+// empty by default: the binding is the owner's claim, never a built-in
+// guess) and optional room NAME prefixes (`--room-prefixes uc_,mod_,con_`)
+// that extend screen classification beyond the base-type check for corpora
+// whose screens follow a naming discipline.
+var roomAliases = new Dictionary<string, string>(StringComparer.Ordinal);
+var roomPrefixes = new List<string>();
+
 for (var i = 0; i < args.Length; i++)
 {
     switch (args[i])
@@ -83,6 +93,19 @@ for (var i = 0; i < args.Length; i++)
         case "--nav-select-props" when i + 1 < args.Length:
             navSelectProps = new HashSet<string>(SplitCsv(args[++i]), StringComparer.Ordinal);
             break;
+        case "--room-aliases" when i + 1 < args.Length:
+            foreach (var kv in SplitCsv(args[++i]))
+            {
+                var eq = kv.IndexOf('=');
+                if (eq > 0)
+                {
+                    roomAliases[kv[..eq]] = kv[(eq + 1)..];
+                }
+            }
+            break;
+        case "--room-prefixes" when i + 1 < args.Length:
+            roomPrefixes = SplitCsv(args[++i]);
+            break;
         default:
             positional.Add(args[i]);
             break;
@@ -94,7 +117,8 @@ if (positional.Count < 1)
     Console.Error.WriteLine(
         "usage: csharp-spo-harvest <source-root> [out.ndjson] " +
         "[--ns <name>] [--mutator-names a,b,c] [--mutator-prefixes add_,del_] " +
-        "[--mutator-receivers mysql] [--nav-select-props SelectedRibbonTabItem,SelectedTab]");
+        "[--mutator-receivers mysql] [--nav-select-props SelectedRibbonTabItem,SelectedTab] " +
+        "[--room-aliases con_lab=lab_value,…] [--room-prefixes uc_,mod_,con_]");
     return 2;
 }
 
@@ -114,12 +138,14 @@ var isMutatorCall = BuildMutatorPredicate(mutatorNames, mutatorPrefixes, mutator
 var triples = new List<Triple>();
 
 // Parse every file once — reused by the screen-type pre-pass and the main pass.
-var parsed = new List<SyntaxNode>();
+// The source path rides along so the room-alias binding can key on the
+// screen's source-directory name.
+var parsed = new List<(string File, SyntaxNode Root)>();
 foreach (var file in Directory.EnumerateFiles(root, "*.cs", SearchOption.AllDirectories))
 {
     try
     {
-        parsed.Add(CSharpSyntaxTree.ParseText(File.ReadAllText(file)).GetRoot());
+        parsed.Add((file, CSharpSyntaxTree.ParseText(File.ReadAllText(file)).GetRoot()));
     }
     catch (IOException ex)
     {
@@ -133,20 +159,50 @@ foreach (var file in Directory.EnumerateFiles(root, "*.cs", SearchOption.AllDire
 // is a UserControl/Form subclass. This is what lets the nav arm emit an edge on
 // the UserControl-SPA idiom `field = new SomeScreen(...)` — the common case in
 // a ribbon/panel-swap app — and not only on the MDI idiom `new Form().Show()`.
+// Extended to FIXPOINT through corpus base chains (`class X : uc_Grid` where
+// `uc_Grid : UserControl` is a screen too) and, when the corpus follows a
+// room naming discipline, through `--room-prefixes`. Also records each
+// type's source-directory name for the `--room-aliases` concept binding.
 var screenTypes = new HashSet<string>(StringComparer.Ordinal);
-foreach (var preRoot in parsed)
+var typeBases = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+var typeDir = new Dictionary<string, string>(StringComparer.Ordinal);
+foreach (var (file, preRoot) in parsed)
 {
+    var dir = Path.GetFileName(Path.GetDirectoryName(file) ?? string.Empty);
     foreach (var type in preRoot.DescendantNodes().OfType<TypeDeclarationSyntax>())
     {
-        if (type.BaseList is not null
-            && type.BaseList.Types.Any(b => IsScreenBase(LastSegment(BareName(b.Type)))))
+        var tname = type.Identifier.Text;
+        typeDir.TryAdd(tname, dir);
+        if (!typeBases.TryGetValue(tname, out var blist))
         {
-            screenTypes.Add(type.Identifier.Text);
+            typeBases[tname] = blist = new List<string>();
+        }
+        if (type.BaseList is not null)
+        {
+            blist.AddRange(type.BaseList.Types.Select(b => LastSegment(BareName(b.Type))));
+        }
+        if (roomPrefixes.Any(pfx => tname.StartsWith(pfx, StringComparison.Ordinal)))
+        {
+            screenTypes.Add(tname);
+        }
+    }
+}
+var screensChanged = true;
+while (screensChanged)
+{
+    screensChanged = false;
+    foreach (var (tname, blist) in typeBases)
+    {
+        if (!screenTypes.Contains(tname)
+            && blist.Any(b => IsScreenBase(b) || screenTypes.Contains(b)))
+        {
+            screenTypes.Add(tname);
+            screensChanged = true;
         }
     }
 }
 
-foreach (var rootNode in parsed)
+foreach (var (_, rootNode) in parsed)
 {
     // class / struct / record / interface declarations all share TypeDeclarationSyntax.
     foreach (var type in rootNode.DescendantNodes().OfType<TypeDeclarationSyntax>())
@@ -156,6 +212,23 @@ foreach (var rootNode in parsed)
 
         // (Class, rdf:type, ogit:ObjectType) — structural classification.
         triples.Add(new Triple(subj, "rdf:type", "ogit:ObjectType", f, c));
+
+        // ── UI-CONFIG PLANE (Phase 0 labyrinth recon, the room map) ──
+        // The config half of the nav harvest: the room→concept binding
+        // (corpus-owner claim, Authoritative) + Designer event wiring +
+        // control-tree containment. The Klickweg EDGES stay EmitNavArm's
+        // job below. Type-level walk (covers constructors and
+        // InitializeComponent partials alike).
+        if (screenTypes.Contains(name))
+        {
+            if (roomAliases.Count > 0
+                && typeDir.TryGetValue(name, out var roomDir)
+                && roomAliases.TryGetValue(roomDir, out var concept))
+            {
+                triples.Add(new Triple(subj, "surfaces_concept", concept, 0.95, 0.90));
+            }
+            EmitUiConfigArm(triples, ns, name, subj, type);
+        }
 
         // (Class, inherits_from, Base) for each base type / interface, name as written.
         if (type.BaseList is not null)
@@ -263,6 +336,107 @@ using (var w = positional.Count > 1
 
 Console.Error.WriteLine($"harvested {triples.Count} triples from {root}");
 return 0;
+
+// UI-CONFIG ARM (Phase 0 labyrinth recon) — the room-map facts for one
+// screen type. Walks ALL descendant nodes of the type (constructors +
+// InitializeComponent + handlers alike; partial Designer classes are their
+// own TypeDeclarationSyntax and get their own walk), emitting:
+//
+//   handles_event    `this.<control>.<Event> += new …(this.<Handler>)`
+//                    → (Class.control, handles_event, "<Event>:<ns>:Class.Handler")
+//                    Authoritative: the `+=` names both ends.
+//   contains_control `this.<parent>.Controls.Add(this.<child>)`
+//                    → (Class.parent|Class, contains_control, ns:Class.child)
+//                    Authoritative: machine-readable containment call.
+//
+// The Klickweg EDGES (navigates_to / selects_view) are EmitNavArm's job —
+// this arm carries only the room map. Syntax-only, no SemanticModel.
+static void EmitUiConfigArm(
+    List<Triple> triples,
+    string ns,
+    string className,
+    string classSubj,
+    TypeDeclarationSyntax type)
+{
+    // The `<ns>:<Class>.<member>` IRI for a `this.<member>` / bare-identifier
+    // receiver chain, or the class subject itself for a bare `this`.
+    string SubjectOf(ExpressionSyntax receiver) => receiver switch
+    {
+        ThisExpressionSyntax => classSubj,
+        IdentifierNameSyntax id => $"{ns}:{className}.{id.Identifier.Text}",
+        MemberAccessExpressionSyntax ma => $"{ns}:{className}.{ma.Name.Identifier.Text}",
+        _ => classSubj,
+    };
+
+    static string? LastIdentifier(ExpressionSyntax e) => e switch
+    {
+        IdentifierNameSyntax id => id.Identifier.Text,
+        MemberAccessExpressionSyntax ma => ma.Name.Identifier.Text,
+        _ => null,
+    };
+
+    foreach (var node in type.DescendantNodes())
+    {
+        switch (node)
+        {
+            // Designer event wiring: <control-chain>.<Event> += <handler>.
+            case AssignmentExpressionSyntax asg
+                when asg.IsKind(SyntaxKind.AddAssignmentExpression)
+                     && asg.Left is MemberAccessExpressionSyntax evAccess:
+                {
+                    // Handler: `new EventHandler(this.Foo_Click)` or a bare
+                    // method group `this.Foo_Click` / `Foo_Click`.
+                    var handler = asg.Right switch
+                    {
+                        ObjectCreationExpressionSyntax oc
+                            when oc.ArgumentList is { Arguments.Count: > 0 } =>
+                            LastIdentifier(oc.ArgumentList.Arguments[0].Expression),
+                        _ => LastIdentifier(asg.Right),
+                    };
+                    if (handler is not null)
+                    {
+                        var control = SubjectOf(evAccess.Expression);
+                        var ev = evAccess.Name.Identifier.Text;
+                        triples.Add(new Triple(
+                            control,
+                            "handles_event",
+                            $"{ev}:{ns}:{className}.{handler}",
+                            0.95,
+                            0.90));
+                    }
+                    break;
+                }
+
+            // Designer containment: <parent-chain>.Controls.Add(<child>).
+            case InvocationExpressionSyntax inv
+                when inv.Expression is MemberAccessExpressionSyntax
+                     {
+                         Name.Identifier.Text: "Add",
+                         Expression: MemberAccessExpressionSyntax
+                         {
+                             Name.Identifier.Text: "Controls",
+                         } controlsAccess,
+                     }
+                     && inv.ArgumentList.Arguments.Count > 0:
+                {
+                    var child = LastIdentifier(inv.ArgumentList.Arguments[0].Expression);
+                    if (child is not null)
+                    {
+                        triples.Add(new Triple(
+                            SubjectOf(controlsAccess.Expression),
+                            "contains_control",
+                            $"{ns}:{className}.{child}",
+                            0.95,
+                            0.90));
+                    }
+                    break;
+                }
+
+            default:
+                break;
+        }
+    }
+}
 
 // (Class, has_field, Class.field) + (Class.field, rdf:type, ogit:Property)
 //                                 + (Class.field, field_type, <Type as written>)
