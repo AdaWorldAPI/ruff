@@ -34,8 +34,10 @@
 //! [`extract_app_with_schema`] sniffs the layout before parsing anything:
 //!
 //! - `<root>/db/migrate/tables/*.rb` exists → the **baseline** surface
-//!   ([`parse_tables_dir`] / [`parse_table_source`]). Authoritative-tier:
-//!   one file *is* one table's declarative final shape, no replay needed.
+//!   ([`parse_tables_dir`] / [`parse_table_source`]). Authoritative-tier
+//!   for the squash itself, PLUS a bounded **post-baseline replay**
+//!   ([`replay_post_baseline_migrations`]) on top of it — see "Post-baseline
+//!   replay" below for exactly what that does and doesn't cover.
 //! - otherwise, `<root>/db/migrate/*.rb` exists → the **classic** surface
 //!   ([`parse_migrations_dir`] / [`apply_migration_source`]). **Inferred**
 //!   tier, and approximate by construction: migrations are replayed in
@@ -54,13 +56,52 @@
 //!   superset of the true final schema (they can include columns that
 //!   were later renamed away or removed), never a silent subset.
 //!
+//! # Post-baseline replay (baseline surface only)
+//!
+//! [`replay_post_baseline_migrations`] runs after [`parse_tables_dir`],
+//! against every migration file under `<root>/db/migrate/*.rb` and
+//! `<root>/modules/*/db/migrate/*.rb` (`OpenProject`'s per-module migration
+//! directories), replayed in **filename-sorted** order across BOTH
+//! locations together (not sorted per-directory then concatenated) —
+//! Rails migration filenames are `NNNNNNNNNNNNNN_name.rb`, so sorting by
+//! filename alone reproduces true application order even when a module's
+//! migration lands chronologically between two core migrations. Per
+//! top-level (non-block) line:
+//!
+//! - `add_column :table, :col, :type, opts` — appended (respecting
+//!   `null: false`), unless a same-named column is already present.
+//! - `rename_column :table, :old, :new` — renamed in place (position in
+//!   the field list is preserved).
+//! - `remove_column :table, :col` / `remove_columns :table, :a, :b` —
+//!   dropped.
+//! - `change_column :table, :col, :type` — the field's type is updated;
+//!   best-effort, so a call whose type argument isn't a plain symbol/quoted
+//!   token is silently skipped rather than guessed.
+//!
+//! A mutation naming a table the baseline squash didn't produce is a
+//! no-op: this pass only ever refines tables [`parse_tables_dir`] already
+//! matched, it never creates one. Data-only migrations (no line matching
+//! one of the four forms above) contribute nothing — there's no
+//! special-case needed when the line scanner simply never matches. Not
+//! replayed, deliberately: `create_table` / `change_table` / `drop_table`
+//! in `db/migrate/*.rb` (including `t.*` DSL lines inside a `change_table`
+//! block, and multi-line calls whose table/column/type args aren't all on
+//! the keyword's own line) — the squash already IS the authoritative
+//! `create_table` for every table this pass can touch, and covering
+//! `change_table` block bodies would need the block-tracking state
+//! [`apply_migration_source`] uses for the *classic* surface, which is out
+//! of scope for this additive slice (see [`SchemaReport::columns_from`]'s
+//! doc for the observable consequence).
+//!
 //! # Scope (recorded honestly, conservation-ledger style)
 //!
-//! - **Baseline surface is baseline-only**: incremental migrations
-//!   (`db/migrate/*.rb`, `modules/*/db/migrate/*.rb`) that
-//!   `add_column`/`rename_column` after the squash are NOT replayed.
-//!   [`SchemaReport::columns_from`] says so. (The classic surface, by
-//!   contrast, exists *because* there is no squash to read instead.)
+//! - **Baseline surface replays four mutation kinds, nothing else**: see
+//!   "Post-baseline replay" above for exactly what [`SchemaReport::columns_from`]'s
+//!   `"baseline+replay"` value does and doesn't cover. A corpus with no
+//!   applicable post-baseline mutations is byte-identical to the
+//!   pre-replay output, label included — `columns_from` only flips away
+//!   from `"baseline-only"` once at least one mutation is actually
+//!   applied.
 //! - Join tables and other tables with no matching AR class are counted in
 //!   [`SchemaReport::unmatched_tables`], never silently dropped.
 //! - `t.index` / `t.foreign_key` / `t.check_constraint` /
@@ -69,7 +110,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ruff_spo_triplet::{Field, Model, ModelGraph};
 
@@ -90,9 +131,14 @@ pub struct SchemaReport {
     /// helper) — named, not just counted.
     pub files_skipped: Vec<String>,
     /// Provenance marker: which migration surface produced the columns —
-    /// `"baseline-only"` (the `Tables::X` squash, no replay) or
-    /// `"classic-migrations"` (replayed `db/migrate/*.rb`, approximate —
-    /// see [`Self::unapplied_mutations`]).
+    /// `"baseline-only"` (the `Tables::X` squash, no post-baseline mutation
+    /// applied), `"baseline+replay"` (the squash PLUS one or more
+    /// post-baseline `add_column`/`rename_column`/`remove_column`/
+    /// `change_column` statements replayed on top of it — see the module
+    /// doc's "Post-baseline replay" section for exactly what that does and
+    /// doesn't cover), or `"classic-migrations"` (replayed `db/migrate/*.rb`
+    /// from scratch, no baseline squash to start from — approximate, see
+    /// [`Self::unapplied_mutations`]).
     pub columns_from: &'static str,
     /// **Classic surface only.** Migration files under `db/migrate/`
     /// successfully read and replayed (`create_table` / `change_table` /
@@ -169,12 +215,14 @@ const COLUMN_TYPES: &[&str] = &[
 ///
 /// `<root>/db/migrate/tables/` is checked first: if it contains any `.rb`
 /// file, this is the `OpenProject`-style squashed baseline and the
-/// (unchanged) [`parse_tables_dir`] path runs. Otherwise, if
-/// `<root>/db/migrate/` itself contains any `.rb` file, this is a classic
-/// Rails app (Redmine and similar — no baseline squash, only the full
-/// migration history) and [`parse_migrations_dir`] runs instead. Neither
-/// directory existing leaves [`SchemaReport::tables_seen`] at zero, same
-/// as before this fallback was added.
+/// [`parse_tables_dir`] path runs, followed by
+/// [`replay_post_baseline_migrations`] (module doc: "Post-baseline
+/// replay"). Otherwise, if `<root>/db/migrate/` itself contains any `.rb`
+/// file, this is a classic Rails app (Redmine and similar — no baseline
+/// squash, only the full migration history) and [`parse_migrations_dir`]
+/// runs instead — untouched by this pass. Neither directory existing
+/// leaves [`SchemaReport::tables_seen`] at zero, same as before the classic
+/// fallback was added.
 #[must_use]
 pub fn extract_app_with_schema(source_tree: &Path, namespace: &str) -> (ModelGraph, SchemaReport) {
     let mut graph = crate::extract_app_with(source_tree, namespace);
@@ -189,11 +237,14 @@ pub fn extract_app_with_schema(source_tree: &Path, namespace: &str) -> (ModelGra
         ..SchemaReport::default()
     };
 
-    let tables = if use_classic_migrations {
+    let mut tables = if use_classic_migrations {
         parse_migrations_dir(source_tree, &mut report)
     } else {
         parse_tables_dir(source_tree, &mut report)
     };
+    if !use_classic_migrations && replay_post_baseline_migrations(source_tree, &mut tables) > 0 {
+        report.columns_from = "baseline+replay";
+    }
     for table in tables {
         report.tables_seen += 1;
         if let Some(model) = graph.models.iter_mut().find(|m| m.name == table.model_name) {
@@ -330,6 +381,201 @@ pub(crate) fn parse_table_source(table_name: &str, src: &str) -> Option<TableCol
         model_name: model_name_for_table(table_name),
         fields,
     })
+}
+
+// ────────────────── baseline + post-baseline replay ──────────────────
+
+/// **Post-baseline replay.** After [`parse_tables_dir`] establishes each
+/// table's baseline columns, replay every migration file under
+/// `<root>/db/migrate/*.rb` and `<root>/modules/*/db/migrate/*.rb` — in
+/// filename-sorted (timestamp) order across both locations together — on
+/// top of them. See the module doc's "Post-baseline replay" section for
+/// exactly what's applied and what isn't. Returns the number of mutations
+/// actually applied (0 when there is nothing to replay, or nothing
+/// replayable was found among what there is), which the caller uses to
+/// decide whether [`SchemaReport::columns_from`] should flip to
+/// `"baseline+replay"`.
+pub(crate) fn replay_post_baseline_migrations(
+    source_tree: &Path,
+    tables: &mut [TableColumns],
+) -> usize {
+    let mut files = collect_post_baseline_migration_files(source_tree);
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, table) in tables.iter().enumerate() {
+        index.insert(table.table_name.clone(), i);
+    }
+
+    let mut applied = 0;
+    for path in files {
+        if let Ok(src) = fs::read_to_string(&path) {
+            applied += replay_migration_source(&src, tables, &index);
+        }
+    }
+    applied
+}
+
+/// Every `.rb` file directly under `<root>/db/migrate/`, plus every `.rb`
+/// file directly under each `<root>/modules/*/db/migrate/` (one per
+/// module). Unsorted — callers sort by filename for cross-directory
+/// timestamp order (see [`replay_post_baseline_migrations`]).
+fn collect_post_baseline_migration_files(source_tree: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    push_rb_files(&source_tree.join("db/migrate"), &mut files);
+    if let Ok(modules) = fs::read_dir(source_tree.join("modules")) {
+        for module in modules.flatten() {
+            push_rb_files(&module.path().join("db/migrate"), &mut files);
+        }
+    }
+    files
+}
+
+/// Push every direct (non-recursive) `.rb` file under `dir` onto `out`. A
+/// missing/unreadable `dir` contributes nothing — same tolerant-of-absence
+/// discipline as [`dir_has_rb_files`].
+fn push_rb_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    out.extend(
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rb")),
+    );
+}
+
+/// Replay one migration file's `add_column` / `rename_column` /
+/// `remove_column` / `remove_columns` / `change_column` statements against
+/// `tables` (keyed by table name via `index`). Top-level lines only — same
+/// single-statement-per-line discipline as [`apply_migration_source`]. A
+/// table not in `index` is left untouched (module doc: this pass never
+/// invents one). Returns the count of mutations actually applied: a line
+/// that matches one of the four forms but names an unknown table, or (for
+/// `rename_column`/`remove_column(s)`/`change_column`) an unknown column,
+/// applies nothing and isn't counted.
+fn replay_migration_source(
+    src: &str,
+    tables: &mut [TableColumns],
+    index: &BTreeMap<String, usize>,
+) -> usize {
+    let mut applied = 0;
+    for raw in src.lines() {
+        let line = raw.trim();
+
+        if let Some((table, field)) = parse_add_column(line) {
+            if let Some(&i) = index.get(&table) {
+                let before = tables[i].fields.len();
+                push_field_if_absent(&mut tables[i].fields, field);
+                if tables[i].fields.len() != before {
+                    applied += 1;
+                }
+            }
+            continue;
+        }
+        if let Some((table, old, new)) = parse_rename_column(line) {
+            if let Some(&i) = index.get(&table) {
+                if let Some(f) = tables[i].fields.iter_mut().find(|f| f.name == old) {
+                    f.name = new;
+                    applied += 1;
+                }
+            }
+            continue;
+        }
+        if let Some((table, names)) = parse_remove_columns(line) {
+            if let Some(&i) = index.get(&table) {
+                let before = tables[i].fields.len();
+                tables[i].fields.retain(|f| !names.contains(&f.name));
+                if tables[i].fields.len() != before {
+                    applied += 1;
+                }
+            }
+            continue;
+        }
+        if let Some((table, name, ty)) = parse_change_column(line) {
+            if let Some(&i) = index.get(&table) {
+                if let Some(f) = tables[i].fields.iter_mut().find(|f| f.name == name) {
+                    f.field_type = Some(ty);
+                    applied += 1;
+                }
+            }
+        }
+    }
+    applied
+}
+
+/// An optional pair of enclosing call parentheses around a keyword's
+/// argument tail: `"(:a, :b)"` → `":a, :b"`; anything without BOTH a
+/// leading `(` and a trailing `)` is returned unchanged (already-bare
+/// arguments, e.g. `" :a, :b"`, or an unbalanced fragment we shouldn't
+/// guess about). Rails migrations mix both call styles freely — real
+/// example from the `OpenProject` corpus: `change_column(:documents,
+/// :title, :string, limit:)` alongside bare `add_column :t, :c, :type`
+/// everywhere else — so the three parsers below tolerate either.
+fn strip_call_parens(rest: &str) -> &str {
+    let trimmed = rest.trim();
+    trimmed
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(rest)
+}
+
+/// `rename_column :table, :old, :new` (or quoted-string / parenthesized
+/// forms) → the table name and the (old, new) column-name pair. `None` for
+/// anything else.
+fn parse_rename_column(line: &str) -> Option<(String, String, String)> {
+    let rest = line.strip_prefix("rename_column")?;
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = strip_call_parens(rest.trim_start());
+    let mut parts = rest.split(',').map(str::trim);
+    let table = parts.next().and_then(name_token)?.to_string();
+    let old = parts.next().and_then(name_token)?.to_string();
+    let new = parts.next().and_then(name_token)?.to_string();
+    Some((table, old, new))
+}
+
+/// `remove_column :table, :name` / `remove_columns :table, :a, :b, …` (or
+/// quoted-string / parenthesized forms) → the table name and the column
+/// name(s) to drop. `remove_columns` (plural, variadic) is checked first —
+/// `remove_column` is a textual prefix of it, the same kind of collision
+/// the `_default`/`_null` suffixes create for `change_column` (see
+/// [`is_mutation_call`]).
+fn parse_remove_columns(line: &str) -> Option<(String, Vec<String>)> {
+    let rest = line
+        .strip_prefix("remove_columns")
+        .or_else(|| line.strip_prefix("remove_column"))?;
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = strip_call_parens(rest.trim_start());
+    let mut parts = rest.split(',').map(str::trim);
+    let table = parts.next().and_then(name_token)?.to_string();
+    let names: Vec<String> = parts.filter_map(name_token).map(str::to_string).collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some((table, names))
+}
+
+/// `change_column :table, :name, :type, opts` (or quoted-string /
+/// parenthesized forms) → the table name, column name, and new type token.
+/// Best-effort: `None` when the type argument isn't a plain symbol/quoted
+/// name token (e.g. a computed/dynamic expression) — skipped rather than
+/// guessed, per the module's "Scope" discipline.
+fn parse_change_column(line: &str) -> Option<(String, String, String)> {
+    let rest = line.strip_prefix("change_column")?;
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = strip_call_parens(rest.trim_start());
+    let mut parts = rest.split(',').map(str::trim);
+    let table = parts.next().and_then(name_token)?.to_string();
+    let name = parts.next().and_then(name_token)?.to_string();
+    let ty = parts.next().and_then(name_token)?.to_string();
+    Some((table, name, ty))
 }
 
 // ────────────────── classic `db/migrate/*.rb` replay ──────────────────
@@ -1313,6 +1559,287 @@ end
         let _ = fs::remove_dir_all(&root);
     }
 
+    // ────────────────── baseline + post-baseline replay (D-AR-3.5) ──────────────────
+
+    /// A baseline table with no post-baseline migrations at all (not even
+    /// an empty `db/migrate/` directory) is untouched:
+    /// [`SchemaReport::columns_from`] stays `"baseline-only"` — the
+    /// behaviour-preserving case the module doc promises.
+    #[test]
+    fn replay_with_no_post_baseline_migrations_stays_baseline_only() {
+        let root = scratch_dir("replay-none");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :name\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+
+        let (graph, report) = extract_app_with_schema(&root, "testns");
+        assert_eq!(report.columns_from, "baseline-only");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let names: Vec<&str> = widget.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "name"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A post-baseline `add_column` is appended onto the baseline columns,
+    /// honouring `null: false`, and flips `columns_from` to
+    /// `"baseline+replay"`.
+    #[test]
+    fn replay_add_column_appends_onto_the_baseline() {
+        let root = scratch_dir("replay-add-column");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :name\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200102000000_add_price.rb",
+            "class AddPrice < ActiveRecord::Migration[7.0]\n  def change\n    add_column :widgets, :price, :integer, null: false\n  end\nend\n",
+        );
+
+        let (graph, report) = extract_app_with_schema(&root, "testns");
+        assert_eq!(report.columns_from, "baseline+replay");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let names: Vec<&str> = widget.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "price"]);
+        let price = widget.fields.iter().find(|f| f.name == "price").unwrap();
+        assert_eq!(price.field_type.as_deref(), Some("integer"));
+        assert_eq!(price.not_null, Some(true));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `rename_column` renames the field IN PLACE — position in the field
+    /// list is preserved, not moved to the end.
+    #[test]
+    fn replay_rename_column_renames_in_place() {
+        let root = scratch_dir("replay-rename-column");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :old_name\n      t.string :other\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200102000000_rename.rb",
+            "class Rename < ActiveRecord::Migration[7.0]\n  def change\n    rename_column :widgets, :old_name, :new_name\n  end\nend\n",
+        );
+
+        let (graph, _report) = extract_app_with_schema(&root, "testns");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let names: Vec<&str> = widget.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["id", "new_name", "other"],
+            "renamed field keeps its original position"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `remove_column` (singular) and `remove_columns` (plural, variadic)
+    /// both drop fields from the baseline.
+    #[test]
+    fn replay_remove_column_and_remove_columns_drop_fields() {
+        let root = scratch_dir("replay-remove-columns");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :a\n      t.string :b\n      t.string :c\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200102000000_remove_a.rb",
+            "class RemoveA < ActiveRecord::Migration[7.0]\n  def change\n    remove_column :widgets, :a\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200103000000_remove_b_and_c.rb",
+            "class RemoveBAndC < ActiveRecord::Migration[7.0]\n  def change\n    remove_columns :widgets, :b, :c\n  end\nend\n",
+        );
+
+        let (graph, _report) = extract_app_with_schema(&root, "testns");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let names: Vec<&str> = widget.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id"], "a, b, and c must all be dropped");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `change_column` updates the field's type — both the bare call form
+    /// and the parenthesized form (`change_column(:t, :c, :type)`, the
+    /// shape actually used in the `OpenProject` corpus).
+    #[test]
+    fn replay_change_column_updates_type_bare_and_parenthesized() {
+        let root = scratch_dir("replay-change-column");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :title\n      t.integer :count\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200102000000_change_title.rb",
+            "class ChangeTitle < ActiveRecord::Migration[7.0]\n  def change\n    change_column :widgets, :title, :text\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200103000000_change_count.rb",
+            "class ChangeCount < ActiveRecord::Migration[7.0]\n  def change\n    change_column(:widgets, :count, :bigint, limit:)\n  end\nend\n",
+        );
+
+        let (graph, _report) = extract_app_with_schema(&root, "testns");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let by_name = |n: &str| widget.fields.iter().find(|f| f.name == n).unwrap();
+        assert_eq!(by_name("title").field_type.as_deref(), Some("text"));
+        assert_eq!(
+            by_name("count").field_type.as_deref(),
+            Some("bigint"),
+            "parenthesized change_column call must parse just like the bare form"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `modules/*/db/migrate/*.rb` is scanned too, not just the core
+    /// `db/migrate/`.
+    #[test]
+    fn replay_scans_module_migrations_too() {
+        let root = scratch_dir("replay-module-migrations");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :name\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        write_migration(
+            &root,
+            "modules/gadgets/db/migrate/20200102000000_add_sku.rb",
+            "class AddSku < ActiveRecord::Migration[7.0]\n  def change\n    add_column :widgets, :sku, :string\n  end\nend\n",
+        );
+
+        let (graph, report) = extract_app_with_schema(&root, "testns");
+        assert_eq!(report.columns_from, "baseline+replay");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let names: Vec<&str> = widget.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "sku"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Core (`db/migrate/`) and module (`modules/*/db/migrate/`) migrations
+    /// are replayed in ONE combined filename-sorted order, not
+    /// "core dir first, then module dirs" — a module migration
+    /// timestamped BEFORE a core migration must still apply first.
+    #[test]
+    fn replay_orders_core_and_module_migrations_by_filename_across_both_dirs() {
+        let root = scratch_dir("replay-cross-dir-order");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :v\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        // Earlier timestamp, lives under modules/ — must apply FIRST.
+        write_migration(
+            &root,
+            "modules/gadgets/db/migrate/20200101000000_step1.rb",
+            "class Step1 < ActiveRecord::Migration[7.0]\n  def change\n    rename_column :widgets, :v, :v_mid\n  end\nend\n",
+        );
+        // Later timestamp, lives under core db/migrate/ — must apply SECOND.
+        // A path-based (not filename-based) sort would run this FIRST
+        // (`"db/..."` < `"modules/..."` lexicographically), in which case
+        // it would find no `v_mid` column yet and no-op, leaving the field
+        // named `v_mid` instead of `v_final`.
+        write_migration(
+            &root,
+            "db/migrate/20200102000000_step2.rb",
+            "class Step2 < ActiveRecord::Migration[7.0]\n  def change\n    rename_column :widgets, :v_mid, :v_final\n  end\nend\n",
+        );
+
+        let (graph, _report) = extract_app_with_schema(&root, "testns");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let names: Vec<&str> = widget.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["id", "v_final"],
+            "timestamp order must win over directory order"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A mutation naming a table the baseline squash never produced is a
+    /// no-op: it neither crashes nor invents a new table/model entry.
+    #[test]
+    fn replay_mutation_on_unknown_table_is_a_no_op() {
+        let root = scratch_dir("replay-unknown-table");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :name\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200102000000_add_to_gadgets.rb",
+            "class AddToGadgets < ActiveRecord::Migration[7.0]\n  def change\n    add_column :gadgets, :foo, :string\n  end\nend\n",
+        );
+
+        let (graph, report) = extract_app_with_schema(&root, "testns");
+        assert_eq!(
+            report.columns_from, "baseline-only",
+            "a mutation matching no baseline table applies nothing"
+        );
+        assert_eq!(report.tables_seen, 1, "gadgets must not be invented");
+        assert!(report.unmatched_tables.is_empty());
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let names: Vec<&str> = widget.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "name"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn inflection_covers_the_corpus_shapes() {
         for (table, model) in [
@@ -1332,8 +1859,20 @@ end
     }
 
     /// Corpus gate (same pattern as the crate's D-AR-4 gate): only runs
-    /// with `OPENPROJECT_PATH` set. Pins the `WorkPackage` baseline column
-    /// set — the oracle-diff ground truth.
+    /// with `OPENPROJECT_PATH` set. Pins the `WorkPackage` baseline+replay
+    /// column set — the oracle-diff ground truth, now including the four
+    /// post-baseline mutation kinds [`replay_post_baseline_migrations`]
+    /// applies (module doc: "Post-baseline replay").
+    ///
+    /// `columns_from` flips to `"baseline+replay"` here: the real corpus
+    /// has post-baseline `add_column`s landing on `work_packages`
+    /// (`position`/`story_points`/`remaining_hours` from the `backlogs`
+    /// module's aggregated migration, `budget_id` from `budgets`'s) — net
+    /// +4 over the 27-column pre-replay baseline this test used to pin
+    /// (`sequence_number`/`identifier` are also added, by
+    /// `20260330100000_create_work_package_semantic_ids.rb`, but the SAME
+    /// file `remove_column`s them a few lines down, so they correctly net
+    /// to zero — see [`replay_migration_source`]'s doc).
     #[test]
     #[allow(clippy::print_stderr)] // diagnostic emission gated on env var (real-corpus gate)
     fn openproject_corpus_schema_gate() {
@@ -1342,7 +1881,7 @@ end
             return;
         };
         let (graph, report) = extract_app_with_schema(Path::new(&root), "openproject");
-        assert_eq!(report.columns_from, "baseline-only");
+        assert_eq!(report.columns_from, "baseline+replay");
         assert!(
             report.tables_seen >= 90,
             "expected ~99 baseline tables, saw {}",
@@ -1372,7 +1911,11 @@ end
             .filter(|f| f.field_type.is_some())
             .map(|f| f.name.as_str())
             .collect();
-        assert_eq!(cols.len(), 27, "baseline WorkPackage columns: {cols:?}");
+        assert_eq!(
+            cols.len(),
+            31,
+            "baseline+replay WorkPackage columns: {cols:?}"
+        );
         for expected in [
             "id",
             "type_id",
@@ -1401,6 +1944,12 @@ end
             "derived_remaining_hours",
             "derived_done_ratio",
             "project_phase_id",
+            // Post-baseline replay additions (net of the same-file
+            // add-then-remove of `sequence_number`/`identifier`).
+            "position",
+            "story_points",
+            "remaining_hours",
+            "budget_id",
         ] {
             assert!(cols.contains(&expected), "missing column {expected}");
         }
@@ -1414,6 +1963,79 @@ end
             "unset ≠ 0% — the oracle-diff bug"
         );
         assert_eq!(by_name("schedule_manually").not_null, Some(true));
+        assert_eq!(by_name("budget_id").field_type.as_deref(), Some("integer"));
+        assert!(
+            !cols.contains(&"sequence_number") && !cols.contains(&"identifier"),
+            "same-file add_column-then-remove_column must net to absent: {cols:?}"
+        );
+    }
+
+    /// **D-AR-3.5 drift fuse** for [`replay_post_baseline_migrations`], in
+    /// the house-style env-gate + self-skip shape (`RAILS_CORPUS_SRC` +
+    /// optional `RAILS_CORPUS_NS`, default namespace `"openproject"`):
+    /// `RAILS_CORPUS_SRC=/home/user/openproject cargo test -p ruff_ruby_spo
+    /// -- --nocapture`.
+    ///
+    /// **Honest result vs. the wave's working assumption:** this wave's
+    /// brief assumed a 40-field pre-replay baseline and expected replay to
+    /// push `WorkPackage` past 64 fields, toward a ~109-field "real" shape.
+    /// Measured against the actual corpus at the time this fuse was
+    /// pinned, the PRE-replay baseline is 27 fields (matching
+    /// [`openproject_corpus_schema_gate`]'s long-standing pin — 40 does not
+    /// reproduce), and POST-replay is 31: a real, verified +4 from four
+    /// genuine post-baseline `add_column`s
+    /// (`position`/`story_points`/`remaining_hours` from the `backlogs`
+    /// module, `budget_id` from `budgets`), net of the `create_work_package_semantic_ids`
+    /// migration's own same-file add-then-remove of `sequence_number`/`identifier`.
+    /// It does not reach 64. Investigation (see the wave report) found the
+    /// remaining gap lives almost entirely in forms this replay pass
+    /// deliberately does not cover — chiefly a `change_table :work_packages
+    /// do |t| … end` block
+    /// (`db/migrate/20250403150639_link_wp_to_project_phase_definition.rb`)
+    /// — which is out of scope for a bounded, four-top-level-statement
+    /// replay (module doc: "Post-baseline replay"). Pinning the true
+    /// measured number here rather than a hoped-for one, per this module's
+    /// conservation-ledger discipline: a silent regression below 31 should
+    /// trip this fuse just as loudly as a silent jump would.
+    #[test]
+    #[allow(clippy::print_stderr)] // diagnostic emission gated on env var (real-corpus gate)
+    fn rails_corpus_baseline_replay_drift_fuse() {
+        let Ok(root) = std::env::var("RAILS_CORPUS_SRC") else {
+            eprintln!("skipping: RAILS_CORPUS_SRC not set");
+            return;
+        };
+        let namespace =
+            std::env::var("RAILS_CORPUS_NS").unwrap_or_else(|_| "openproject".to_string());
+        let (graph, report) = extract_app_with_schema(Path::new(&root), &namespace);
+
+        let wp = graph
+            .models
+            .iter()
+            .find(|m| m.name == "WorkPackage")
+            .expect("WorkPackage model");
+        let field_count = wp.fields.len();
+        eprintln!(
+            "D-AR-3.5 baseline+replay drift fuse: WorkPackage field count = {field_count} \
+             (pre-replay baseline was 27; columns_from = {})",
+            report.columns_from
+        );
+
+        assert_eq!(
+            report.columns_from, "baseline+replay",
+            "expected at least one post-baseline mutation to be replayed somewhere in the corpus"
+        );
+        assert!(
+            field_count > 27,
+            "expected post-baseline replay to add at least one field over the 27-field \
+             pre-replay baseline, got {field_count}"
+        );
+        assert_eq!(
+            field_count, 31,
+            "drift fuse: WorkPackage field count via baseline+replay on the real OpenProject \
+             corpus moved away from the pinned 31 — confirm whether the corpus or the parser \
+             changed before updating this pin (see doc comment: this is short of the wave's \
+             hoped-for >64/~109, by design scope, not a bug)"
+        );
     }
 
     // ────────────────── compute-linkage pass (D-AR-3.5) ──────────────────
