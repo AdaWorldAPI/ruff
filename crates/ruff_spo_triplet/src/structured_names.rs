@@ -250,6 +250,31 @@ mod tests {
         assert_eq!(parse_structured_name("2_3_push", &grammar), None);
     }
 
+    /// Marker-less mode scans forward to the first numeric token and
+    /// DISCARDS every leading token — `vital_2` parses to bare node
+    /// `form_2` with `vital` recorded nowhere (not a tier, not residue).
+    /// This pin documents the footgun: a consumer separating unresolved
+    /// domain residues from protocol addresses (the furnace exam) must
+    /// gate the protocol plane on marker presence, because with a marker
+    /// the same name safely returns `None` instead.
+    #[test]
+    fn marker_less_mode_discards_leading_tokens_the_exam_must_gate_on_marker() {
+        let marker_less = NameGrammar {
+            strip_prefixes: Vec::new(),
+            marker: String::new(),
+            tier_names: vec!["form".to_string(), "section".to_string()],
+        };
+        let parsed = parse_structured_name("vital_2", &marker_less).expect("parses");
+        assert_eq!(parsed.tiers, vec![("form".to_string(), 2)]);
+        assert!(parsed.residue.is_empty(), "leading `vital` is DISCARDED");
+        // Marker-present mode is the safe configuration: the non-marker
+        // leading token makes the parse refuse.
+        assert_eq!(
+            parse_structured_name("vital_2", &form_section_grammar()),
+            None
+        );
+    }
+
     #[test]
     fn extra_numeric_tokens_get_level_n_tier_names() {
         let parsed =

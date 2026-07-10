@@ -27,11 +27,15 @@
 //!                        # grid / localization). Methods matching a surface
 //!                        # row are classified OUT of the concept plane
 //!                        # before residue accounting (doctrine Phase 3).
-//! grammar_strip=form     # structured-name grammar (doctrine Phase 5):
-//! grammar_marker=f       # leading tokens to strip / the numbered-path
-//! grammar_tier=form      # marker / tier names outermost-first. Residues
-//! grammar_tier=section   # that parse land on the PROTOCOL plane
+//! grammar_strip=mod      # structured-name grammar (doctrine Phase 5):
+//! grammar_marker=f       # leading NOISE tokens to strip / the numbered-
+//! grammar_tier=form      # path marker / tier names outermost-first.
+//! grammar_tier=section   # Residues that parse land on the PROTOCOL plane
 //!                        # (part_of tree nodes), not the unbound ledger.
+//!                        # The plane arms ONLY with a grammar_marker —
+//!                        # marker-less mode would silently eat un-aliased
+//!                        # `<concept>_<digit>` residues (see the armed
+//!                        # gate in main).
 //! ```
 
 #![expect(
@@ -40,6 +44,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use ruff_spo_triplet::{
     ConceptConvention, Model, ModelGraph, NameGrammar, SurfaceConvention, SurfaceKind,
@@ -152,8 +157,15 @@ fn main() {
     // Protocol plane (doctrine Phase 5): un-aliased residues whose spelling
     // parses against the structured-name grammar are name-embedded tree
     // addresses (CRF form/section coordinates) — part_of nodes, never
-    // unbound concepts.
-    let grammar_armed = !conf.grammar.marker.is_empty() || !conf.grammar.tier_names.is_empty();
+    // unbound concepts. The plane arms ONLY when a marker is configured:
+    // marker-less parsing scans forward to the first numeric token and
+    // DISCARDS the leading tokens, so an un-aliased domain residue like
+    // `vital_2` would be silently swallowed as node `form_2` (its concept
+    // token dropped) — violating the exam's slag contract and able to
+    // force a false EXAM FAIL on an expected concept. With a marker, a
+    // non-marker leading token makes the parse return None, so nothing
+    // domain-shaped can be eaten.
+    let grammar_armed = !conf.grammar.marker.is_empty();
     let mut protocol_histogram: BTreeMap<String, usize> = BTreeMap::new();
     let mut protocol_total = 0usize;
     for model in &graph.models {
@@ -173,15 +185,15 @@ fn main() {
                 && let Some(parsed) = parse_structured_name(&split.concept, &conf.grammar)
             {
                 protocol_total += 1;
+                // Key on the tier path ALONE (the `part_of_edges` node
+                // convention): qualifier residues must not fragment a
+                // node's method count.
                 let mut path = String::new();
                 for (tier, n) in &parsed.tiers {
                     if !path.is_empty() {
                         path.push('/');
                     }
-                    path.push_str(&format!("{tier}_{n}"));
-                }
-                if !parsed.residue.is_empty() {
-                    path.push_str(&format!(" (+{})", parsed.residue.join("_")));
+                    let _ = write!(path, "{tier}_{n}");
                 }
                 *protocol_histogram.entry(path).or_default() += 1;
                 continue;
