@@ -455,14 +455,68 @@ fn push_rb_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// that matches one of the four forms but names an unknown table, or (for
 /// `rename_column`/`remove_column(s)`/`change_column`) an unknown column,
 /// applies nothing and isn't counted.
+/// Heuristic Ruby block-opener detector for the replay depth tracker: a
+/// leading block keyword (`def`/`if`/`unless`/`while`/`until`/`case`/
+/// `begin`/`for`/`class`/`module`) or a trailing `do` / `do |...|`. Modifier
+/// forms (`add_column … if cond`) don't match — the keyword must lead. Paired
+/// with an `== "end"` close check; single-line `def … end` (absent from
+/// real migrations) is out of scope.
+fn is_ruby_block_opener(line: &str) -> bool {
+    if line.ends_with(" do") || line.contains(" do ") || line.contains(" do|") {
+        return true;
+    }
+    let head = line
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    matches!(
+        head,
+        "def" | "if" | "unless" | "while" | "until" | "case" | "begin" | "for" | "class" | "module"
+    )
+}
+
 fn replay_migration_source(
     src: &str,
     tables: &mut [TableColumns],
     index: &BTreeMap<String, usize>,
 ) -> usize {
     let mut applied = 0;
+    // Skip `def down` rollback bodies: `def up`/`def change` describe the
+    // schema AFTER the migration, `def down` reverses it. Replaying the down
+    // half would undo valid columns (add-then-remove). Track Ruby block depth
+    // and suppress mutations while inside the `def down` method (from its
+    // opening `def` line to the `end` that returns to the enclosing depth).
+    let mut depth: i32 = 0;
+    let mut down_from: Option<i32> = None;
     for raw in src.lines() {
         let line = raw.trim();
+
+        if down_from.is_none()
+            && (line == "def down"
+                || line.starts_with("def down(")
+                || line.starts_with("def down "))
+        {
+            down_from = Some(depth);
+        }
+        let in_rollback = down_from.is_some();
+
+        let opens = is_ruby_block_opener(line);
+        let closes = line == "end" || line.starts_with("end ") || line.starts_with("end;");
+        if opens {
+            depth += 1;
+        }
+        if closes {
+            depth -= 1;
+            if let Some(d) = down_from
+                && depth <= d
+            {
+                down_from = None;
+            }
+        }
+
+        if in_rollback {
+            continue;
+        }
 
         if let Some((table, field)) = parse_add_column(line) {
             if let Some(&i) = index.get(&table) {
@@ -778,7 +832,11 @@ fn parse_add_column(line: &str) -> Option<(String, Field)> {
     if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
         return None;
     }
-    let mut parts = rest.trim_start().split(',').map(str::trim);
+    // Normalise the parenthesized call form `add_column(:t, :c, :type)` the
+    // same way the rename/remove/change parsers do — otherwise the leading
+    // `(` rides into the first token and the whole mutation is dropped.
+    let rest = strip_call_parens(rest.trim_start());
+    let mut parts = rest.split(',').map(str::trim);
     let table = parts.next().and_then(name_token)?.to_string();
     let name = parts.next().and_then(name_token)?;
     let ty = parts.next().and_then(name_token)?;
@@ -1735,6 +1793,74 @@ end
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Parenthesized `add_column(:t, :c, :type)` is applied just like the
+    /// bare form (codex #73 P2) — the leading `(` must not ride into the
+    /// table token and silently drop the mutation.
+    #[test]
+    fn replay_add_column_parenthesized_form_applies() {
+        let root = scratch_dir("replay-add-column-parens");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :name\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200102000000_add_price.rb",
+            "class AddPrice < ActiveRecord::Migration[7.0]\n  def change\n    add_column(:widgets, :price, :integer)\n  end\nend\n",
+        );
+
+        let (graph, report) = extract_app_with_schema(&root, "testns");
+        assert_eq!(report.columns_from, "baseline+replay");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let price = widget.fields.iter().find(|f| f.name == "price");
+        assert!(price.is_some(), "parenthesized add_column must be applied");
+        assert_eq!(price.unwrap().field_type.as_deref(), Some("integer"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `def up` / `def down` migration replays only the `up` direction
+    /// (codex #73 P2) — the `down` rollback (which removes the just-added
+    /// column) must be skipped, or `baseline+replay` would drop a valid
+    /// column.
+    #[test]
+    fn replay_skips_def_down_rollback_body() {
+        let root = scratch_dir("replay-def-down");
+        write_migration(
+            &root,
+            "db/migrate/tables/widgets.rb",
+            "class Tables::Widgets < Tables::Base\n  def self.table(migration)\n    create_table migration do |t|\n      t.string :name\n    end\n  end\nend\n",
+        );
+        write_migration(
+            &root,
+            "app/models/widget.rb",
+            "class Widget < ActiveRecord::Base\nend\n",
+        );
+        write_migration(
+            &root,
+            "db/migrate/20200102000000_add_foo.rb",
+            "class AddFoo < ActiveRecord::Migration[7.0]\n  def up\n    add_column :widgets, :foo, :string\n  end\n\n  def down\n    remove_column :widgets, :foo\n  end\nend\n",
+        );
+
+        let (graph, report) = extract_app_with_schema(&root, "testns");
+        assert_eq!(report.columns_from, "baseline+replay");
+        let widget = graph.models.iter().find(|m| m.name == "Widget").unwrap();
+        let names: Vec<&str> = widget.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["id", "name", "foo"],
+            "the `up` add must survive; the `down` remove must be skipped"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// `modules/*/db/migrate/*.rb` is scanned too, not just the core
     /// `db/migrate/`.
     #[test]
@@ -1919,7 +2045,7 @@ end
             .collect();
         assert_eq!(
             cols.len(),
-            31,
+            33,
             "baseline+replay WorkPackage columns: {cols:?}"
         );
         for expected in [
@@ -1950,12 +2076,17 @@ end
             "derived_remaining_hours",
             "derived_done_ratio",
             "project_phase_id",
-            // Post-baseline replay additions (net of the same-file
-            // add-then-remove of `sequence_number`/`identifier`).
+            // Post-baseline replay additions.
             "position",
             "story_points",
             "remaining_hours",
             "budget_id",
+            // Added by `20260330100000_create_work_package_semantic_ids.rb`'s
+            // `def up`; its `def down` removes them, but Rails applies only the
+            // `up` direction (codex #73 P2 — the replay now skips `def down`
+            // bodies, so these are correctly RETAINED, not netted to absent).
+            "sequence_number",
+            "identifier",
         ] {
             assert!(cols.contains(&expected), "missing column {expected}");
         }
@@ -1971,8 +2102,8 @@ end
         assert_eq!(by_name("schedule_manually").not_null, Some(true));
         assert_eq!(by_name("budget_id").field_type.as_deref(), Some("integer"));
         assert!(
-            !cols.contains(&"sequence_number") && !cols.contains(&"identifier"),
-            "same-file add_column-then-remove_column must net to absent: {cols:?}"
+            cols.contains(&"sequence_number") && cols.contains(&"identifier"),
+            "`def up` add must survive; the `def down` remove is skipped (codex #73 P2): {cols:?}"
         );
     }
 
@@ -1988,11 +2119,13 @@ end
     /// Measured against the actual corpus at the time this fuse was
     /// pinned, the PRE-replay baseline is 27 fields (matching
     /// [`openproject_corpus_schema_gate`]'s long-standing pin — 40 does not
-    /// reproduce), and POST-replay is 31: a real, verified +4 from four
-    /// genuine post-baseline `add_column`s
-    /// (`position`/`story_points`/`remaining_hours` from the `backlogs`
-    /// module, `budget_id` from `budgets`), net of the `create_work_package_semantic_ids`
-    /// migration's own same-file add-then-remove of `sequence_number`/`identifier`.
+    /// reproduce), and POST-replay is 33: a real, verified +6 — four genuine
+    /// post-baseline `add_column`s (`position`/`story_points`/`remaining_hours`
+    /// from the `backlogs` module, `budget_id` from `budgets`) PLUS
+    /// `sequence_number`/`identifier` from `create_work_package_semantic_ids`'s
+    /// `def up` (its `def down` removes them, but Rails applies only `up`, and
+    /// the replay now skips `def down` bodies — codex #73 P2; the earlier
+    /// "net to zero" pin of 31 was the bug the reviewer caught).
     /// It does not reach 64. Investigation (see the wave report) found the
     /// remaining gap lives almost entirely in forms this replay pass
     /// deliberately does not cover — chiefly a `change_table :work_packages
@@ -2001,7 +2134,7 @@ end
     /// — which is out of scope for a bounded, four-top-level-statement
     /// replay (module doc: "Post-baseline replay"). Pinning the true
     /// measured number here rather than a hoped-for one, per this module's
-    /// conservation-ledger discipline: a silent regression below 31 should
+    /// conservation-ledger discipline: a silent regression below 33 should
     /// trip this fuse just as loudly as a silent jump would.
     #[test]
     #[allow(clippy::print_stderr)] // diagnostic emission gated on env var (real-corpus gate)
@@ -2036,9 +2169,9 @@ end
              pre-replay baseline, got {field_count}"
         );
         assert_eq!(
-            field_count, 31,
+            field_count, 33,
             "drift fuse: WorkPackage field count via baseline+replay on the real OpenProject \
-             corpus moved away from the pinned 31 — confirm whether the corpus or the parser \
+             corpus moved away from the pinned 33 — confirm whether the corpus or the parser \
              changed before updating this pin (see doc comment: this is short of the wave's \
              hoped-for >64/~109, by design scope, not a bug)"
         );
