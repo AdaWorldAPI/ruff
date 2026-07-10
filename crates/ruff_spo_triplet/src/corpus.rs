@@ -272,9 +272,15 @@ mod tests {
         let f = &fns[0];
         assert_eq!(f.name, "odoo:account_move._compute_amount");
         assert_eq!(f.writes, vec!["odoo:account_move.amount_total"]);
-        assert!(f.guarded_writes.is_empty(), "declarative write is not a J1 guard");
+        assert!(
+            f.guarded_writes.is_empty(),
+            "declarative write is not a J1 guard"
+        );
         // The whole point: the fresh write (W ⊄ R) classifies as Compute.
-        assert_eq!(crate::recipe::classify(f), crate::recipe::RecipeCentroid::Compute);
+        assert_eq!(
+            crate::recipe::classify(f),
+            crate::recipe::RecipeCentroid::Compute
+        );
     }
 
     #[test]

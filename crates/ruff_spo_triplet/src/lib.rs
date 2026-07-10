@@ -56,8 +56,10 @@
 mod codebook;
 mod concept_split;
 mod corpus;
+mod exam_config;
 mod expand;
 mod ir;
+mod nav_digest;
 mod ndjson;
 mod reassemble;
 mod recipe;
@@ -71,6 +73,7 @@ pub use concept_split::{
     split_method_name, tokenize_method_name,
 };
 pub use corpus::{group_functions, reassemble_model_graph};
+pub use exam_config::{ExamConfig, parse};
 pub use expand::expand;
 pub use ir::{
     ActsAs, AssocDecl, AssocKind, AttrDecl, AttrKind, Callback, ConcernKind, ConcernRef,
@@ -79,10 +82,13 @@ pub use ir::{
     GemDsl, GemKind, Model, ModelGraph, ScopeDecl, ScopeKind, StiInfo, UsingRef, Validation,
     ValidationKind,
 };
+pub use nav_digest::build_nav_digest;
 pub use ndjson::{ParseError, from_ndjson, to_ndjson};
 pub use reassemble::{cpp_projection, reassemble};
 pub use recipe::{RecipeCentroid, classify, is_recoverable};
-pub use structured_names::{NameGrammar, StructuredName, Tier, parse_structured_name, part_of_edges};
+pub use structured_names::{
+    NameGrammar, StructuredName, Tier, parse_structured_name, part_of_edges,
+};
 pub use surface_schema::{SchemaSurface, SurfaceConvention, SurfaceKind, classify_surface};
 pub use triple::{EntityKind, Predicate, Provenance, Triple};
 

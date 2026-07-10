@@ -57,10 +57,34 @@ pub enum SurfaceKind {
     /// declared for the operator's surface-convention table (`patfile_sub`
     /// -> subtab) but not yet exercised by a shipped convention row.
     SubtabSurface,
-    /// A grid/table surface (UI-shaped config, not data-shaped). RESERVED:
-    /// the `dgv`-style grid-plumbing rows on the slag ledger are this
-    /// variant's intended consumers; wired when that convention row lands.
+    /// A grid/table surface (UI-shaped config, not data-shaped). The
+    /// `dgv`-style grid-plumbing rows on the slag ledger are this
+    /// variant's consumers (autosize / regenerate-line / select-line
+    /// plumbing repeated per form class).
     GridSurface,
+    /// A UI-localization pass (config-shaped, not data-shaped): the
+    /// apply-language-strings-to-controls method every form class
+    /// repeats (WinForms-style `Update<Lang>ToForm` families). The
+    /// language table is SCHEMA (a localization space); the per-form
+    /// method is plumbing over it — never a domain action.
+    LocalizationSurface,
+}
+
+impl SurfaceKind {
+    /// Parse a convention-config token (`surface=<token>:<kind>` rows in
+    /// data-as-config files) into a kind. Tokens are the stable config
+    /// vocabulary, deliberately decoupled from variant names.
+    #[must_use]
+    pub fn from_config_token(token: &str) -> Option<Self> {
+        match token {
+            "enum_source" => Some(Self::EnumSource),
+            "template_source" => Some(Self::TemplateSource),
+            "subtab" => Some(Self::SubtabSurface),
+            "grid" => Some(Self::GridSurface),
+            "localization" => Some(Self::LocalizationSurface),
+            _ => None,
+        }
+    }
 }
 
 /// One classified schema surface.
@@ -183,7 +207,10 @@ mod tests {
     /// name: an ordinary domain action, not a schema surface.
     #[test]
     fn no_surface_token_is_not_a_schema_surface() {
-        assert_eq!(classify_surface("get_invoice", &verbs(), &convention()), None);
+        assert_eq!(
+            classify_surface("get_invoice", &verbs(), &convention()),
+            None
+        );
     }
 
     /// `combo_cipher` — a surface token (`combo`) is present, but the
@@ -191,7 +218,10 @@ mod tests {
     /// of recognizable action shape either).
     #[test]
     fn non_verb_first_token_is_not_a_schema_surface() {
-        assert_eq!(classify_surface("combo_cipher", &verbs(), &convention()), None);
+        assert_eq!(
+            classify_surface("combo_cipher", &verbs(), &convention()),
+            None
+        );
     }
 
     /// Case-insensitivity flows from the tokenizer (which lowercases) and
@@ -202,5 +232,62 @@ mod tests {
         assert_eq!(result.kind, SurfaceKind::EnumSource);
         assert_eq!(result.surface, "combo");
         assert_eq!(result.residue, vec!["cipher", "typ"]);
+    }
+
+    /// Grid plumbing (`autosize_grid_invoice_list`) classifies as a
+    /// `GridSurface` once the convention row lands — the per-form
+    /// autosize/select/regen-line families are UI config, not actions.
+    #[test]
+    fn grid_convention_row_classifies_grid_plumbing() {
+        let verbs = vec!["autosize".to_string()];
+        let conv = SurfaceConvention {
+            surfaces: vec![("grid".to_string(), SurfaceKind::GridSurface)],
+        };
+        let result = classify_surface("autosize_grid_invoice_list", &verbs, &conv).unwrap();
+        assert_eq!(result.kind, SurfaceKind::GridSurface);
+        assert_eq!(result.surface, "grid");
+        assert_eq!(result.residue, vec!["invoice", "list"]);
+    }
+
+    /// The per-form localization pass (`Update_Lang_To_Form` shape)
+    /// classifies as a `LocalizationSurface`: the language table is
+    /// schema, the repeated per-form applier is plumbing over it.
+    #[test]
+    fn localization_convention_row_classifies_language_pass() {
+        let verbs = vec!["update".to_string()];
+        let conv = SurfaceConvention {
+            surfaces: vec![("lang".to_string(), SurfaceKind::LocalizationSurface)],
+        };
+        let result = classify_surface("Update_Lang_To_Form", &verbs, &conv).unwrap();
+        assert_eq!(result.kind, SurfaceKind::LocalizationSurface);
+        assert_eq!(result.surface, "lang");
+        assert_eq!(result.residue, vec!["to", "form"]);
+    }
+
+    /// The config vocabulary round-trips every kind and rejects unknowns —
+    /// `surface=<token>:<kind>` rows in data-as-config files depend on it.
+    #[test]
+    fn config_tokens_parse_to_kinds() {
+        assert_eq!(
+            SurfaceKind::from_config_token("enum_source"),
+            Some(SurfaceKind::EnumSource)
+        );
+        assert_eq!(
+            SurfaceKind::from_config_token("template_source"),
+            Some(SurfaceKind::TemplateSource)
+        );
+        assert_eq!(
+            SurfaceKind::from_config_token("subtab"),
+            Some(SurfaceKind::SubtabSurface)
+        );
+        assert_eq!(
+            SurfaceKind::from_config_token("grid"),
+            Some(SurfaceKind::GridSurface)
+        );
+        assert_eq!(
+            SurfaceKind::from_config_token("localization"),
+            Some(SurfaceKind::LocalizationSurface)
+        );
+        assert_eq!(SurfaceKind::from_config_token("bogus"), None);
     }
 }
