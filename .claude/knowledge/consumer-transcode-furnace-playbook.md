@@ -255,6 +255,64 @@ co-fire reorder ("fires-together-wires-together") is offered as an
 
 ______________________________________________________________________
 
+## 6b. The render manifest is EDITABLE CONFIG — manual override
+
+The single rule that keeps a transcode alive instead of frozen: **the
+render manifest (the emitted `nav-manifest.json` / config) is the
+authoritative, hand-editable source of truth — not a locked build
+artifact the deriver owns.** The deriver *seeds* it from the harvest; a
+human then overrides it "from the end" (the desired end state). Get this
+wrong and the substrate is glued to exactly what the harvest emitted and
+impossible to keep working on.
+
+**The anti-pattern that glues it (do NOT ship this):** a hardcoded
+reachable-routes set / allow-list in the *consumer code* that silently
+**drops** any manifest entry it doesn't recognise. It means adding one
+menu item requires editing code AND re-harvesting — the config is no
+longer the config. If you find one, delete it (worked instance:
+MedCare-rs `nav::reachable_routes`).
+
+**The four moves that keep it editable:**
+
+1. **Manifest is authoritative.** The runtime renders exactly what the
+   manifest says, filtered ONLY by *access* masks (RBAC / local /
+   patient-context), never by a reachability drop. A manual override is
+   rendered, not swallowed.
+2. **`enabled` flag = the override switch** (data-as-config; default
+   true). A planned end-state entry (`enabled: false`) STILL renders — as
+   a disabled placeholder, not a link — so the manifest can carry the
+   *desired* end-state menu **before** its route exists. You build toward
+   it and flip the flag. This is "thinking from the end": put the whole
+   intended menu in config, mark what's live.
+3. **Reachability is a TEST-TIME drift guard, not a runtime gate.** A
+   *live* entry pointing at an unmounted route fails CI (caught at test
+   time); planned entries are exempt. Safety without glue.
+4. **Two override surfaces, both data-as-config, neither needs code or a
+   re-harvest:** edit the manifest JSON directly, or edit the deriver
+   (its `CONCEPT_ROUTE` for live rows + a `PLANNED_OVERRIDES` list for
+   end-state placeholders) and re-run it. Document the manifest header as
+   the hand-editable source so the next session doesn't treat it as
+   regenerated-only.
+
+**Why this is legitimate, not a hack:** the transcode target is an
+**object-oriented representation** — ClassView / manifest / config is an
+abstraction, so you modify it at the abstraction layer. Data-as-config
+means the config author is responsible for the config being correct
+(a live entry with a bad route is *their* CI failure, per move 3); the
+system's job is to render the config faithfully, not to second-guess it
+by dropping rows.
+
+**The consumer render seam that makes it work** (one `NavEntry` shape,
+one projection): each entry carries `{concept, scope (global|patient),
+route, route_template, order, enabled}`; the frame is a *projection* of
+the manifest under the access masks, computing a per-render `href`
+(global → bare route; patient → template with the id filled) so the
+render never emits an unmounted URL, and reading `enabled` to choose
+link-vs-placeholder. Same seam for every consumer; only the manifest
+(config) differs.
+
+______________________________________________________________________
+
 ## 7. The furnace exam — the re-derivation test
 
 The proof that a transcode is honest: **re-derive the domain concepts from
@@ -386,6 +444,11 @@ ______________________________________________________________________
 - **Minting a two-axis token.** Method+storage but no Klickwege home = it's
   a lookup/enum/RBAC filter, not a concept. Refusing it is a closure, not a
   gap (`user_right` → global_mask).
+- **A hardcoded reachability gate in consumer code** (a route allow-list
+  that silently drops manifest entries). This is the glue that freezes
+  the transcode — adding a menu item then needs a code edit + re-harvest.
+  The manifest is the config; render what it says, mark planned entries
+  `enabled: false`, and move reachability to a test-time drift guard (§6b).
 - **Emulating the widget tree.** Porting WinForms/XML/ERB layout verbatim
   instead of harvesting-and-reimagining into the six-region frame.
 - **One oracle only.** Value parity without structure parity ships a
