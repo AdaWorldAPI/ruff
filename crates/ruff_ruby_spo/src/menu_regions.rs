@@ -63,7 +63,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use lib_ruby_parser::{Node, Parser, ParserOptions};
-use ruff_spo_triplet::{Predicate, Provenance, Triple};
+use ruff_spo_triplet::{RegionFact, Triple};
 
 /// One harvested menu-item region placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -757,37 +757,31 @@ fn positional_args(args: &[Node]) -> Vec<&Node> {
 }
 
 impl RegionEntry {
-    /// Lift into the shared closed-vocab triples (§1/§2 of the frozen
-    /// spec): `docked_at` always, `tab_order` when resolved, and
-    /// `contains_control` when `parent` is present. All
-    /// [`Provenance::Authoritative`], matching ruff #76's `WinForms` arm.
+    /// Project this Rails harvest record onto the shared, frontend-agnostic
+    /// [`RegionFact`]. The Rails-local subject convention (`{ns}:{menu}` as the
+    /// screen, the bare `menu` token as the `docked_at` object) is applied
+    /// here; the emission itself lives once in [`RegionFact::to_triples`], so
+    /// the subject grammar is shared with the Odoo and `WinForms` arms and the
+    /// [`ruff_spo_triplet::build_nav_digest`] consumer.
+    #[must_use]
+    pub fn to_fact(&self, namespace: &str) -> RegionFact {
+        RegionFact {
+            screen: format!("{namespace}:{}", self.menu),
+            control: self.item.clone(),
+            dock_token: self.menu.clone(),
+            tab_order: self.tab_order,
+            opens_popup: None,
+            parent: self.parent.clone(),
+        }
+    }
+
+    /// Lift into the shared closed-vocab triples via [`Self::to_fact`]:
+    /// `docked_at` always, `tab_order` when resolved, and `contains_control`
+    /// when `parent` is present. Byte-identical to the pre-collapse hand-rolled
+    /// emission (subject `{ns}:{menu}.{item}`, `docked_at → menu`).
     #[must_use]
     pub fn to_triples(&self, namespace: &str) -> Vec<Triple> {
-        let subject = format!("{namespace}:{}.{}", self.menu, self.item);
-        let mut triples = vec![Triple::new(
-            subject.clone(),
-            Predicate::DockedAt,
-            self.menu.clone(),
-            Provenance::Authoritative,
-        )];
-        if let Some(order) = self.tab_order {
-            triples.push(Triple::new(
-                subject.clone(),
-                Predicate::TabOrder,
-                order.to_string(),
-                Provenance::Authoritative,
-            ));
-        }
-        if let Some(parent) = &self.parent {
-            let parent_subject = format!("{namespace}:{}.{parent}", self.menu);
-            triples.push(Triple::new(
-                parent_subject,
-                Predicate::ContainsControl,
-                subject,
-                Provenance::Authoritative,
-            ));
-        }
-        triples
+        self.to_fact(namespace).to_triples()
     }
 }
 

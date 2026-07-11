@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use crate::exam_config::ExamConfig;
+use crate::region::RegionSubject;
 use crate::triple::Triple;
 
 /// Strip a triple's namespace prefix (`"ns:"`), returning the local part.
@@ -26,22 +27,26 @@ fn strip_ns(iri: &str) -> &str {
 }
 
 /// The screen segment of a namespace-qualified, possibly control-qualified
-/// local IRI: the namespace-stripped segment up to the first `.`, e.g.
-/// `"csharp:uc_cipher_main.btn_save"` -> `"uc_cipher_main"`.
+/// local IRI: the namespace-stripped segment up to the **last** `.`, e.g.
+/// `"csharp:uc_cipher_main.btn_save"` -> `"uc_cipher_main"`. Decoded through
+/// the shared [`crate::RegionSubject::from_iri`] codec (last-dot rule), so a
+/// dotted screen (Odoo's `widget_views.xml#view.field`) recovers the screen
+/// correctly instead of splitting at the `.xml` dot.
 fn screen_of(iri: &str) -> &str {
     let local = strip_ns(iri);
-    local.split_once('.').map_or(local, |(head, _)| head)
+    RegionSubject::from_iri(local).map_or(local, |(head, _)| head)
 }
 
 /// The control segment of a namespace-qualified, screen-qualified local
-/// IRI: the tail after the first `.`, e.g.
+/// IRI: the tail after the **last** `.`, e.g.
 /// `"csharp:uc_cipher_main.btn_save"` -> `"btn_save"`. Sibling of
-/// [`screen_of`] (the head half of the same split); when there is no `.`
-/// the whole namespace-stripped string is returned (degenerate case, not
-/// expected for `docked_at` / `tab_order` / `opens_popup` subjects).
+/// [`screen_of`] (the other half of the same [`crate::RegionSubject::from_iri`]
+/// split); when there is no `.` the whole namespace-stripped string is
+/// returned (degenerate case, not expected for `docked_at` / `tab_order` /
+/// `opens_popup` subjects).
 fn control_of(iri: &str) -> &str {
     let local = strip_ns(iri);
-    local.split_once('.').map_or(local, |(_, tail)| tail)
+    RegionSubject::from_iri(local).map_or(local, |(_, tail)| tail)
 }
 
 /// Resolve a `surfaces_concept` object token to a codebook concept id.
@@ -480,6 +485,48 @@ Invoice
     #[test]
     fn digest_matches_the_exact_expected_string() {
         assert_eq!(build_nav_digest(&sample_triples(), &config()), EXPECTED);
+    }
+
+    /// Convergence proof (region-collapse spec §6): a Rails-shaped fact and an
+    /// Odoo-shaped fact, lifted through the SHARED `region_triples`, both land
+    /// in the `[regions]` section of the SAME digest — proving all frontends
+    /// round-trip through one consumer. The Odoo case is the one that matters:
+    /// its screen carries a `.xml` dot, so it exercises the shared codec's
+    /// last-dot rule (`rsplit_once`). Before the collapse Odoo emitted a
+    /// `{screen}::{control}` subject the dot-parsing digest could not read.
+    #[test]
+    fn rails_and_odoo_facts_both_round_trip_through_one_digest() {
+        let facts = [
+            crate::RegionFact {
+                screen: "openproject:top_menu".to_string(),
+                control: "projects".to_string(),
+                dock_token: "top".to_string(),
+                tab_order: Some(0),
+                opens_popup: None,
+                parent: None,
+            },
+            crate::RegionFact {
+                // Dotted `.xml` screen — the codec must split on the LAST dot.
+                screen: "widget_views.xml#view_form".to_string(),
+                control: "partner_id".to_string(),
+                dock_token: "fill".to_string(),
+                tab_order: Some(0),
+                opens_popup: None,
+                parent: None,
+            },
+        ];
+        let digest = build_nav_digest(&crate::region_triples(&facts), &config());
+        // Rails: `top` -> top_bar, ns-stripped screen `top_menu`.
+        assert!(
+            digest.contains("top_menu / top_bar: projects(0)"),
+            "Rails fact missing from [regions]:\n{digest}"
+        );
+        // Odoo: `fill` -> center, dotted screen recovered intact (the `.xml`
+        // dot is NOT mistaken for the control boundary).
+        assert!(
+            digest.contains("widget_views.xml#view_form / center: partner_id(0)"),
+            "Odoo dotted-screen fact missing/mis-split in [regions]:\n{digest}"
+        );
     }
 
     /// Same triples, different input order: the digest must be byte-identical

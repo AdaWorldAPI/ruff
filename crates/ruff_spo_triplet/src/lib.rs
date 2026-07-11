@@ -63,6 +63,7 @@ mod nav_digest;
 mod ndjson;
 mod reassemble;
 mod recipe;
+mod region;
 mod structured_names;
 mod surface_schema;
 mod triple;
@@ -86,6 +87,7 @@ pub use nav_digest::build_nav_digest;
 pub use ndjson::{ParseError, from_ndjson, to_ndjson};
 pub use reassemble::{cpp_projection, reassemble};
 pub use recipe::{RecipeCentroid, classify, is_recoverable};
+pub use region::{RegionFact, RegionSubject, region_triples};
 pub use structured_names::{
     NameGrammar, StructuredName, Tier, parse_structured_name, part_of_edges,
 };
