@@ -2220,11 +2220,15 @@ mod tests {
             Predicate::from_str(Predicate::RouteScope.as_str()),
             Some(Predicate::RouteScope)
         );
-        // The global predicate count-lock is owned by `ruff_spo_triplet`'s
-        // `predicate_count_locked_at_*` test; this arm only proves its own two
-        // variants roundtrip, so it must not re-assert the total (a predicate
-        // added by any other arm — e.g. #76's dock/tab/popup plane — must not
-        // trip a routes.rs test).
+        // This arm proves only its own two variants roundtrip — it must NOT
+        // re-assert the global `Predicate::ALL.len()`. A cross-crate re-assertion
+        // of a shared count is the "monitor N pins" anti-pattern the OGAR
+        // hot-plug plug-and-play doctrine retires (`OGAR/.claude/knowledge/
+        // hotplug-consumer-migration.md`: "wenn's knallt, dann einmal — nicht
+        // 200 Pins monitoren"): vocabulary drift is caught precisely, at the
+        // consumer boundary, by classid/capability resolution — not by a global
+        // integer every arm duplicates. A predicate added by any other arm
+        // (e.g. #76's dock/tab/popup plane) must never trip a routes.rs test.
     }
 
     /// F(16) — member/collection String first-arg: bare identifier ↔
