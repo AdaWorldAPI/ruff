@@ -58,7 +58,7 @@
 //! 4. `content_for :sidebar` is a `left_nav` sub-panel, not a region —
 //!    downstream-config concern, irrelevant to this harvester.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -79,9 +79,12 @@ pub struct RegionEntry {
     pub parent: Option<String>,
     /// The raw declared position directive.
     pub position: Position,
-    /// The resolved 0-based sibling ordinal (§3). `None` means the item's
-    /// sibling group had a `before`/`after` cycle — genuinely unresolvable,
-    /// not a guess (counted in [`RegionScanReport::unresolved_order`]).
+    /// The resolved 0-based sibling ordinal (§3), assigned by the single-
+    /// pass Rails `TreeNode` replay in [`resolve_group`]. Always `Some`
+    /// under that model (declaration-order resolution always terminates);
+    /// the `Option` is retained so any future regression that fails to
+    /// assign an ordinal surfaces as `None` + a non-zero
+    /// [`RegionScanReport::unresolved_order`] rather than a silent wrong 0.
     pub tab_order: Option<u32>,
     /// Path relative to the corpus root, `/`-joined.
     pub file: String,
@@ -116,8 +119,10 @@ pub struct RegionScanReport {
     pub with_parent: usize,
     /// Entries whose declared [`Position`] is not [`Position::Append`].
     pub with_position: usize,
-    /// Items whose sibling group had a `before`/`after` cycle — no
-    /// `tab_order` was assigned for them (never a guess).
+    /// Entries left without a `tab_order` after resolution. Structurally 0
+    /// under the single-pass Rails `TreeNode` replay (which always
+    /// terminates); retained as a regression tripwire — a non-zero value
+    /// means a future change stopped assigning an ordinal to some item.
     pub unresolved_order: usize,
     /// Distinct `menu_names` seen, sorted.
     pub menus: Vec<String>,
@@ -307,17 +312,19 @@ fn relative_path(root: &Path, path: &Path) -> String {
 // §3 — the tab_order resolution algorithm
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Resolve `tab_order` for every registration, per §3 of the frozen spec:
-/// group by `(menu, parent)` sibling group, seed with declaration order
-/// (the `regs` slice's own index order — files are walked in sorted-path
-/// order and each file's AST is visited in source order, so index order
-/// IS the "file+line declaration order" approximation the spec names as
-/// its one ordering assumption), then apply First / Last / Before / After
-/// in that fixed sequence. Returns one `Option<u32>` per `regs` entry (by
-/// index) plus the total count of cyclic (unresolvable) entries.
+/// Resolve `tab_order` for every registration: group by `(menu, parent)`
+/// sibling group, then replay each group in declaration order via
+/// [`resolve_group`]'s faithful Rails `TreeNode` single pass. Group
+/// membership preserves the `regs` slice's own index order (files walked in
+/// sorted-path order, each file's AST visited in source order — the
+/// "file+line declaration order" approximation the spec names as its one
+/// ordering assumption). Returns one `Option<u32>` per `regs` entry (by
+/// index) plus the count of entries left without a `tab_order` — always 0
+/// under the single-pass model (declaration-order resolution always
+/// terminates; the field is retained for report-shape stability and to
+/// catch any future regression that fails to assign an ordinal).
 fn resolve_tab_orders(regs: &[Registration]) -> (Vec<Option<u32>>, usize) {
     let mut tab_order: Vec<Option<u32>> = vec![None; regs.len()];
-    let mut unresolved = 0usize;
 
     let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
     for (i, r) in regs.iter().enumerate() {
@@ -328,142 +335,72 @@ fn resolve_tab_orders(regs: &[Registration]) -> (Vec<Option<u32>>, usize) {
     }
 
     for order in groups.into_values() {
-        resolve_group(regs, order, &mut tab_order, &mut unresolved);
+        resolve_group(regs, order, &mut tab_order);
     }
 
+    let unresolved = tab_order.iter().filter(|t| t.is_none()).count();
     (tab_order, unresolved)
 }
 
-/// Resolve one `(menu, parent)` sibling group in place, per the 5-step
-/// algorithm (§3): cycle-detect first (functional graph, out-degree <= 1
-/// per node since each registration carries exactly one [`Position`]),
-/// then First → Last → Before/After → assign ordinals.
-fn resolve_group(
-    regs: &[Registration],
-    order: Vec<usize>,
-    tab_order: &mut [Option<u32>],
-    unresolved: &mut usize,
-) {
-    let item_index: HashMap<&str, usize> =
-        order.iter().map(|&i| (regs[i].item.as_str(), i)).collect();
-    let mut edge: HashMap<usize, usize> = HashMap::new();
-    for &i in &order {
-        let anchor = match &regs[i].position {
-            Position::Before(a) | Position::After(a) => Some(a.as_str()),
-            _ => None,
-        };
-        if let Some(a) = anchor
-            && let Some(&target) = item_index.get(a)
-            && target != i
-        {
-            edge.insert(i, target);
-        }
-    }
-    let cyclic = detect_cycle_members(&order, &edge);
+/// Resolve one `(menu, parent)` sibling group in place by a **faithful
+/// single-pass replay of Rails `MenuManager::TreeNode`** (`tree_node.rb`):
+/// process the registrations in declaration order, mutating a `children`
+/// vec exactly as Rails does per push, so the final index IS the
+/// `tab_order`. This replaced an earlier phase-separated model (First →
+/// Last → Before/After in fixed stages) that diverged from Rails in two
+/// code-proven ways: multiple `first:` items are LIFO in Rails (each
+/// `prepend` inserts at index 0), not FIFO; and a plain push after a
+/// `before:`/`after:` splice lands relative to the *live*
+/// `size - last_count` boundary, which a staged model can't reproduce.
+/// The single pass matches Rails' one mutating pass exactly, and Rails'
+/// at-push-time `exists?` means a forward-referenced or absent anchor
+/// falls back to a plain `add` — so there is no unresolvable/cyclic case
+/// to detect (declaration-order resolution always terminates).
+///
+/// Per-push semantics (Rails `mapper.rb` push dispatch + `tree_node.rb`):
+/// - `first`  → `prepend`: insert at 0.
+/// - `before`/`after` with the anchor **already present**: `add_at` at the
+///   anchor's current index (`+1` for `after`); does NOT touch `last_count`.
+/// - `before`/`after` with a **missing** anchor → fall through to a plain
+///   `add` (Rails checks `exists?` and only then splices).
+/// - `last`   → `add_last`: append AND `last_count += 1`.
+/// - plain    → `add`: insert at `children.len() - last_count` (just before
+///   the trailing `last:` band).
+fn resolve_group(regs: &[Registration], order: Vec<usize>, tab_order: &mut [Option<u32>]) {
+    let mut children: Vec<usize> = Vec::with_capacity(order.len());
+    let mut last_count: usize = 0;
 
-    // Step 2: First items move to the front, relative order preserved.
-    let (firsts, rest): (Vec<usize>, Vec<usize>) = order
-        .into_iter()
-        .partition(|&i| matches!(regs[i].position, Position::First));
-    let mut seq: Vec<usize> = firsts;
-    seq.extend(rest);
+    // A plain `add` inserts just before the trailing `last:` band.
+    let plain_pos = |children: &Vec<usize>, last_count: usize| children.len() - last_count;
+    // The anchor's current index within `children`, by item name.
+    let anchor_pos = |children: &Vec<usize>, anchor: &str| {
+        children
+            .iter()
+            .position(|&x| regs[x].item.as_str() == anchor)
+    };
 
-    // Step 3: Last items move to the end, relative order preserved.
-    let (rest2, lasts): (Vec<usize>, Vec<usize>) = seq
-        .into_iter()
-        .partition(|&i| !matches!(regs[i].position, Position::Last));
-    let mut seq: Vec<usize> = rest2;
-    seq.extend(lasts);
-
-    // Step 4: Before/After, resolved in declaration order (the stable
-    // partitions above keep the untouched middle band declaration-ordered,
-    // so filtering `seq` here yields Before/After items in original seq
-    // order too). Cyclic items are skipped — they keep their step-2/3
-    // position and get no tab_order (step 5).
-    let before_after: Vec<usize> = seq
-        .iter()
-        .copied()
-        .filter(|i| {
-            !cyclic.contains(i)
-                && matches!(regs[*i].position, Position::Before(_) | Position::After(_))
-        })
-        .collect();
-    for id in before_after {
-        let Some(cur) = seq.iter().position(|&x| x == id) else {
-            continue;
-        };
-        seq.remove(cur);
-        let (anchor, is_before) = match &regs[id].position {
-            Position::Before(a) => (a.as_str(), true),
-            Position::After(a) => (a.as_str(), false),
-            _ => unreachable!("filtered to Before/After above"),
-        };
-        match seq.iter().position(|&x| regs[x].item.as_str() == anchor) {
-            Some(anchor_idx) => {
-                let insert_at = if is_before {
-                    anchor_idx
-                } else {
-                    anchor_idx + 1
-                };
-                seq.insert(insert_at, id);
+    for i in order {
+        match &regs[i].position {
+            Position::First => children.insert(0, i),
+            Position::Last => {
+                children.push(i);
+                last_count += 1;
             }
-            // Missing anchor -> Rails' own documented missing-anchor
-            // behavior (mapper.rb): fall back to append.
-            None => seq.push(id),
+            Position::Before(anchor) => match anchor_pos(&children, anchor) {
+                Some(p) => children.insert(p, i),
+                None => children.insert(plain_pos(&children, last_count), i),
+            },
+            Position::After(anchor) => match anchor_pos(&children, anchor) {
+                Some(p) => children.insert(p + 1, i),
+                None => children.insert(plain_pos(&children, last_count), i),
+            },
+            Position::Append => children.insert(plain_pos(&children, last_count), i),
         }
     }
 
-    // Step 5: assign 0-based indices; cyclic items get no tab_order.
-    for (idx, id) in seq.into_iter().enumerate() {
-        if cyclic.contains(&id) {
-            *unresolved += 1;
-        } else {
-            tab_order[id] = Some(u32::try_from(idx).unwrap_or(u32::MAX));
-        }
+    for (idx, id) in children.into_iter().enumerate() {
+        tab_order[id] = Some(u32::try_from(idx).unwrap_or(u32::MAX));
     }
-}
-
-/// Find every item that participates in a `before`/`after` cycle within
-/// one sibling group. `edge` is a functional graph (out-degree <= 1 per
-/// node, since each registration carries exactly one [`Position`]), so
-/// this is a plain follow-the-chain walk with a three-color visited set
-/// (0 = unvisited, 1 = in the current path, 2 = done/resolved) rather than
-/// general-graph Tarjan/Kosaraju machinery.
-fn detect_cycle_members(order: &[usize], edge: &HashMap<usize, usize>) -> HashSet<usize> {
-    let mut cyclic = HashSet::new();
-    let mut state: HashMap<usize, u8> = HashMap::new();
-    for &start in order {
-        if state.get(&start).copied().unwrap_or(0) != 0 {
-            continue;
-        }
-        let mut path = Vec::new();
-        let mut cur = start;
-        loop {
-            match state.get(&cur).copied().unwrap_or(0) {
-                0 => {
-                    state.insert(cur, 1);
-                    path.push(cur);
-                    match edge.get(&cur) {
-                        Some(&next) => cur = next,
-                        None => break,
-                    }
-                }
-                1 => {
-                    if let Some(pos) = path.iter().position(|&n| n == cur) {
-                        for &n in &path[pos..] {
-                            cyclic.insert(n);
-                        }
-                    }
-                    break;
-                }
-                _ => break,
-            }
-        }
-        for &n in &path {
-            state.insert(n, 2);
-        }
-    }
-    cyclic
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1001,10 +938,15 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Fixture (e) — `after:` with a MISSING anchor → append fallback
-    /// (Rails' own documented missing-anchor behavior).
+    /// Fixture (e) — `after:` with a MISSING anchor → Rails' documented
+    /// missing-anchor behavior: `exists?(:nonexistent)` is false at push
+    /// time, so the `after` branch is skipped and beta falls through to a
+    /// plain `add` AT THAT MOMENT (index 1, before the not-yet-pushed
+    /// gamma) — NOT an append to the very end. (The earlier phase-separated
+    /// model wrongly pushed beta past gamma; the single-pass replay keeps
+    /// Rails' declaration-time placement.)
     #[test]
-    fn after_missing_anchor_falls_back_to_append() {
+    fn after_missing_anchor_falls_back_to_plain_add_at_push_time() {
         let root = scratch_dir("missing_anchor");
         write_file(
             &root,
@@ -1019,8 +961,8 @@ mod tests {
         let entries = extract_regions(&root);
         let order = |name: &str| entries.iter().find(|e| e.item == name).unwrap().tab_order;
         assert_eq!(order("alpha"), Some(0));
-        assert_eq!(order("gamma"), Some(1));
-        assert_eq!(order("beta"), Some(2));
+        assert_eq!(order("beta"), Some(1));
+        assert_eq!(order("gamma"), Some(2));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1116,11 +1058,19 @@ mod tests {
         assert_eq!(triples.len(), 2, "{triples:?}");
     }
 
-    /// Fixture (i) — a before/after cycle → `unresolved_order`, no
-    /// `tab_order` for the affected items (never a guess).
+    /// Fixture (i) — a mutual `after:` reference ("cycle") resolves
+    /// DETERMINISTICALLY under the single-pass replay, and is therefore NOT
+    /// unresolved. Rails processes registrations in declaration order and
+    /// checks `exists?` at push time, so a forward reference to a
+    /// not-yet-pushed anchor falls through to a plain `add`; there is no
+    /// unresolvable state to detect. (The earlier phase-separated model
+    /// treated this as a cycle and emitted `unresolved_order`; that was a
+    /// divergence from Rails, caught by the correctness adversary.)
+    ///   alpha after:beta -> beta absent -> plain add -> [alpha]
+    ///   beta  after:alpha -> alpha at 0 -> add_at 1  -> [alpha, beta]
     #[test]
-    fn before_after_cycle_yields_no_tab_order_and_counts_unresolved() {
-        let root = scratch_dir("cycle");
+    fn mutual_after_reference_resolves_deterministically_single_pass() {
+        let root = scratch_dir("mutual_after");
         write_file(
             &root,
             "config/initializers/menus.rb",
@@ -1131,10 +1081,71 @@ mod tests {
         );
 
         let (entries, report) = extract_regions_with_report(&root, "openproject");
-        assert_eq!(report.unresolved_order, 2, "{report:?}");
-        for e in &entries {
-            assert!(e.tab_order.is_none(), "{e:?}");
-        }
+        assert_eq!(report.unresolved_order, 0, "{report:?}");
+        let order = |name: &str| entries.iter().find(|e| e.item == name).unwrap().tab_order;
+        assert_eq!(order("alpha"), Some(0));
+        assert_eq!(order("beta"), Some(1));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding 1 (correctness adversary) — multiple `first:` items are
+    /// **LIFO**, not FIFO. Rails `prepend` inserts each `first:` item at
+    /// index 0, so the LAST-declared `first:` wins the front. A phase-
+    /// separated "collect all firsts, move to front in declaration order"
+    /// model would give FIFO (alpha=0) — the confirmed bug.
+    ///   alpha first -> [alpha]
+    ///   beta  plain -> [alpha, beta]
+    ///   gamma first -> prepend -> [gamma, alpha, beta]
+    #[test]
+    fn multiple_first_items_are_lifo_not_fifo() {
+        let root = scratch_dir("first_lifo");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :alpha, { controller: \"/a\" }, first: true\n\
+             \x20 menu.push :beta, { controller: \"/b\" }\n\
+             \x20 menu.push :gamma, { controller: \"/c\" }, first: true\n\
+             end\n",
+        );
+
+        let entries = extract_regions(&root);
+        let order = |name: &str| entries.iter().find(|e| e.item == name).unwrap().tab_order;
+        assert_eq!(order("gamma"), Some(0));
+        assert_eq!(order("alpha"), Some(1));
+        assert_eq!(order("beta"), Some(2));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Finding 2 (correctness adversary) — a plain push after a `before:`/
+    /// `after:` splice onto a `last:` item lands relative to the **live**
+    /// `size - last_count` boundary. `after:` uses `add_at` (does NOT bump
+    /// `last_count`), so the trailing `last:` band is still {a}; the plain
+    /// `c` inserts just before it. A phase-separated model that applied Last
+    /// after Before/After would push `b` to the very end — the confirmed bug.
+    ///   a last  -> push, last_count=1        -> [a]
+    ///   b after:a -> a at 0 -> add_at 1      -> [a, b]  (last_count still 1)
+    ///   c plain -> insert at 2-1=1           -> [a, c, b]
+    #[test]
+    fn plain_push_after_splice_onto_last_respects_live_boundary() {
+        let root = scratch_dir("last_splice");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :a, { controller: \"/a\" }, last: true\n\
+             \x20 menu.push :b, { controller: \"/b\" }, after: :a\n\
+             \x20 menu.push :c, { controller: \"/c\" }\n\
+             end\n",
+        );
+
+        let entries = extract_regions(&root);
+        let order = |name: &str| entries.iter().find(|e| e.item == name).unwrap().tab_order;
+        assert_eq!(order("a"), Some(0));
+        assert_eq!(order("c"), Some(1));
+        assert_eq!(order("b"), Some(2));
 
         let _ = fs::remove_dir_all(&root);
     }
