@@ -21,6 +21,15 @@ using System.Windows.Forms;
 //   LayoutHost.grid    -tab_order->    "2"
 //   LayoutHost.toolbar -docked_at->    top     (fully-qualified DockStyle.Top)
 //   LayoutHost.toolbar -opens_popup-> LayoutHost.contextMenu
+//
+// The KLICKWEGE-RAIL arm adds the menu quad's location + purpose axes:
+//   part_of  (post-pass over navigates_to — the canonical menu parent = first
+//            opener): OrderScreen/SettingsScreen/CustomerScreen -part_of->
+//            MainScreen; ChildControl -part_of-> HostControl;
+//            QualifiedChild -part_of-> QualifiedHost.
+//   purpose  (per-screen, from control composition — ClassifyPurpose):
+//            GridScreen -> list ; ChartScreen -> chart ; FormScreen -> form ;
+//            ActionScreen -> action ; a control-less screen -> detail.
 namespace NavShapes
 {
     public class MainScreen : Form
@@ -58,6 +67,30 @@ namespace NavShapes
     public class SettingsScreen : Form { }
 
     public class CustomerScreen : Form { }
+
+    // Purpose fixture — the usability ROLE from control composition
+    // (ClassifyPurpose). Agnostic: classification is by control TYPE, no name
+    // prefixes. A chart beats a grid beats >=2 inputs beats a button.
+    public class GridScreen : UserControl
+    {
+        private DataGridView _dgv;   // -> purpose list
+    }
+
+    public class ChartScreen : UserControl
+    {
+        private Chart _chart;        // -> purpose chart
+    }
+
+    public class FormScreen : UserControl
+    {
+        private TextBox _name;       // >=2 inputs -> purpose form
+        private ComboBox _kind;
+    }
+
+    public class ActionScreen : UserControl
+    {
+        private Button _go;          // a button, no inputs/grid/chart -> purpose action
+    }
 
     // UserControl-SPA host: navigates by instantiating a screen-typed
     // UserControl into a field — NO `.Show()`. This is the idiom a ribbon /

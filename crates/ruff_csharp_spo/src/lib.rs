@@ -216,4 +216,51 @@ mod tests {
         assert_eq!(triples[0].o, "cipher_key");
     }
 
+    /// The KLICKWEGE-RAIL arm — the menu quad's `part_of` (location) + `purpose`
+    /// axes. Shaped exactly as `harvester/Program.cs` emits them (verified by
+    /// running the real harvester over `harvester/fixtures/nav_shapes.cs`):
+    /// `part_of` is the post-pass canonical menu parent (the FIRST screen that
+    /// navigates to a target — walking the rail is the radix-trie menu address,
+    /// so no position ordinal is stored, per the V3 LE-contract §3); `purpose`
+    /// is the per-screen usability role classified from control composition
+    /// (chart > grid/list > multi-input form > button/action > detail). Both
+    /// ride the Inferred tier (0.85 / 0.75). A clean load is the standing proof
+    /// the rail arm stays inside the closed vocabulary.
+    #[test]
+    fn loads_and_validates_klickwege_rail_arm_ndjson() {
+        let ndjson = concat!(
+            // part_of — canonical menu parent = first navigates_to opener
+            r#"{"s":"csharp:OrderScreen","p":"part_of","o":"csharp:MainScreen","f":0.85,"c":0.75}"#,
+            "\n",
+            r#"{"s":"csharp:ChildControl","p":"part_of","o":"csharp:HostControl","f":0.85,"c":0.75}"#,
+            "\n",
+            r#"{"s":"csharp:QualifiedChild","p":"part_of","o":"csharp:QualifiedHost","f":0.85,"c":0.75}"#,
+            "\n",
+            // purpose — one per classifier branch (from control composition)
+            r#"{"s":"csharp:GridScreen","p":"purpose","o":"list","f":0.85,"c":0.75}"#,
+            "\n",
+            r#"{"s":"csharp:ChartScreen","p":"purpose","o":"chart","f":0.85,"c":0.75}"#,
+            "\n",
+            r#"{"s":"csharp:FormScreen","p":"purpose","o":"form","f":0.85,"c":0.75}"#,
+            "\n",
+            r#"{"s":"csharp:ActionScreen","p":"purpose","o":"action","f":0.85,"c":0.75}"#,
+            "\n",
+            r#"{"s":"csharp:MainScreen","p":"purpose","o":"detail","f":0.85,"c":0.75}"#,
+            "\n",
+        );
+        let triples = load(ndjson).expect("part_of + purpose are in the closed vocab");
+        assert_eq!(triples.len(), 8);
+        // part_of: the child screen is the subject, its canonical menu parent
+        // the object (walking this rail yields the radix-trie menu address).
+        assert_eq!(triples[0].p, "part_of");
+        assert_eq!(triples[0].s, "csharp:OrderScreen");
+        assert_eq!(triples[0].o, "csharp:MainScreen");
+        // purpose: the four control-composition branches + the default.
+        assert_eq!(triples[3].p, "purpose");
+        assert_eq!(triples[3].o, "list");
+        assert_eq!(triples[4].o, "chart");
+        assert_eq!(triples[5].o, "form");
+        assert_eq!(triples[6].o, "action");
+        assert_eq!(triples[7].o, "detail");
+    }
 }
