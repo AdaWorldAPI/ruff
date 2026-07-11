@@ -631,6 +631,38 @@ pub enum Predicate {
     /// target-IRI object-slot shape as [`Self::HandlesEvent`].
     /// Authoritative: the assignment names the menu control unambiguously.
     OpensPopup,
+
+    // ───── Klickwege-rail plane (the menu quad's location + purpose axes) ─────
+    //
+    // The two axes a `(location, purpose, identity, action)` MENU QUAD needs
+    // that the planes above don't already carry. `identity` is
+    // [`Self::SurfacesConcept`] (→ classid); `action` is [`Self::NavigatesTo`] /
+    // [`Self::OpensPopup`] / [`Self::InvokesAction`]. These two supply the rest,
+    // WITHOUT a stored position ordinal — the V3 LE-contract §3 forbids a
+    // label/position slot in a facet, so the menu LOCATION is the `part_of`
+    // containment RAIL, and walking it yields the radix-trie menu address by
+    // construction (a projection the ClassView computes, never a stored
+    // ordinal). `part_of:is_a` is the mereological rail pair the le-contract
+    // names; this arm supplies the `part_of` half for the menu tree.
+    /// `(screen, part_of, parent_menu_node)` — the canonical MENU-TREE parent of
+    /// a screen/room: the menu group (ribbon tab / `MainForm` region) the screen
+    /// is reached under. Distinct from [`Self::ContainsControl`] (the raw
+    /// control tree) and [`Self::NavigatesTo`] (a click EDGE, possibly many per
+    /// screen): `part_of` names the ONE canonical menu-containment parent — the
+    /// location RAIL. Walking the rail = the radix-trie menu address; there is no
+    /// stored position ordinal (le-contract §3). **Default tier is
+    /// [`Provenance::Inferred`]**: the canonical parent is a canonicalisation
+    /// over the navigation/containment graph, not a single machine-readable
+    /// literal.
+    PartOf,
+    /// `(screen, purpose, "<role>")` — the usability ROLE of a surface, a closed
+    /// vocab: `list` / `detail` / `form` / `chart` / `settings` / `action` /
+    /// `dialog`. The MENU quad's `purpose` axis — what KIND of surface a screen
+    /// is, read from its control composition (a `DataGridView` → `list`,
+    /// form-field controls → `form`/`detail`, a chart control → `chart`, an
+    /// options room → `settings`). **Default tier is [`Provenance::Inferred`]**:
+    /// a heuristic over the control set, not a declared literal.
+    Purpose,
 }
 
 impl Predicate {
@@ -724,6 +756,8 @@ impl Predicate {
             Self::DockedAt => "docked_at",
             Self::TabOrder => "tab_order",
             Self::OpensPopup => "opens_popup",
+            Self::PartOf => "part_of",
+            Self::Purpose => "purpose",
         }
     }
 
@@ -823,6 +857,8 @@ impl Predicate {
             "docked_at" => Self::DockedAt,
             "tab_order" => Self::TabOrder,
             "opens_popup" => Self::OpensPopup,
+            "part_of" => Self::PartOf,
+            "purpose" => Self::Purpose,
             _ => return None,
         })
     }
@@ -831,11 +867,12 @@ impl Predicate {
     /// closed-vocab round-trip test and by any consumer that needs to
     /// enumerate the whole surface (e.g. the ndjson validator).
     ///
-    /// **Length invariant:** `ALL.len() == 76` (7 core + 32 AR-shape +
+    /// **Length invariant:** `ALL.len() == 78` (7 core + 32 AR-shape +
     /// 18 C++ machine-plane + 3 Odoo-relational + 4 body-mutation +
-    /// 4 UI-navigation + 3 UI-config + 2 Rails-routes + 3 UI-layout). A new
-    /// variant added to [`Predicate`] **must** be appended here in the same
-    /// order, or the closed-vocab round-trip test fails.
+    /// 4 UI-navigation + 3 UI-config + 2 Rails-routes + 3 UI-layout +
+    /// 2 Klickwege-rail). A new variant added to [`Predicate`] **must** be
+    /// appended here in the same order, or the closed-vocab round-trip test
+    /// fails.
     pub const ALL: &'static [Predicate] = &[
         // Core 7
         Self::RdfType,
@@ -922,6 +959,9 @@ impl Predicate {
         Self::DockedAt,
         Self::TabOrder,
         Self::OpensPopup,
+        // Klickwege-rail plane (menu quad location + purpose)
+        Self::PartOf,
+        Self::Purpose,
     ];
 
     /// The default provenance tier for this predicate, per the Odoo
@@ -987,7 +1027,12 @@ impl Predicate {
             | Self::NavigatesTo
             | Self::SelectsView
             | Self::InvokesAction
-            | Self::RendersAs => Provenance::Inferred,
+            | Self::RendersAs
+            // Klickwege-rail: the canonical menu parent is a canonicalisation
+            // over the nav/containment graph; the usability role is a heuristic
+            // over the control set. Neither is a single declared literal.
+            | Self::PartOf
+            | Self::Purpose => Provenance::Inferred,
             // C++ machine-plane declarative surface (the 10 remaining of 13)
             Self::InheritsFrom
             | Self::HasField
@@ -1156,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_count_locked_at_76() {
+    fn predicate_count_locked_at_78() {
         // The exact count is part of the schema contract: 7 core (Odoo
         // Python) + 32 OpenProject AR-shape (PR #15 added
         // `association_kind`; #18 added `class_name`; #21 added
@@ -1211,7 +1256,17 @@ mod tests {
         // context menu it opens. The region-grammar arm — Designer
         // `Dock` / `TabIndex` / `ContextMenuStrip` property assignments,
         // all Authoritative) = 76.
-        assert_eq!(Predicate::ALL.len(), 76);
+        // + 2 Klickwege-rail plane (2026-07-11: `part_of` / `purpose` — the
+        // two axes a `(location, purpose, identity, action)` menu quad needs
+        // beyond `surfaces_concept` (identity) + `navigates_to`/`opens_popup`
+        // (action). `part_of` is the canonical menu-tree containment RAIL —
+        // walking it yields the radix-trie menu address, so no stored position
+        // ordinal is minted (V3 LE-contract §3 forbids a label/position facet
+        // slot); `purpose` is the usability role. Both Inferred) = 78.
+        // NB (#77 lesson): this count lives HERE only. No other arm may
+        // re-assert it — cross-crate count duplication is the "monitor N pins"
+        // anti-pattern; a predicate added here must never trip a routes.rs test.
+        assert_eq!(Predicate::ALL.len(), 78);
     }
 
     #[test]
