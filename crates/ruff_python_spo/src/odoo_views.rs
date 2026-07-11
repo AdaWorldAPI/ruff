@@ -326,7 +326,7 @@ fn xml_tokens(content: &str) -> Vec<XmlToken> {
 
 /// The tag slice starting at `idx`, up to (excluding) its own `>` — wherever
 /// that is, newlines included. An unterminated tag runs to end-of-content.
-fn tag_slice(content: &str, idx: usize) -> &str {
+pub(crate) fn tag_slice(content: &str, idx: usize) -> &str {
     match content[idx..].find('>') {
         Some(rel) => &content[idx..idx + rel],
         None => &content[idx..],
@@ -335,7 +335,7 @@ fn tag_slice(content: &str, idx: usize) -> &str {
 
 /// Whether the character at `pos` terminates a tag NAME (whitespace, `/`,
 /// `>`, or end-of-content) — rejects `<fields…`/`<recording…` false matches.
-fn tag_name_boundary(content: &str, pos: usize) -> bool {
+pub(crate) fn tag_name_boundary(content: &str, pos: usize) -> bool {
     content
         .as_bytes()
         .get(pos)
@@ -356,7 +356,7 @@ fn simple_text_after(content: &str, tag_end: usize) -> Option<String> {
 }
 
 /// The value of `key="…"` inside a tag slice, if present.
-fn attr_value(tag: &str, key: &str) -> Option<String> {
+pub(crate) fn attr_value(tag: &str, key: &str) -> Option<String> {
     let pat = format!("{key}=\"");
     let start = tag.find(&pat)? + pat.len();
     let end = tag[start..].find('"')? + start;
@@ -365,7 +365,7 @@ fn attr_value(tag: &str, key: &str) -> Option<String> {
 
 /// Recursively collect every `*.xml` file under `dir` (sorted for
 /// determinism — the sibling arms' file-walk discipline).
-fn collect_xml_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn collect_xml_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -381,7 +381,7 @@ fn collect_xml_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// `path` relative to `root`, `/`-joined (a stable id, not reopened).
-fn relative_path(root: &Path, path: &Path) -> String {
+pub(crate) fn relative_path(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -443,8 +443,7 @@ mod tests {
     fn arch_fields_captured_meta_fields_excluded() {
         let root = scratch("arch");
         write(&root, "views/account_move_views.xml", FORM_VIEW);
-        let (sets, report) =
-            extract_odoo_view_field_sets_with_report(&root, &[move_target()]);
+        let (sets, report) = extract_odoo_view_field_sets_with_report(&root, &[move_target()]);
         assert_eq!(sets.len(), 1, "{sets:?}");
         assert_eq!(sets[0].resource, "account_move");
         assert_eq!(sets[0].view, "views/account_move_views.xml#view_move_form");
@@ -488,10 +487,12 @@ mod tests {
 </odoo>
 "#,
         );
-        let (sets, report) =
-            extract_odoo_view_field_sets_with_report(&root, &[move_target()]);
+        let (sets, report) = extract_odoo_view_field_sets_with_report(&root, &[move_target()]);
         assert!(sets.is_empty(), "{sets:?}");
-        assert_eq!(report.view_records, 1, "the act_window record is not a view");
+        assert_eq!(
+            report.view_records, 1,
+            "the act_window record is not a view"
+        );
         assert_eq!(report.views_with_hits, 0);
         let _ = fs::remove_dir_all(&root);
     }
