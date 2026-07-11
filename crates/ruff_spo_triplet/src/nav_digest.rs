@@ -176,9 +176,13 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
     let mut docked_raw: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut tab_order_raw: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut popup_raw: BTreeSet<(String, String, String)> = BTreeSet::new();
-    // Klickwege-rail: the menu quad's location + purpose axes.
-    let mut parent_of: BTreeMap<String, String> = BTreeMap::new();
-    let mut purpose_of: BTreeMap<String, String> = BTreeMap::new();
+    // Klickwege-rail: the menu quad's location + purpose axes. Collected as
+    // sorted raw sets first (like docked_at / tab_order below), so when a child
+    // carries more than one `part_of` fact — or a screen more than one
+    // `purpose` — the chosen value is deterministic (smallest wins via
+    // `or_insert` over the sorted set), never dependent on input triple order.
+    let mut part_of_raw: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut purpose_raw: BTreeSet<(String, String)> = BTreeSet::new();
 
     for t in triples {
         match t.p.as_str() {
@@ -236,12 +240,12 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
                 let parent = strip_ns(&t.o).to_string();
                 screens.insert(child.clone());
                 screens.insert(parent.clone());
-                parent_of.insert(child, parent);
+                part_of_raw.insert((child, parent));
             }
             "purpose" => {
                 let screen = strip_ns(&t.s).to_string();
                 screens.insert(screen.clone());
-                purpose_of.insert(screen, t.o.clone());
+                purpose_raw.insert((screen, t.o.clone()));
             }
             _ => {}
         }
@@ -271,6 +275,20 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
             screen_of(target).to_string(),
             control_of(target).to_string(),
         ));
+    }
+    // Deterministic child->parent / screen->role lookups: iterate the sorted
+    // raw sets so the smallest parent/role wins when a node carries several.
+    let mut parent_of: BTreeMap<String, String> = BTreeMap::new();
+    for (child, parent) in &part_of_raw {
+        parent_of
+            .entry(child.clone())
+            .or_insert_with(|| parent.clone());
+    }
+    let mut purpose_of: BTreeMap<String, String> = BTreeMap::new();
+    for (screen, role) in &purpose_raw {
+        purpose_of
+            .entry(screen.clone())
+            .or_insert_with(|| role.clone());
     }
 
     // Group docked controls (+ popup targets) by resolved region.
@@ -653,6 +671,30 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
         // Root: parentless, has no out-edge here, so it is a leaf node with its
         // own single-element address.
         assert!(digest.contains("Root  loc=0x0900  purpose=-  id=0x0900  action=leaf"));
+    }
+
+    /// Codex P2: when a child carries MORE THAN ONE `part_of` fact, the chosen
+    /// parent must be deterministic (smallest via `or_insert` over the sorted
+    /// raw set), so reversing the input yields a byte-identical digest — the
+    /// digest's shuffle-invariance must hold for the rail arm too.
+    #[test]
+    fn menu_quad_conflicting_part_of_is_order_independent() {
+        let mut triples = vec![
+            Triple::new("app:Leaf", Predicate::PartOf, "app:Zparent", Provenance::Inferred),
+            Triple::new("app:Leaf", Predicate::PartOf, "app:Aparent", Provenance::Inferred),
+        ];
+        let forward = build_nav_digest(&triples, &config());
+        triples.reverse();
+        let reversed = build_nav_digest(&triples, &config());
+        assert_eq!(
+            forward, reversed,
+            "conflicting part_of must be order-independent"
+        );
+        // Aparent (lexicographically smallest) is the canonical parent.
+        assert!(
+            forward.contains("Leaf  loc=Aparent/Leaf"),
+            "smallest parent must win deterministically:\n{forward}"
+        );
     }
 
     /// A mis-declared `part_of` cycle must terminate (cycle-guarded walk), not
