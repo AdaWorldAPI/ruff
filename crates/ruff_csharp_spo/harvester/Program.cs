@@ -239,18 +239,24 @@ foreach (var (_, rootNode) in parsed)
             }
         }
 
+        // Klickwege-rail `purpose`: collect this screen's control field types,
+        // classified into a usability role after the member walk.
+        var controlTypes = new List<string>();
+
         foreach (var member in type.Members)
         {
             switch (member)
             {
                 case PropertyDeclarationSyntax p:
                     EmitField(triples, ns, subj, name, p.Identifier.Text, p.Type, f, c);
+                    controlTypes.Add(p.Type.ToString());
                     break;
 
                 case FieldDeclarationSyntax fd:
                     foreach (var v in fd.Declaration.Variables)
                     {
                         EmitField(triples, ns, subj, name, v.Identifier.Text, fd.Declaration.Type, f, c);
+                        controlTypes.Add(fd.Declaration.Type.ToString());
                     }
                     break;
 
@@ -320,6 +326,32 @@ foreach (var (_, rootNode) in parsed)
                     break;
             }
         }
+
+        // ── KLICKWEGE-RAIL: purpose (the menu quad's usability role) ──
+        // Agnostic + syntactic: classify a screen by its control COMPOSITION
+        // (no app-specific prefixes) — chart > grid(list) > inputs(form) >
+        // buttons(action) > detail. Inferred tier (a heuristic over controls,
+        // not a declared literal).
+        if (screenTypes.Contains(name))
+        {
+            triples.Add(new Triple(subj, "purpose", ClassifyPurpose(controlTypes), 0.85, 0.75));
+        }
+    }
+}
+
+// ── KLICKWEGE-RAIL POST-PASS: part_of (the menu quad's location rail) ──
+// `part_of` is a canonicalisation over the `navigates_to` graph, not a single
+// AST literal, so it runs AFTER the streaming loop once every edge exists. The
+// canonical menu parent of a screen is the FIRST screen (file/Designer order)
+// that navigates to it; walking this rail yields the radix-trie menu ADDRESS by
+// construction, so no position ordinal is stored (V3 LE-contract §3: the menu
+// LOCATION is the part_of rail, projected, never a stored slot). Inferred tier.
+var partOfSeen = new HashSet<string>(StringComparer.Ordinal);
+foreach (var t in triples.ToList())
+{
+    if (t.P == "navigates_to" && t.S != t.O && partOfSeen.Add(t.O))
+    {
+        triples.Add(new Triple(t.O, "part_of", t.S, 0.85, 0.75));
     }
 }
 
@@ -336,6 +368,40 @@ using (var w = positional.Count > 1
 
 Console.Error.WriteLine($"harvested {triples.Count} triples from {root}");
 return 0;
+
+// KLICKWEGE-RAIL — the usability ROLE of a screen from its control set
+// (agnostic + syntactic: classification is by control TYPE substring, no
+// app-specific name prefixes). Priority: a chart screen, then a grid/list,
+// then a multi-input form, then an action panel, else a plain detail surface.
+// Contains-matching works on qualified spellings too
+// (`System.Windows.Forms.DataGridView`.Contains("DataGridView")).
+static string ClassifyPurpose(List<string> controlTypes)
+{
+    bool Has(params string[] needles) =>
+        controlTypes.Any(t => needles.Any(n => t.Contains(n, StringComparison.Ordinal)));
+    if (Has("Chart"))
+    {
+        return "chart";
+    }
+    if (Has("DataGridView", "GridControl", "GridView", "ListView"))
+    {
+        return "list";
+    }
+    var inputs = controlTypes.Count(t => new[]
+    {
+        "TextBox", "ComboBox", "DateTimePicker", "CheckBox",
+        "NumericUpDown", "RadioButton", "MaskedTextBox", "RichTextBox",
+    }.Any(n => t.Contains(n, StringComparison.Ordinal)));
+    if (inputs >= 2)
+    {
+        return "form";
+    }
+    if (Has("Button", "LinkLabel"))
+    {
+        return "action";
+    }
+    return "detail";
+}
 
 // UI-CONFIG ARM (Phase 0 labyrinth recon) — the room-map facts for one
 // screen type. Walks ALL descendant nodes of the type (constructors +
