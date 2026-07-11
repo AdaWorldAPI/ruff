@@ -44,6 +44,40 @@ fn control_of(iri: &str) -> &str {
     local.split_once('.').map_or(local, |(_, tail)| tail)
 }
 
+/// Lower a menu node's LOCATION into the existing classid ontology: walk the
+/// `part_of` rail from `node` up to its root and render the ancestor chain
+/// root-first as a radix-trie path. Each element is the ancestor's classid
+/// (`0x<ID>`) when it resolves, else its screen name (fallback). There is no
+/// stored ordinal — the address IS the walked rail (V3 LE-contract §3: the
+/// existing concept ontology is the radix trie; menu location is a path
+/// through it). Cycle-guarded and depth-bounded so a mis-declared `part_of`
+/// cycle terminates instead of looping.
+fn menu_address(
+    node: &str,
+    parent_of: &BTreeMap<String, String>,
+    classid_of: &BTreeMap<String, u16>,
+) -> String {
+    let mut chain: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut cur = node.to_string();
+    loop {
+        if !seen.insert(cur.clone()) || chain.len() >= 32 {
+            break;
+        }
+        chain.push(
+            classid_of
+                .get(&cur)
+                .map_or_else(|| cur.clone(), |id| format!("0x{id:04X}")),
+        );
+        match parent_of.get(&cur) {
+            Some(parent) => cur = parent.clone(),
+            None => break,
+        }
+    }
+    chain.reverse();
+    chain.join("/")
+}
+
 /// Resolve a `surfaces_concept` object token to a codebook concept id.
 ///
 /// Tries, in order: (1) an exact codebook concept-name match; (2) a
@@ -72,7 +106,7 @@ fn resolve_token(token: &str, config: &ExamConfig) -> Option<u16> {
 /// Format (every section sorted lexicographically and deduplicated):
 ///
 /// ```text
-/// === nav digest v1 ===
+/// === nav digest v2 ===
 /// screens: <N>
 /// klickwege: <M>
 /// views: <V>
@@ -93,6 +127,8 @@ fn resolve_token(token: &str, config: &ExamConfig) -> Option<u16> {
 /// <root-screen>
 ///   = <view>
 ///   -> <target-screen>
+/// [menu-quad]
+/// <node>  loc=<radix-address>  purpose=<role>  id=0x<ID>  action=<navigate|root|leaf>
 /// ```
 ///
 /// - `screens` is the distinct endpoint set of every `navigates_to` pair
@@ -121,6 +157,15 @@ fn resolve_token(token: &str, config: &ExamConfig) -> Option<u16> {
 ///   `selects_view` targets each as `  = <view>` (sorted), then its
 ///   `navigates_to` targets each as `  -> <target-screen>` (sorted).
 ///   Indentation is exactly two spaces.
+/// - `[menu-quad]` lowers the `(location, purpose, identity, action)` quad per
+///   menu node into the existing classid ontology. `location` is the `part_of`
+///   rail walked as a radix-trie address ([`menu_address`]): the ancestor
+///   classid path, root-first, `0x<ID>` per resolved ancestor and the bare
+///   screen name as fallback — **no stored ordinal**, the address IS the walk
+///   (V3 LE-contract §3). `identity` is the node's own classid (`-` when
+///   unresolved); `purpose` the `purpose` role (`-` when none); `action` is
+///   `navigate` (a `part_of` child), `root` (a parentless menu source), or
+///   `leaf`. Nodes sorted lexicographically.
 #[must_use]
 pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
     let mut klickwege: BTreeSet<(String, String)> = BTreeSet::new();
@@ -131,6 +176,9 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
     let mut docked_raw: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut tab_order_raw: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut popup_raw: BTreeSet<(String, String, String)> = BTreeSet::new();
+    // Klickwege-rail: the menu quad's location + purpose axes.
+    let mut parent_of: BTreeMap<String, String> = BTreeMap::new();
+    let mut purpose_of: BTreeMap<String, String> = BTreeMap::new();
 
     for t in triples {
         match t.p.as_str() {
@@ -182,6 +230,18 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
                     control_of(&t.s).to_string(),
                     t.o.clone(),
                 ));
+            }
+            "part_of" => {
+                let child = strip_ns(&t.s).to_string();
+                let parent = strip_ns(&t.o).to_string();
+                screens.insert(child.clone());
+                screens.insert(parent.clone());
+                parent_of.insert(child, parent);
+            }
+            "purpose" => {
+                let screen = strip_ns(&t.s).to_string();
+                screens.insert(screen.clone());
+                purpose_of.insert(screen, t.o.clone());
             }
             _ => {}
         }
@@ -274,7 +334,7 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
         .collect();
 
     let mut out = String::new();
-    let _ = writeln!(out, "=== nav digest v1 ===");
+    let _ = writeln!(out, "=== nav digest v2 ===");
     let _ = writeln!(out, "screens: {}", screens.len());
     let _ = writeln!(out, "klickwege: {}", klickwege.len());
     let _ = writeln!(out, "views: {}", views.len());
@@ -343,6 +403,41 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
                 let _ = writeln!(out, "  -> {to}");
             }
         }
+    }
+
+    // [menu-quad] — the (location, purpose, identity, action) quad per menu
+    // node, LOWERED into the existing classid ontology. `location` is the
+    // `part_of` rail walked as a radix-trie address (ancestor classid path,
+    // root-first) — no stored ordinal (V3 §3). `identity` is the node's own
+    // classid; `purpose` the usability role; `action` its nav position
+    // (navigate = a part_of child, root = a parentless menu source, leaf =
+    // neither). This is the lowering the raw facts exist to feed.
+    let mut classid_of: BTreeMap<String, u16> = BTreeMap::new();
+    for (screen, _token, id) in &concept_rows {
+        if let Some(id) = id {
+            classid_of.entry(screen.clone()).or_insert(*id);
+        }
+    }
+    let mut nodes: BTreeSet<String> = screens.iter().cloned().collect();
+    nodes.extend(purpose_of.keys().cloned());
+    nodes.extend(parent_of.keys().cloned());
+    nodes.extend(parent_of.values().cloned());
+    nodes.extend(classid_of.keys().cloned());
+    let _ = writeln!(out, "[menu-quad]");
+    for node in &nodes {
+        let loc = menu_address(node, &parent_of, &classid_of);
+        let purpose = purpose_of.get(node).map_or("-", String::as_str);
+        let id = classid_of
+            .get(node)
+            .map_or_else(|| "-".to_string(), |id| format!("0x{id:04X}"));
+        let action = if parent_of.contains_key(node) {
+            "navigate"
+        } else if menu_roots.contains(node) {
+            "root"
+        } else {
+            "leaf"
+        };
+        let _ = writeln!(out, "{node}  loc={loc}  purpose={purpose}  id={id}  action={action}");
     }
 
     out
@@ -448,11 +543,27 @@ mod tests {
                 "app:CipherPanel.ctx_menu",
                 Provenance::Authoritative,
             ),
+            // Klickwege-rail: CipherPanel's canonical menu parent is Invoice
+            // (the part_of rail), so its lowered location walks to
+            // `Invoice/0x0C01`; both carry a purpose role.
+            Triple::new(
+                "app:CipherPanel",
+                Predicate::PartOf,
+                "app:Invoice",
+                Provenance::Inferred,
+            ),
+            Triple::new(
+                "app:CipherPanel",
+                Predicate::Purpose,
+                "form",
+                Provenance::Inferred,
+            ),
+            Triple::new("app:Invoice", Predicate::Purpose, "list", Provenance::Inferred),
         ]
     }
 
     const EXPECTED: &str = "\
-=== nav digest v1 ===
+=== nav digest v2 ===
 screens: 2
 klickwege: 1
 views: 1
@@ -475,6 +586,9 @@ CipherPanel / unmapped:bottom: btn_save→popup(-)
 Invoice
   = tab_summary
   -> CipherPanel
+[menu-quad]
+CipherPanel  loc=Invoice/0x0C01  purpose=form  id=0x0C01  action=navigate
+Invoice  loc=Invoice  purpose=list  id=-  action=root
 ";
 
     #[test]
@@ -506,6 +620,54 @@ Invoice
         let digest = build_nav_digest(&triples, &config());
         assert!(digest.contains("Invoice ~ mystery -> UNRESOLVED"));
         assert!(digest.contains("concept bindings: 0 resolved, 1 unresolved"));
+    }
+
+    /// The lowering claim: a multi-level `part_of` chain whose every ancestor
+    /// resolves to a classid lowers to a PURE radix-trie path (root-first
+    /// `0x<ID>/0x<ID>/0x<ID>`), with no stored ordinal — the address is the
+    /// walked rail. A leaf's `purpose`/`action` ride alongside.
+    #[test]
+    fn menu_quad_lowers_location_as_a_classid_radix_path() {
+        let config = ExamConfig {
+            codebook: vec![
+                ("root_c".to_string(), 0x0900),
+                ("mid_c".to_string(), 0x0910),
+                ("leaf_c".to_string(), 0x0911),
+            ],
+            ..ExamConfig::default()
+        };
+        let triples = vec![
+            Triple::new("app:Root", Predicate::SurfacesConcept, "root_c", Provenance::Authoritative),
+            Triple::new("app:Mid", Predicate::SurfacesConcept, "mid_c", Provenance::Authoritative),
+            Triple::new("app:Leaf", Predicate::SurfacesConcept, "leaf_c", Provenance::Authoritative),
+            Triple::new("app:Mid", Predicate::PartOf, "app:Root", Provenance::Inferred),
+            Triple::new("app:Leaf", Predicate::PartOf, "app:Mid", Provenance::Inferred),
+            Triple::new("app:Leaf", Predicate::Purpose, "form", Provenance::Inferred),
+        ];
+        let digest = build_nav_digest(&triples, &config);
+        // Leaf's location is the full ancestor classid path, root-first.
+        assert!(
+            digest.contains("Leaf  loc=0x0900/0x0910/0x0911  purpose=form  id=0x0911  action=navigate"),
+            "leaf must lower to the pure radix path 0x0900/0x0910/0x0911:\n{digest}"
+        );
+        // Root: parentless, has no out-edge here, so it is a leaf node with its
+        // own single-element address.
+        assert!(digest.contains("Root  loc=0x0900  purpose=-  id=0x0900  action=leaf"));
+    }
+
+    /// A mis-declared `part_of` cycle must terminate (cycle-guarded walk), not
+    /// loop forever — the address is the bounded chain up to the first repeat.
+    #[test]
+    fn menu_quad_part_of_cycle_terminates() {
+        let triples = vec![
+            Triple::new("app:A", Predicate::PartOf, "app:B", Provenance::Inferred),
+            Triple::new("app:B", Predicate::PartOf, "app:A", Provenance::Inferred),
+        ];
+        // Must return (not hang) and emit both nodes under [menu-quad].
+        let digest = build_nav_digest(&triples, &config());
+        assert!(digest.contains("[menu-quad]"));
+        assert!(digest.contains("A  loc="));
+        assert!(digest.contains("B  loc="));
     }
 
     /// A `docked_at` token with no matching `config.regions` row lands in
