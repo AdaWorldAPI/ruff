@@ -13,6 +13,14 @@ using System.Windows.Forms;
 //   QualifiedHost -> QualifiedChild (qualified: field = new Ns.X(); qualifier stripped)
 // SaveFileDialog is a framework CommonDialog and must NOT produce an edge; a
 // non-screen helper (`new StringBuilder()`) must NOT produce an edge either.
+//
+// `LayoutHost` below also carries the region-layout half of the UI-CONFIG arm
+// (EmitUiConfigArm) — docked_at / tab_order / opens_popup, alongside the
+// existing handles_event / contains_control room-map facts. Expected facts:
+//   LayoutHost.grid    -docked_at->    fill    (unqualified DockStyle.Fill)
+//   LayoutHost.grid    -tab_order->    "2"
+//   LayoutHost.toolbar -docked_at->    top     (fully-qualified DockStyle.Top)
+//   LayoutHost.toolbar -opens_popup-> LayoutHost.contextMenu
 namespace NavShapes
 {
     public class MainScreen : Form
@@ -105,5 +113,23 @@ namespace NavShapes.Nested
     public class QualifiedChild : System.Windows.Forms.UserControl
     {
         public QualifiedChild(object owner) { }
+    }
+}
+
+namespace NavShapes
+{
+    // Region-layout fixture — the Designer.cs `InitializeComponent()` shape
+    // for docked_at / tab_order / opens_popup (EmitUiConfigArm). Exercises
+    // both the unqualified and namespace-qualified DockStyle spelling, plus
+    // the ContextMenuStrip popup-wiring idiom.
+    public class LayoutHost : Form
+    {
+        private void InitializeComponent()
+        {
+            this.grid.Dock = DockStyle.Fill;
+            this.grid.TabIndex = 2;
+            this.toolbar.Dock = System.Windows.Forms.DockStyle.Top;
+            this.toolbar.ContextMenuStrip = this.contextMenu;
+        }
     }
 }
