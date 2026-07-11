@@ -63,7 +63,37 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use lib_ruby_parser::{Node, Parser, ParserOptions};
-use ruff_spo_triplet::{Predicate, Provenance, Triple};
+use ruff_spo_triplet::{
+    MenuQuad, Provenance, PurposeRole, PurposeRule, RegionFact, Triple, classify_purpose,
+};
+
+/// The Rails `purpose`-axis config (the operator's "config over reusable"): the
+/// target REST-style `action:` classifies into the shared [`PurposeRole`] vocab
+/// via the shared [`classify_purpose`] engine. Rules are existential
+/// (`min_hits: 1`) — Rails carries one action token per item. Priority: a
+/// list/index surface, then a detail/show, then a create/edit form; a
+/// custom/unknown action falls to [`RAILS_PURPOSE_FALLBACK`].
+const RAILS_PURPOSE: &[PurposeRule] = &[
+    PurposeRule {
+        needles: &["index"],
+        role: PurposeRole::List,
+        min_hits: 1,
+    },
+    PurposeRule {
+        needles: &["show"],
+        role: PurposeRole::Detail,
+        min_hits: 1,
+    },
+    PurposeRule {
+        needles: &["new", "edit"],
+        role: PurposeRole::Form,
+        min_hits: 1,
+    },
+];
+
+/// A menu item whose target action is custom/unknown (a non-REST verb) is a
+/// plain navigation trigger — [`PurposeRole::Action`].
+const RAILS_PURPOSE_FALLBACK: PurposeRole = PurposeRole::Action;
 
 /// One harvested menu-item region placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +116,13 @@ pub struct RegionEntry {
     /// assign an ordinal surfaces as `None` + a non-zero
     /// [`RegionScanReport::unresolved_order`] rather than a silent wrong 0.
     pub tab_order: Option<u32>,
+    /// The target `action:` (the `purpose`-axis signal for the menu quad).
+    /// `None` when the push has no `action:`; a bare `controller:` then
+    /// defaults to Rails' REST-style `index` (see [`Self::to_quad`]).
+    pub action: Option<String>,
+    /// Whether the push declares a `controller:` target — used to distinguish
+    /// "no target at all" from "target with the implicit `index` action".
+    pub has_controller: bool,
     /// Path relative to the corpus root, `/`-joined.
     pub file: String,
 }
@@ -136,6 +173,12 @@ struct Registration {
     item: String,
     parent: Option<String>,
     position: Position,
+    /// The target `action:` from the push opts (the `purpose`-axis signal).
+    /// `None` when unset — a bare `controller:` defaults to Rails' `index`.
+    action: Option<String>,
+    /// Whether the push carries a `controller:` target (so a missing `action:`
+    /// resolves to the REST-style `index` default rather than no signal at all).
+    has_controller: bool,
     file: String,
 }
 
@@ -183,6 +226,8 @@ pub fn extract_regions_with_report(
             parent: r.parent,
             position: r.position,
             tab_order,
+            action: r.action,
+            has_controller: r.has_controller,
             file: r.file,
         })
         .collect();
@@ -597,11 +642,18 @@ fn handle_push(menu: &str, item_override: Option<String>, args: &[Node], w: &mut
     let pairs = kwarg_pairs(args);
     let parent = kwarg(&pairs, "parent").and_then(sym_or_str);
     let position = extract_position(&pairs);
+    // `kwarg_pairs` flattens the positional `{controller:, action:}` options
+    // hash and any trailing kwargs into one vec, so `action`/`controller` are
+    // plain key lookups (distinct from the routes arm, which reads routes.rb).
+    let action = kwarg(&pairs, "action").and_then(sym_or_str);
+    let has_controller = kwarg(&pairs, "controller").is_some();
     w.regs.push(Registration {
         menu: menu.to_string(),
         item,
         parent,
         position,
+        action,
+        has_controller,
         file: w.file.clone(),
     });
 }
@@ -757,38 +809,72 @@ fn positional_args(args: &[Node]) -> Vec<&Node> {
 }
 
 impl RegionEntry {
-    /// Lift into the shared closed-vocab triples (§1/§2 of the frozen
-    /// spec): `docked_at` always, `tab_order` when resolved, and
-    /// `contains_control` when `parent` is present. All
-    /// [`Provenance::Authoritative`], matching ruff #76's `WinForms` arm.
+    /// Project this Rails harvest record onto the shared, frontend-agnostic
+    /// [`RegionFact`]. The Rails-local subject convention (`{ns}:{menu}` as the
+    /// screen, the bare `menu` token as the `docked_at` object) is applied
+    /// here; the emission itself lives once in [`RegionFact::to_triples`], so
+    /// the subject grammar is shared with the Odoo and `WinForms` arms and the
+    /// [`ruff_spo_triplet::build_nav_digest`] consumer.
+    #[must_use]
+    pub fn to_fact(&self, namespace: &str) -> RegionFact {
+        RegionFact {
+            screen: format!("{namespace}:{}", self.menu),
+            control: self.item.clone(),
+            dock_token: self.menu.clone(),
+            tab_order: self.tab_order,
+            opens_popup: None,
+            parent: self.parent.clone(),
+        }
+    }
+
+    /// Lift into the shared closed-vocab triples via [`Self::to_fact`]:
+    /// `docked_at` always, `tab_order` when resolved, and `contains_control`
+    /// when `parent` is present. Byte-identical to the pre-collapse hand-rolled
+    /// emission (subject `{ns}:{menu}.{item}`, `docked_at → menu`).
     #[must_use]
     pub fn to_triples(&self, namespace: &str) -> Vec<Triple> {
-        let subject = format!("{namespace}:{}.{}", self.menu, self.item);
-        let mut triples = vec![Triple::new(
-            subject.clone(),
-            Predicate::DockedAt,
-            self.menu.clone(),
-            Provenance::Authoritative,
-        )];
-        if let Some(order) = self.tab_order {
-            triples.push(Triple::new(
-                subject.clone(),
-                Predicate::TabOrder,
-                order.to_string(),
-                Provenance::Authoritative,
-            ));
-        }
-        if let Some(parent) = &self.parent {
-            let parent_subject = format!("{namespace}:{}.{parent}", self.menu);
-            triples.push(Triple::new(
-                parent_subject,
-                Predicate::ContainsControl,
-                subject,
-                Provenance::Authoritative,
-            ));
-        }
-        triples
+        self.to_fact(namespace).to_triples()
     }
+
+    /// Project this menu item onto the shared, frontend-agnostic [`MenuQuad`]
+    /// (the `location` + `purpose` axes of the Klickwege menu quad). The node
+    /// and parent use the BARE `{ns}:{name}` grammar — identical to the nav
+    /// arm's `navigates_to` subjects, NOT the region plane's `{menu}.{item}`
+    /// composite (the quad is the menu-tree/navigation plane, not the
+    /// within-screen layout plane). `part_of` is Authoritative (Rails declares
+    /// the parent via `parent:`); `purpose` classifies the target `action:`
+    /// (a bare `controller:` defaults to Rails' `index`) through the shared
+    /// [`classify_purpose`] engine + the [`RAILS_PURPOSE`] config.
+    #[must_use]
+    pub fn to_quad(&self, namespace: &str) -> MenuQuad {
+        let token = match &self.action {
+            Some(a) => a.as_str(),
+            // A push with a `controller:` but no `action:` is the REST-style
+            // `index` default; a push with no target at all has no signal.
+            None if self.has_controller => "index",
+            None => "",
+        };
+        let purpose = classify_purpose(&[token], RAILS_PURPOSE, RAILS_PURPOSE_FALLBACK);
+        MenuQuad {
+            node: format!("{namespace}:{}", self.item),
+            parent: self.parent.as_ref().map(|p| format!("{namespace}:{p}")),
+            part_of_tier: Provenance::Authoritative,
+            purpose,
+            identity_concept: None,
+        }
+    }
+}
+
+/// Harvest every menu item as a [`MenuQuad`] — the `location`/`purpose` half of
+/// the Klickwege menu quad. Companion to [`extract_regions`] (the layout
+/// plane); both read the same `menu.push` sites. Nodes use the bare
+/// `{namespace}:{item}` grammar.
+#[must_use]
+pub fn extract_menu_quads(root: &Path, namespace: &str) -> Vec<MenuQuad> {
+    extract_regions(root)
+        .iter()
+        .map(|e| e.to_quad(namespace))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1040,6 +1126,8 @@ mod tests {
             parent: None,
             position: Position::Append,
             tab_order: Some(3),
+            action: None,
+            has_controller: false,
             file: "config/initializers/menus.rb".to_string(),
         };
         let triples = entry.to_triples("openproject");
@@ -1056,6 +1144,57 @@ mod tests {
         // No parent -> no contains_control triple.
         assert!(!triples.iter().any(|t| t.p == "contains_control"));
         assert_eq!(triples.len(), 2, "{triples:?}");
+    }
+
+    /// Menu-quad emission: the location (`part_of` from `parent:`, bare
+    /// `{ns}:{item}` grammar) + purpose (from the target `action:` through the
+    /// shared engine) axes. `index`→list, `show`→detail, `new`/`edit`→form,
+    /// a bare `controller:` defaults to `index`→list, a custom action→action.
+    #[test]
+    fn menu_items_project_onto_the_shared_quad() {
+        let root = scratch_dir("menu_quad");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :project_menu do |menu|\n\
+             \x20 menu.push :overview, { controller: \"/projects\", action: \"show\" }\n\
+             \x20 menu.push :work_packages, { controller: \"/work_packages\", action: \"index\" }, parent: :overview\n\
+             \x20 menu.push :new_wp, { controller: \"/work_packages\", action: \"new\" }, parent: :work_packages\n\
+             \x20 menu.push :settings, { controller: \"/projects/settings\" }, parent: :overview\n\
+             \x20 menu.push :board, { controller: \"/boards\", action: \"kanban\" }, parent: :overview\n\
+             end\n",
+        );
+
+        let quads = extract_menu_quads(&root, "openproject");
+        let q = |item: &str| {
+            quads
+                .iter()
+                .find(|q| q.node == format!("openproject:{item}"))
+                .unwrap_or_else(|| panic!("no quad for {item}"))
+        };
+        // purpose from action:
+        assert_eq!(q("overview").purpose, PurposeRole::Detail); // show
+        assert_eq!(q("work_packages").purpose, PurposeRole::List); // index
+        assert_eq!(q("new_wp").purpose, PurposeRole::Form); // new
+        assert_eq!(q("settings").purpose, PurposeRole::List); // controller, no action -> index
+        assert_eq!(q("board").purpose, PurposeRole::Action); // custom "kanban" -> fallback
+        // location: bare-node part_of rail (walk yields the radix address).
+        assert_eq!(
+            q("work_packages").parent.as_deref(),
+            Some("openproject:overview")
+        );
+        assert_eq!(
+            q("new_wp").parent.as_deref(),
+            Some("openproject:work_packages")
+        );
+        assert_eq!(q("overview").parent, None); // root of project_menu
+        // the emitted facts carry the bare grammar + Authoritative part_of.
+        let wp = q("work_packages").to_triples();
+        let part_of = wp.iter().find(|t| t.p == "part_of").unwrap();
+        assert_eq!(part_of.s, "openproject:work_packages");
+        assert_eq!(part_of.o, "openproject:overview");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Fixture (i) — a mutual `after:` reference ("cycle") resolves

@@ -43,7 +43,7 @@
 use std::fs;
 use std::path::Path;
 
-use ruff_spo_triplet::{Predicate, Provenance, Triple};
+pub use ruff_spo_triplet::{RegionFact, region_triples};
 
 use crate::odoo_views::{
     attr_value, collect_xml_files, relative_path, tag_name_boundary, tag_slice,
@@ -75,79 +75,15 @@ pub const REGION_CONTAINERS: &[&str] = &[
     "gantt",
 ];
 
-/// One harvested region placement: a control, the container it docks in, its
-/// intra-screen order, and whether it opens a popup.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegionFact {
-    /// `<rel_path>#<view_xml_id>` — one XML file bundles many view records, so
-    /// the record id disambiguates (same convention as the field-set arm).
-    pub screen: String,
-    /// The control's identity: a field's `name`, or a button's
-    /// `name`/`string`/`"button"`.
-    pub control: String,
-    /// The innermost enclosing [`REGION_CONTAINERS`] tag (the raw dock token;
-    /// the consumer `region=` config maps it to a canonical region).
-    pub dock_token: String,
-    /// 0-based document order of this control within its screen (the
-    /// `tab_order` source — Odoo arch DOM position, preserved faithfully).
-    pub tab_order: usize,
-    /// `Some(action)` when this control is a `<button type="action">` (the
-    /// popup-opening interaction); `None` otherwise.
-    pub opens_popup: Option<String>,
-}
-
-impl RegionFact {
-    /// The `docked_at` triple: `(screen::control, docked_at, dock_token)`.
-    #[must_use]
-    pub fn docked_at_triple(&self) -> Triple {
-        Triple::new(
-            format!("{}::{}", self.screen, self.control),
-            Predicate::DockedAt,
-            self.dock_token.clone(),
-            Provenance::Authoritative,
-        )
-    }
-
-    /// The `tab_order` triple: `(screen::control, tab_order, <n>)`.
-    #[must_use]
-    pub fn tab_order_triple(&self) -> Triple {
-        Triple::new(
-            format!("{}::{}", self.screen, self.control),
-            Predicate::TabOrder,
-            self.tab_order.to_string(),
-            Provenance::Authoritative,
-        )
-    }
-
-    /// The `opens_popup` triple, if this control opens one:
-    /// `(screen::control, opens_popup, <action>)`.
-    #[must_use]
-    pub fn opens_popup_triple(&self) -> Option<Triple> {
-        self.opens_popup.as_ref().map(|action| {
-            Triple::new(
-                format!("{}::{}", self.screen, self.control),
-                Predicate::OpensPopup,
-                action.clone(),
-                Provenance::Authoritative,
-            )
-        })
-    }
-}
-
-/// Lift every [`RegionFact`] into its SPO triples (`docked_at` +
-/// `tab_order` + optional `opens_popup`), in a deterministic order.
-#[must_use]
-pub fn region_triples(facts: &[RegionFact]) -> Vec<Triple> {
-    let mut out = Vec::with_capacity(facts.len() * 2);
-    for f in facts {
-        out.push(f.docked_at_triple());
-        out.push(f.tab_order_triple());
-        if let Some(t) = f.opens_popup_triple() {
-            out.push(t);
-        }
-    }
-    out
-}
+// The region fact type and its lift are the shared, frontend-agnostic
+// `ruff_spo_triplet::{RegionFact, region_triples}` (re-exported above). This
+// arm builds `RegionFact`s in [`push_fact`] and the shared lift emits the
+// canonical `{screen}.{control}` subject — so Odoo, Rails, and the `WinForms`
+// arm all round-trip through the one `ruff_spo_triplet::build_nav_digest`
+// consumer. (Before the collapse this arm emitted a `{screen}::{control}`
+// subject that the dot-parsing digest could not read; the shared codec fixes
+// that. Odoo screens carry a `.xml` dot, but the digest decodes on the LAST
+// dot — the dotless control is always the final segment.)
 
 /// Scan `<root>` for Odoo view XML and extract, per `ir.ui.view` record, the
 /// region placement of every depth-0 control in its arch.
@@ -320,8 +256,15 @@ fn push_fact(
         screen: screen.to_string(),
         control: control.to_string(),
         dock_token,
-        tab_order: order,
+        // DOM document position is the faithful ordinal; the shared field is
+        // `Option<u32>` (a harvester that cannot assign an ordinal leaves it
+        // `None`). Odoo always has one — the non-panicking cast mirrors
+        // `menu_regions`'s `try_from(...).unwrap_or(u32::MAX)`.
+        tab_order: Some(u32::try_from(order).unwrap_or(u32::MAX)),
+        // Odoo nesting is implicit in the element stack; a `contains_control`
+        // edge is not emitted (yet). The parent tree is the named follow-up.
         opens_popup,
+        parent: None,
     });
 }
 
@@ -448,6 +391,7 @@ fn arch_tags(content: &str) -> Vec<ArchTag> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruff_spo_triplet::{Predicate, Provenance};
 
     /// A neutral synthetic view exercising: a `<header>` button (top_bar), a
     /// `<searchpanel>` field (left_nav), a `<sheet>` field + a `<notebook>`
@@ -531,7 +475,7 @@ mod tests {
     fn tab_order_follows_document_order() {
         let facts = extract_regions_from_source(FIXTURE, "widget_views.xml");
         // The header confirm button is first in document order.
-        assert_eq!(fact(&facts, "action_confirm").tab_order, 0);
+        assert_eq!(fact(&facts, "action_confirm").tab_order, Some(0));
         // category_id (searchpanel) comes after both header buttons.
         assert!(fact(&facts, "category_id").tab_order > fact(&facts, "action_confirm").tab_order);
     }
@@ -552,6 +496,26 @@ mod tests {
                 .iter()
                 .any(|t| t.p == Predicate::OpensPopup.as_str())
         );
+    }
+
+    /// Fence for the known codec edge (collapse-spec §2): the shared subject
+    /// codec ([`RegionSubject::from_iri`](ruff_spo_triplet::RegionSubject))
+    /// decodes on the LAST `.`, so a control that itself contains a `.` (a rare
+    /// Odoo related-field path like `currency_id.symbol`) would mis-split. On
+    /// this corpus controls are Python identifiers / `%(...)d` action refs —
+    /// dotless. If a real dotted control ever appears this trips, and the
+    /// canonical separator must escalate to `::` (with the C# harvester
+    /// migration filed as the paired follow-up).
+    #[test]
+    fn harvested_controls_carry_no_dot() {
+        let facts = extract_regions_from_source(FIXTURE, "widget_views.xml");
+        for f in &facts {
+            assert!(
+                !f.control.contains('.'),
+                "dotted control {:?} would mis-rsplit through the shared subject codec",
+                f.control
+            );
+        }
     }
 
     #[test]
