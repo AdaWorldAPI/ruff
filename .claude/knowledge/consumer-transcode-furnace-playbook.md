@@ -228,11 +228,16 @@ live(R)   = region_basis[R] ∩ global_mask ∩ local_mask
 render(R) = live(R).ordered_by(harvested_order).as(interaction[predicate])
 ```
 
-- `region_basis[R]` — every entry the harvest placed in region `R`.
-- `global_mask` — a *session-wide* WideFieldMask: `reachable_routes ∩
-  RBAC(role)`. **RBAC / `user_right` IS the global mask** — this is where
-  the concept the mint gate *refused* (§3) does its real job. An entry
-  survives only if its route is mounted AND the role may see its concept.
+- `region_basis[R]` — every entry the *manifest* declares for region `R`.
+  The manifest is the authoritative config (§6b) — there is **no
+  reachability drop** in this projection; a manually-added entry is
+  rendered, not swallowed.
+- `global_mask` — a *session-wide* WideFieldMask = **`RBAC(role)` only**.
+  **RBAC / `user_right` IS the global mask** — this is where the concept the
+  mint gate *refused* (§3) does its real job: an entry survives only if the
+  role may see its concept. (Route *mounting* is NOT a runtime mask — it is a
+  test-time drift guard, §6b move 3. Whether an entry renders as a live link
+  or a planned placeholder is its own `enabled` flag, not a mask.)
 - `local_mask` — a *per-screen* WideFieldMask the active view may narrow
   further (default: show all).
 

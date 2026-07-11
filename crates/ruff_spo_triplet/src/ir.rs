@@ -813,7 +813,7 @@ mod dto_surface_tests {
     // only at its own lift site. These pins make the DTO surface a
     // conscious, reviewed act on THIS side of the repo boundary: adding,
     // removing or renaming a serde-visible field bangs here first — the
-    // struct-surface sibling of `predicate_count_locked_at_71`.
+    // struct-surface sibling of `predicate_count_locked_at_78`.
 
     /// Sorted serde key set of a value. The fixtures below populate EVERY
     /// field (each `Vec` non-empty, each `Option` `Some`) so that
