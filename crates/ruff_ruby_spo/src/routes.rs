@@ -1387,7 +1387,7 @@ fn resolve_and_emit(verbs: &[RouteVerb], args: &[Node], w: &mut Walker<'_>) {
                         );
                     }
                     None => {
-                        resolve_naked_in_resource(verb, idx, &positionals, &pairs, fat_arrow, w)
+                        resolve_naked_in_resource(verb, idx, &positionals, &pairs, fat_arrow, w);
                     }
                 }
             }
@@ -2193,7 +2193,7 @@ mod tests {
     /// F(15) — triple shape: `RoutesTo` object
     /// `"<verb>:<ctrl>#<action>"` lowercase verb; `RouteScope` on EVERY
     /// stemmed entry (4 values); both Authoritative;
-    /// `Predicate::from_str(as_str)` roundtrip; count-lock 73.
+    /// `Predicate::from_str(as_str)` roundtrip for this arm's two variants.
     #[test]
     fn triple_shape_and_predicate_roundtrip() {
         let (t, _) = table_from("triples", "  get \"/foo\", to: \"foos#index\"\n");
@@ -2220,7 +2220,15 @@ mod tests {
             Predicate::from_str(Predicate::RouteScope.as_str()),
             Some(Predicate::RouteScope)
         );
-        assert_eq!(Predicate::ALL.len(), 73);
+        // This arm proves only its own two variants roundtrip — it must NOT
+        // re-assert the global `Predicate::ALL.len()`. A cross-crate re-assertion
+        // of a shared count is the "monitor N pins" anti-pattern the OGAR
+        // hot-plug plug-and-play doctrine retires (`OGAR/.claude/knowledge/
+        // hotplug-consumer-migration.md`: "wenn's knallt, dann einmal — nicht
+        // 200 Pins monitoren"): vocabulary drift is caught precisely, at the
+        // consumer boundary, by classid/capability resolution — not by a global
+        // integer every arm duplicates. A predicate added by any other arm
+        // (e.g. #76's dock/tab/popup plane) must never trip a routes.rs test.
     }
 
     /// F(16) — member/collection String first-arg: bare identifier ↔
