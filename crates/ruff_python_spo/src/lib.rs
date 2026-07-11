@@ -48,6 +48,7 @@ use ruff_spo_triplet::{Field, Function, Model, ModelGraph};
 mod functions;
 mod navigation;
 mod odoo_nav;
+mod odoo_regions;
 mod odoo_views;
 mod parse;
 mod templates;
@@ -58,6 +59,10 @@ pub use navigation::{
 };
 pub use odoo_nav::{
     OdooNavEdge, OdooNavScanReport, extract_odoo_nav_edges, extract_odoo_nav_edges_with_report,
+};
+pub use odoo_regions::{
+    REGION_CONTAINERS, RegionFact, extract_odoo_view_regions, extract_regions_from_source,
+    region_triples,
 };
 pub use odoo_views::{
     OdooViewScanReport, extract_odoo_view_field_sets, extract_odoo_view_field_sets_with_report,
