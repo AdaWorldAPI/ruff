@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 
 use lib_ruby_parser::{Node, Parser, ParserOptions};
 use ruff_spo_triplet::{
-    MenuQuad, Provenance, PurposeRole, PurposeRule, RegionFact, Triple, classify_purpose,
+    MenuQuad, Predicate, Provenance, PurposeRole, PurposeRule, RegionFact, Triple, classify_purpose,
 };
 
 /// The Rails `purpose`-axis config (the operator's "config over reusable"): the
@@ -123,6 +123,14 @@ pub struct RegionEntry {
     /// Whether the push declares a `controller:` target — used to distinguish
     /// "no target at all" from "target with the implicit `index` action".
     pub has_controller: bool,
+    /// The statically-extractable permission symbols named in the push's `if:`
+    /// visibility guard, deduped + sorted for determinism. Empty when the push
+    /// has no `if:`, when the guard names no `allowed_*` permission (a bare
+    /// `admin?`/`logged?`/`Setting.*` guard), or when every permission argument
+    /// is dynamic (a `Hash`/method-call rather than a `Sym` literal — never
+    /// fabricated). Both operands of a `||`/`&&` guard contribute, per the
+    /// visibility-honest [`Predicate::GuardedByPermission`] semantics.
+    pub permissions: Vec<String>,
     /// Path relative to the corpus root, `/`-joined.
     pub file: String,
 }
@@ -156,6 +164,10 @@ pub struct RegionScanReport {
     pub with_parent: usize,
     /// Entries whose declared [`Position`] is not [`Position::Append`].
     pub with_position: usize,
+    /// Entries with at least one statically-extractable `if:`-guard permission
+    /// symbol (the OQ-GUARD-1 conservation counter for
+    /// [`Predicate::GuardedByPermission`]).
+    pub with_permission: usize,
     /// Entries left without a `tab_order` after resolution. Structurally 0
     /// under the single-pass Rails `TreeNode` replay (which always
     /// terminates); retained as a regression tripwire — a non-zero value
@@ -179,6 +191,9 @@ struct Registration {
     /// Whether the push carries a `controller:` target (so a missing `action:`
     /// resolves to the REST-style `index` default rather than no signal at all).
     has_controller: bool,
+    /// Permission symbols named in the push's `if:` guard (deduped + sorted).
+    /// See [`RegionEntry::permissions`].
+    permissions: Vec<String>,
     file: String,
 }
 
@@ -228,6 +243,7 @@ pub fn extract_regions_with_report(
             tab_order,
             action: r.action,
             has_controller: r.has_controller,
+            permissions: r.permissions,
             file: r.file,
         })
         .collect();
@@ -238,6 +254,7 @@ pub fn extract_regions_with_report(
         .iter()
         .filter(|e| !matches!(e.position, Position::Append))
         .count();
+    report.with_permission = entries.iter().filter(|e| !e.permissions.is_empty()).count();
     let mut menus: Vec<String> = entries.iter().map(|e| e.menu.clone()).collect();
     menus.sort();
     menus.dedup();
@@ -647,6 +664,9 @@ fn handle_push(menu: &str, item_override: Option<String>, args: &[Node], w: &mut
     // plain key lookups (distinct from the routes arm, which reads routes.rb).
     let action = kwarg(&pairs, "action").and_then(sym_or_str);
     let has_controller = kwarg(&pairs, "controller").is_some();
+    let permissions = kwarg(&pairs, "if")
+        .map(extract_guard_permissions)
+        .unwrap_or_default();
     w.regs.push(Registration {
         menu: menu.to_string(),
         item,
@@ -654,6 +674,7 @@ fn handle_push(menu: &str, item_override: Option<String>, args: &[Node], w: &mut
         position,
         action,
         has_controller,
+        permissions,
         file: w.file.clone(),
     });
 }
@@ -808,6 +829,162 @@ fn positional_args(args: &[Node]) -> Vec<&Node> {
         .collect()
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// §5 — the `if:`-guard permission extraction (OQ-GUARD-1)
+//
+// The visibility-honest harvest for [`Predicate::GuardedByPermission`]. A
+// menu item's `if:` kwarg is a proc (`->(_) { ... }` / `Proc.new { ... }`)
+// whose body is a boolean tree of `User.current.allowed_*?(:perm)` checks
+// combined via `&&`/`||`, possibly alongside non-permission conditions
+// (`Setting.*` / `admin?` / `logged?`). Both operands of a disjunction are
+// GUARDED-BY the item's visibility, so BOTH are emitted — the honest
+// weaker claim the OQ-GUARD-1 probe established (a flat "requires" would
+// mis-encode the one real disjunction in the corpus). Dynamic permission
+// arguments (a `Hash`/method-call, not a `Sym` literal) yield no symbol —
+// nothing is fabricated.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Extract the deduped + sorted permission symbols from an `if:` kwarg
+/// value. Unwraps the proc wrapper to its body, walks the boolean tree for
+/// every `allowed_*` permission check, and keeps only the statically
+/// resolvable `Sym`/`Str` arguments.
+fn extract_guard_permissions(if_value: &Node) -> Vec<String> {
+    let mut perms: Vec<String> = find_permission_symbols(guard_body(if_value));
+    perms.sort();
+    perms.dedup();
+    perms
+}
+
+/// Unwrap the `if:` kwarg VALUE down to its callable body: `->(_) { ... }`
+/// and `Proc.new { ... }` are both `Block { body, ... }`. Anything else (a
+/// bare literal, or a `if: :method_name` symbol shorthand) has no
+/// inspectable body and is treated as a leaf itself — a symbol shorthand is
+/// genuinely unresolvable without cross-file analysis, so it yields no
+/// permission rather than being miscounted as one.
+fn guard_body(if_value: &Node) -> &Node {
+    match if_value {
+        Node::Block(blk) => blk.body.as_deref().unwrap_or(if_value),
+        other => other,
+    }
+}
+
+/// Walk the AND/OR spine of a guard body, collecting every `allowed_*`
+/// permission SYMBOL (dynamic-arg calls contribute nothing). Structural
+/// boolean nodes (`And`/`Or`/parenthesising `Begin`/`If`/`IfMod`) recurse;
+/// any other node is a LEAF searched in full — so a permission check wrapped
+/// in `.any?` / `!` / `&.` is still found.
+fn find_permission_symbols(node: &Node) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_permission_symbols(node, &mut out);
+    out
+}
+
+fn collect_permission_symbols(node: &Node, out: &mut Vec<String>) {
+    match node {
+        Node::Send(s) => {
+            if is_permission_method(&s.method_name)
+                && let Some(sym) = permission_arg(&s.args)
+            {
+                out.push(sym);
+            }
+            if let Some(recv) = s.recv.as_deref() {
+                collect_permission_symbols(recv, out);
+            }
+            for a in &s.args {
+                collect_permission_symbols(a, out);
+            }
+        }
+        Node::CSend(s) => {
+            if is_permission_method(&s.method_name)
+                && let Some(sym) = permission_arg(&s.args)
+            {
+                out.push(sym);
+            }
+            collect_permission_symbols(&s.recv, out);
+            for a in &s.args {
+                collect_permission_symbols(a, out);
+            }
+        }
+        Node::And(a) => {
+            collect_permission_symbols(&a.lhs, out);
+            collect_permission_symbols(&a.rhs, out);
+        }
+        Node::Or(o) => {
+            collect_permission_symbols(&o.lhs, out);
+            collect_permission_symbols(&o.rhs, out);
+        }
+        Node::Begin(b) => {
+            for stmt in &b.statements {
+                collect_permission_symbols(stmt, out);
+            }
+        }
+        Node::If(i) => {
+            collect_permission_symbols(&i.cond, out);
+            if let Some(t) = i.if_true.as_deref() {
+                collect_permission_symbols(t, out);
+            }
+            if let Some(f) = i.if_false.as_deref() {
+                collect_permission_symbols(f, out);
+            }
+        }
+        Node::IfMod(i) => {
+            collect_permission_symbols(&i.cond, out);
+            if let Some(t) = i.if_true.as_deref() {
+                collect_permission_symbols(t, out);
+            }
+            if let Some(f) = i.if_false.as_deref() {
+                collect_permission_symbols(f, out);
+            }
+        }
+        Node::Hash(h) => {
+            for p in &h.pairs {
+                collect_permission_symbols(p, out);
+            }
+        }
+        Node::Pair(p) => {
+            collect_permission_symbols(&p.key, out);
+            collect_permission_symbols(&p.value, out);
+        }
+        Node::Array(arr) => {
+            for e in &arr.elements {
+                collect_permission_symbols(e, out);
+            }
+        }
+        Node::Kwargs(k) => {
+            for p in &k.pairs {
+                collect_permission_symbols(p, out);
+            }
+        }
+        Node::Block(blk) => {
+            collect_permission_symbols(&blk.call, out);
+            if let Some(body) = blk.body.as_deref() {
+                collect_permission_symbols(body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A permission check is any `allowed_*` method (with or without a trailing
+/// `?` — `allowed_to`, `allowed_globally?`, `allowed_in_project?`,
+/// `allowed_in_any_work_package?`, ...).
+fn is_permission_method(method_name: &str) -> bool {
+    method_name.starts_with("allowed_")
+}
+
+/// The permission symbol from an `allowed_*` call's arguments. Normal form
+/// (`allowed_globally?(:sym)`) puts it FIRST; the receiver-style
+/// `allowed_to(User.current, :sym)` / `Project.portfolio.allowed_to(
+/// User.current, :view_project)` shape puts a user-expression first and the
+/// permission SECOND. Returns `None` when neither slot is a `Sym`/`Str`
+/// literal (a dynamic `Hash`/method-call argument — never fabricated).
+fn permission_arg(args: &[Node]) -> Option<String> {
+    if let Some(sym) = args.first().and_then(sym_or_str) {
+        return Some(sym);
+    }
+    args.get(1).and_then(sym_or_str)
+}
+
 impl RegionEntry {
     /// Project this Rails harvest record onto the shared, frontend-agnostic
     /// [`RegionFact`]. The Rails-local subject convention (`{ns}:{menu}` as the
@@ -863,6 +1040,30 @@ impl RegionEntry {
             identity_concept: None,
         }
     }
+
+    /// Emit one [`Predicate::GuardedByPermission`] fact per extracted `if:`-guard
+    /// permission symbol. The subject is the BARE `{namespace}:{item}` node —
+    /// the same grammar as [`Self::to_quad`]'s node and the nav arm's
+    /// `navigates_to` subject, NOT the region plane's `{menu}.{item}` composite
+    /// (the guard is a property of the menu-tree NODE, not of a within-screen
+    /// control placement). The object is the permission symbol; the tier is
+    /// [`Provenance::Inferred`] (a proc-body heuristic). Empty when no symbol
+    /// was extracted.
+    #[must_use]
+    pub fn to_guard_triples(&self, namespace: &str) -> Vec<Triple> {
+        let node = format!("{namespace}:{}", self.item);
+        self.permissions
+            .iter()
+            .map(|perm| {
+                Triple::new(
+                    node.clone(),
+                    Predicate::GuardedByPermission,
+                    perm.clone(),
+                    Provenance::Inferred,
+                )
+            })
+            .collect()
+    }
 }
 
 /// Harvest every menu item as a [`MenuQuad`] — the `location`/`purpose` half of
@@ -874,6 +1075,19 @@ pub fn extract_menu_quads(root: &Path, namespace: &str) -> Vec<MenuQuad> {
     extract_regions(root)
         .iter()
         .map(|e| e.to_quad(namespace))
+        .collect()
+}
+
+/// Harvest every menu item's `if:`-guard permissions as
+/// [`Predicate::GuardedByPermission`] triples (the OQ-GUARD-1 visibility rail).
+/// Companion to [`extract_menu_quads`]; both read the same `menu.push` sites.
+/// Nodes use the bare `{namespace}:{item}` grammar. Items whose guard names no
+/// statically-extractable permission contribute nothing.
+#[must_use]
+pub fn extract_menu_guards(root: &Path, namespace: &str) -> Vec<Triple> {
+    extract_regions(root)
+        .iter()
+        .flat_map(|e| e.to_guard_triples(namespace))
         .collect()
 }
 
@@ -1131,6 +1345,7 @@ mod tests {
             tab_order: Some(3),
             action: None,
             has_controller: false,
+            permissions: vec![],
             file: "config/initializers/menus.rb".to_string(),
         };
         let triples = entry.to_triples("openproject");
@@ -1620,6 +1835,139 @@ mod tests {
             triples.len(),
             parent_of.len(),
             max_depth,
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // §5 — the `if:`-guard permission arm (OQ-GUARD-1)
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn guard_entry(case: &str, guard_src: &str) -> RegionEntry {
+        let root = scratch_dir(case);
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            &format!(
+                "Redmine::MenuManager.map :top_menu do |menu|\n\
+                 \x20 menu.push :x, {{ controller: \"/x\" }}, if: {guard_src}\n\
+                 end\n"
+            ),
+        );
+        let entries = extract_regions(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        entries.into_iter().next().expect("one entry")
+    }
+
+    /// A single `allowed_to?(:sym)` → one symbol, and `to_guard_triples`
+    /// emits the bare-node `guarded_by_permission` fact at Inferred.
+    #[test]
+    fn guard_single_permission_extracted() {
+        let entry = guard_entry(
+            "guard_single",
+            "->(_) { User.current.allowed_to?(:view_foo) }",
+        );
+        assert_eq!(entry.permissions, vec!["view_foo".to_string()]);
+
+        let triples = entry.to_guard_triples("openproject");
+        assert_eq!(triples.len(), 1, "{triples:?}");
+        let t = &triples[0];
+        assert_eq!(t.s, "openproject:x");
+        assert_eq!(t.p, "guarded_by_permission");
+        assert_eq!(t.o, "view_foo");
+        // Inferred tier — a proc-body heuristic.
+        assert_eq!((t.f, t.c), Provenance::Inferred.truth());
+    }
+
+    /// A conjunction (`allowed_to?(:a) && allowed_in_project?(:b)`) → BOTH
+    /// symbols (sorted).
+    #[test]
+    fn guard_conjunction_both_symbols() {
+        let entry = guard_entry(
+            "guard_conjunction",
+            "->(_) { User.current.allowed_to?(:view_a) && User.current.allowed_in_project?(:manage_b) }",
+        );
+        assert_eq!(
+            entry.permissions,
+            vec!["manage_b".to_string(), "view_a".to_string()]
+        );
+    }
+
+    /// A disjunction (`allowed_globally?(:add_project) ||
+    /// allowed_in_project?(:add_subprojects, project)`) → BOTH symbols
+    /// emitted. This is the honest `guarded_by` semantics: both permissions
+    /// appear in the visibility guard, so a flat "requires" would mis-encode
+    /// it. (The `allowed_in_project?(:sym, project)` shape keeps `:sym` FIRST
+    /// — the `project` receiver-context arg trails it, so this is normal-form,
+    /// not receiver-style.)
+    #[test]
+    fn guard_disjunction_both_symbols() {
+        let entry = guard_entry(
+            "guard_disjunction",
+            "->(_) { User.current.allowed_globally?(:add_project) || User.current.allowed_in_project?(:add_subprojects, project) }",
+        );
+        assert_eq!(
+            entry.permissions,
+            vec!["add_project".to_string(), "add_subprojects".to_string()]
+        );
+    }
+
+    /// A receiver-style `allowed_to(User.current, :view_x)` — the permission
+    /// is the SECOND positional (the first is a user-expression) → `["view_x"]`.
+    #[test]
+    fn guard_receiver_style_extracted() {
+        let entry = guard_entry(
+            "guard_receiver_style",
+            "->(_) { allowed_to(User.current, :view_x) }",
+        );
+        assert_eq!(entry.permissions, vec!["view_x".to_string()]);
+    }
+
+    /// A no-permission guard (`if: ->(_) { admin? }`) → no symbol, no guard
+    /// triple.
+    #[test]
+    fn guard_no_permission_yields_empty() {
+        let entry = guard_entry("guard_none", "->(_) { admin? }");
+        assert!(entry.permissions.is_empty(), "{:?}", entry.permissions);
+        assert!(entry.to_guard_triples("openproject").is_empty());
+    }
+
+    /// Env-gated real-corpus probe (self-skips without `RAILS_CORPUS_SRC`).
+    /// The OQ-GUARD-1 measurement over `OpenProject` found ~10 permission-
+    /// bearing menu items (single 2 + disjunction 1 + mixed 7; the 2 dynamic
+    /// guards contribute no symbol) spanning 11 distinct permission symbols.
+    /// Asserted as firm lower bounds; the eprintln prints the exact measured
+    /// values so the bounds can be tightened at first green.
+    #[test]
+    #[allow(clippy::print_stderr)] // diagnostic emission gated on env var (real-corpus gate)
+    fn corpus_probe_guard_arm_over_openproject() {
+        let Ok(root) = std::env::var("RAILS_CORPUS_SRC") else {
+            eprintln!("RAILS_CORPUS_SRC unset; skipping guard-arm corpus probe");
+            return;
+        };
+        let path = Path::new(&root);
+        let (entries, report) = extract_regions_with_report(path, "openproject");
+        assert!(report.with_permission >= 10, "{report:?}");
+
+        let triples = extract_menu_guards(path, "openproject");
+        assert!(!triples.is_empty(), "{report:?}");
+        // Every emitted guard triple carries the closed-vocab predicate at the
+        // Inferred tier and a bare-node subject.
+        for t in &triples {
+            assert_eq!(t.p, "guarded_by_permission");
+            assert_eq!((t.f, t.c), Provenance::Inferred.truth());
+            assert!(t.s.starts_with("openproject:"), "{t:?}");
+        }
+
+        let distinct: BTreeSet<&str> = triples.iter().map(|t| t.o.as_str()).collect();
+        assert!(distinct.len() >= 10, "distinct symbols: {distinct:?}");
+
+        eprintln!(
+            "guard-arm corpus probe: {} items, {} with_permission, {} guard triples, {} distinct symbols",
+            entries.len(),
+            report.with_permission,
+            triples.len(),
+            distinct.len(),
         );
     }
 }

@@ -663,6 +663,18 @@ pub enum Predicate {
     /// options room → `settings`). **Default tier is [`Provenance::Inferred`]**:
     /// a heuristic over the control set, not a declared literal.
     Purpose,
+    /// `(node, guarded_by_permission, "<permission_symbol>")` — a permission
+    /// that appears in the node's VISIBILITY guard (a menu item's `if:` proc
+    /// body). **Visibility-honest, does NOT assert necessity:** a node's guard
+    /// may combine several permissions via `&&`/`||` alongside non-permission
+    /// conditions (`Setting.*`, `admin?`, `logged?`), so the correct weaker
+    /// claim is "this permission is GUARDED-BY the node's visibility", never
+    /// "this permission is REQUIRED". Both operands of a disjunction are
+    /// emitted (each appears in the guard); dynamic permission arguments (a
+    /// `Hash`/method-call rather than a `Sym` literal) contribute nothing —
+    /// no symbol is fabricated. **Default tier is [`Provenance::Inferred`]**:
+    /// a proc-body heuristic, not a declared literal.
+    GuardedByPermission,
 }
 
 impl Predicate {
@@ -758,6 +770,7 @@ impl Predicate {
             Self::OpensPopup => "opens_popup",
             Self::PartOf => "part_of",
             Self::Purpose => "purpose",
+            Self::GuardedByPermission => "guarded_by_permission",
         }
     }
 
@@ -859,6 +872,7 @@ impl Predicate {
             "opens_popup" => Self::OpensPopup,
             "part_of" => Self::PartOf,
             "purpose" => Self::Purpose,
+            "guarded_by_permission" => Self::GuardedByPermission,
             _ => return None,
         })
     }
@@ -867,10 +881,10 @@ impl Predicate {
     /// closed-vocab round-trip test and by any consumer that needs to
     /// enumerate the whole surface (e.g. the ndjson validator).
     ///
-    /// **Length invariant:** `ALL.len() == 78` (7 core + 32 AR-shape +
+    /// **Length invariant:** `ALL.len() == 79` (7 core + 32 AR-shape +
     /// 18 C++ machine-plane + 3 Odoo-relational + 4 body-mutation +
     /// 4 UI-navigation + 3 UI-config + 2 Rails-routes + 3 UI-layout +
-    /// 2 Klickwege-rail). A new variant added to [`Predicate`] **must** be
+    /// 3 Klickwege-rail). A new variant added to [`Predicate`] **must** be
     /// appended here in the same order, or the closed-vocab round-trip test
     /// fails.
     pub const ALL: &'static [Predicate] = &[
@@ -962,6 +976,7 @@ impl Predicate {
         // Klickwege-rail plane (menu quad location + purpose)
         Self::PartOf,
         Self::Purpose,
+        Self::GuardedByPermission,
     ];
 
     /// The default provenance tier for this predicate, per the Odoo
@@ -1032,7 +1047,11 @@ impl Predicate {
             // over the nav/containment graph; the usability role is a heuristic
             // over the control set. Neither is a single declared literal.
             | Self::PartOf
-            | Self::Purpose => Provenance::Inferred,
+            | Self::Purpose
+            // Klickwege visibility rail: the permission is read from a menu
+            // item's `if:` proc body (a heuristic over the boolean guard), not
+            // a declared literal.
+            | Self::GuardedByPermission => Provenance::Inferred,
             // C++ machine-plane declarative surface (the 10 remaining of 13)
             Self::InheritsFrom
             | Self::HasField
@@ -1201,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_count_locked_at_78() {
+    fn predicate_count_locked_at_79() {
         // The exact count is part of the schema contract: 7 core (Odoo
         // Python) + 32 OpenProject AR-shape (PR #15 added
         // `association_kind`; #18 added `class_name`; #21 added
@@ -1263,10 +1282,17 @@ mod tests {
         // walking it yields the radix-trie menu address, so no stored position
         // ordinal is minted (V3 LE-contract §3 forbids a label/position facet
         // slot); `purpose` is the usability role. Both Inferred) = 78.
+        // + 1 Klickwege visibility rail (2026-07-12: `guarded_by_permission` —
+        // the OQ-GUARD-1 mint. A permission that appears in a menu item's `if:`
+        // visibility guard, read from the proc-body boolean tree. Named
+        // visibility-honestly (`guarded_by`, NOT `requires`): the OQ-GUARD-1
+        // probe measured that guards combine permissions via `&&`/`||` plus
+        // non-permission conditions, so a flat "requires" claim would
+        // mis-encode the disjunctions. Inferred — a proc-body heuristic) = 79.
         // NB (#77 lesson): this count lives HERE only. No other arm may
         // re-assert it — cross-crate count duplication is the "monitor N pins"
         // anti-pattern; a predicate added here must never trip a routes.rs test.
-        assert_eq!(Predicate::ALL.len(), 78);
+        assert_eq!(Predicate::ALL.len(), 79);
     }
 
     #[test]
