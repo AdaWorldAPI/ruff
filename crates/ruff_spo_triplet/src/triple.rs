@@ -557,11 +557,25 @@ pub enum Predicate {
     // this in `.Designer.cs` + room-directory conventions; a Rails app in
     // ERB partial trees + route scopes. (MedCare transcode doctrine
     // Phase 0 — `MedCare-rs/.claude/knowledge/medcare-transcode-doctrine.md`.)
-    /// `(screen, surfaces_concept, concept)` — a room-alias config row binds
-    /// this screen's room (its source directory / name family, e.g.
-    /// `con_lab` → `lab`) to a domain concept. Authoritative: the binding
-    /// is a machine-readable config-table row supplied by the corpus owner
-    /// (data-as-config), not a heuristic — the config IS the claim.
+    /// `(screen, surfaces_concept, concept)` — binds a screen/menu node to a
+    /// domain concept the consumer resolves to a classid (via
+    /// `PortSpec::class_id`), source-agnostic on the harvester side. Three
+    /// sources feed this ONE predicate; the [`Provenance`] tier carried per
+    /// emission (see [`crate::MenuQuad::identity_tier`]) records which:
+    /// a room-alias config row binds a screen's room (its source directory /
+    /// name family, e.g. `con_lab` → `lab`) to a domain concept —
+    /// [`Provenance::Authoritative`] (a machine-readable config-table row
+    /// supplied by the corpus owner, data-as-config, not a heuristic — the
+    /// config IS the claim); a DECLARED literal read verbatim (Odoo
+    /// `<field name="res_model">account.move</field>`) — also
+    /// [`Provenance::Authoritative`] (no inflection, the declaration IS the
+    /// fact); a DERIVED model-name token (Rails `controller → singularize →
+    /// model`), emitted ONLY after the derived token is cross-checked
+    /// against the real model roster — [`Provenance::OpenProjectExtracted`]
+    /// (deterministic but not curated config, one notch below
+    /// `Authoritative`). A model-less / concept-less target emits nothing —
+    /// refusal is the correctness property for a screen with no backing
+    /// concept, not a gap.
     SurfacesConcept,
     /// `(screen.control, handles_event, "<event>:<handler-IRI>")` — Designer
     /// event wiring: `this.<control>.<Event> += new …(this.<Handler>)`.

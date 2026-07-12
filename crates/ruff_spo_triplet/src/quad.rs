@@ -132,6 +132,15 @@ pub struct MenuQuad {
     /// `surfaces_concept` object (→ classid), when the identity is bound at
     /// harvest time. `None` leaves identity to the concept-binding arm.
     pub identity_concept: Option<String>,
+    /// The `surfaces_concept` provenance tier, mirroring [`Self::part_of_tier`]:
+    /// [`Provenance::Authoritative`] for a corpus-owner config row (C#
+    /// `roomAliases`) or a DECLARED literal (Odoo `res_model`, read verbatim,
+    /// no inflection); [`Provenance::OpenProjectExtracted`] for a DERIVED
+    /// model-name token (Rails `controller → singularize → model`,
+    /// roster-verified before emission — deterministic but not curated, one
+    /// notch below `Authoritative`). Ignored when `identity_concept` is
+    /// `None` (nothing is emitted either way).
+    pub identity_tier: Provenance,
 }
 
 impl MenuQuad {
@@ -160,7 +169,7 @@ impl MenuQuad {
                 self.node.clone(),
                 Predicate::SurfacesConcept,
                 concept.clone(),
-                Provenance::Authoritative,
+                self.identity_tier,
             ));
         }
         out
@@ -287,6 +296,7 @@ mod tests {
             part_of_tier: Provenance::Authoritative,
             purpose: PurposeRole::List,
             identity_concept: None,
+            identity_tier: Provenance::Authoritative,
         };
         let triples = quad.to_triples();
         assert_eq!(triples.len(), 2, "{triples:?}");
@@ -299,6 +309,39 @@ mod tests {
         assert_eq!(purpose.o, "list");
     }
 
+    /// `surfaces_concept` is emitted at `identity_tier`, NOT a hardcoded
+    /// `Authoritative` — the structural over-claim the v2 council fix
+    /// targets. A derived, roster-verified binding must carry the honest
+    /// `OpenProjectExtracted` tier.
+    #[test]
+    fn surfaces_concept_emits_at_identity_tier_not_hardcoded_authoritative() {
+        let quad = MenuQuad {
+            node: "openproject:work_packages".to_string(),
+            parent: None,
+            part_of_tier: Provenance::Authoritative,
+            purpose: PurposeRole::List,
+            identity_concept: Some("WorkPackage".to_string()),
+            identity_tier: Provenance::OpenProjectExtracted,
+        };
+        let triples = quad.to_triples();
+        let sc = triples
+            .iter()
+            .find(|t| t.p == "surfaces_concept")
+            .unwrap_or_else(|| panic!("no surfaces_concept triple: {triples:?}"));
+        assert_eq!(sc.o, "WorkPackage");
+        assert_eq!((sc.f, sc.c), Provenance::OpenProjectExtracted.truth());
+
+        // A declared (Authoritative-tier) binding still emits Authoritative.
+        let declared = MenuQuad {
+            identity_concept: Some("account.move".to_string()),
+            identity_tier: Provenance::Authoritative,
+            ..quad
+        };
+        let triples = declared.to_triples();
+        let sc = triples.iter().find(|t| t.p == "surfaces_concept").unwrap();
+        assert_eq!((sc.f, sc.c), Provenance::Authoritative.truth());
+    }
+
     /// A root node (no parent) emits `purpose` only — no `part_of`.
     #[test]
     fn root_quad_emits_purpose_only() {
@@ -308,6 +351,7 @@ mod tests {
             part_of_tier: Provenance::Authoritative,
             purpose: PurposeRole::Settings,
             identity_concept: None,
+            identity_tier: Provenance::Authoritative,
         };
         let triples = quad.to_triples();
         assert_eq!(triples.len(), 1);
