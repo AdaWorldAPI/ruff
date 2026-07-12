@@ -183,10 +183,20 @@ pub struct RegionScanReport {
     pub unresolved_order: usize,
     /// Distinct `menu_names` seen, sorted.
     pub menus: Vec<String>,
-    // ── the `surfaces_concept` identity-binding 4-bucket ledger (SPEC v2) ──
-    /// Entries with no `controller:` target at all — identity dormant BY
-    /// DESIGN (settings/help/external-URL items have no backing model).
+    // ── the `surfaces_concept` identity-binding 5-bucket ledger (SPEC v2) ──
+    /// Entries with NO `controller:` target at all (`has_controller ==
+    /// false`) — identity dormant BY DESIGN (settings/help/external-URL
+    /// items have no backing model). Distinct from
+    /// [`Self::with_dynamic_controller`], which HAS a `controller:` we
+    /// simply can't resolve statically.
     pub without_concept: usize,
+    /// Entries with a `controller:` kwarg whose value is DYNAMIC (e.g. the
+    /// each-loop `controller: options[:controller]`) — `has_controller ==
+    /// true` but no static token to derive from. NOT identity-dormant "by
+    /// design" (there IS a target); a visible non-emission bucket that
+    /// names the next arm (an each-loop expansion) rather than hiding a
+    /// dynamic target inside [`Self::without_concept`].
+    pub with_dynamic_controller: usize,
     /// Entries whose identity is bound from a DECLARED literal (a Rails
     /// config-row arm, if one is ever added — always 0 today; Rails only
     /// has the derived arm below). Kept for report-shape parity with the
@@ -289,11 +299,12 @@ pub fn extract_regions_with_report(
     menus.dedup();
     report.menus = menus;
 
-    // The `surfaces_concept` identity-binding 4-bucket ledger.
+    // The `surfaces_concept` identity-binding 5-bucket ledger.
     let roster = crate::schema::model_roster(root);
     for binding in bind_identities(&entries, &roster) {
         match binding {
             IdentityBinding::WithoutConcept => report.without_concept += 1,
+            IdentityBinding::DynamicController => report.with_dynamic_controller += 1,
             IdentityBinding::DerivedMatched(_) => report.with_concept_derived_matched += 1,
             IdentityBinding::DerivedUnmatched => report.with_concept_derived_unmatched += 1,
         }
@@ -1128,14 +1139,22 @@ impl RegionEntry {
 // (`derived_unmatched`), never a fabricated `surfaces_concept`.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// One entry's identity-binding outcome — the 4-bucket conservation ledger's
+/// One entry's identity-binding outcome — the 5-bucket conservation ledger's
 /// per-entry classification, index-aligned with the entry slice (same
 /// discipline as [`resolve_tab_orders`]'s parallel `Option<u32>` vec).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IdentityBinding {
-    /// No `controller:` target at all — identity dormant BY DESIGN (a
-    /// settings/help/external-URL item has no backing model to bind).
+    /// No `controller:` target at all (`has_controller == false`) —
+    /// identity dormant BY DESIGN (a settings/help/external-URL item has no
+    /// backing model to bind).
     WithoutConcept,
+    /// A `controller:` kwarg IS present (`has_controller == true`) but its
+    /// value is DYNAMIC (`controller: options[:controller]`) — no static
+    /// token to derive from, so nothing is emitted, but it is NOT
+    /// "concept-less by design": there IS a target we can't yet resolve.
+    /// Counted separately so a dynamic target is never hidden inside
+    /// [`Self::WithoutConcept`].
+    DynamicController,
     /// A `controller:`-derived model token that is NOT in the real model
     /// roster — the visible failure-rate bucket (irregular plurals, a
     /// namespaced controller the `/`-fix doesn't cover, or a genuinely
@@ -1161,11 +1180,18 @@ fn derive_model_from_controller(controller: &str) -> String {
 
 /// Cross-check every entry's `controller:` target against the real model
 /// `roster`, deriving via [`derive_model_from_controller`]. One
-/// [`IdentityBinding`] per entry, index-aligned with `entries`.
+/// [`IdentityBinding`] per entry, index-aligned with `entries`. The
+/// `has_controller`/`controller` pair distinguishes THREE controller states:
+/// absent (`WithoutConcept`), present-but-dynamic (`DynamicController`), and
+/// present-and-static (derive + roster check).
 fn bind_identities(entries: &[RegionEntry], roster: &HashSet<String>) -> Vec<IdentityBinding> {
     entries
         .iter()
         .map(|e| match &e.controller {
+            // A dynamic `controller:` records `has_controller == true` but no
+            // static value — a target we can't resolve, NOT a design-dormant
+            // absence.
+            None if e.has_controller => IdentityBinding::DynamicController,
             None => IdentityBinding::WithoutConcept,
             Some(controller) => {
                 let derived = derive_model_from_controller(controller);
@@ -1685,12 +1711,51 @@ mod tests {
 
         let (_, report) = extract_regions_with_report(&root, "openproject");
         assert_eq!(report.without_concept, 1, "{report:?}");
+        assert_eq!(report.with_dynamic_controller, 0, "{report:?}");
         assert_eq!(report.with_concept_derived_matched, 0, "{report:?}");
         assert_eq!(report.with_concept_derived_unmatched, 0, "{report:?}");
 
         let quads = extract_menu_quads(&root, "openproject");
         let q = quads.iter().find(|q| q.node == "openproject:help").unwrap();
         assert_eq!(q.identity_concept, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A menu item whose `controller:` value is DYNAMIC (the each-loop
+    /// `controller: options[:controller]` case) records `has_controller ==
+    /// true` but no static token — it is counted in `with_dynamic_controller`,
+    /// NOT `without_concept` (which means "no target at all"). Nothing is
+    /// emitted either way, but the ledger no longer hides a dynamic target as
+    /// intentionally concept-less (PR #87 codex P2).
+    #[test]
+    fn dynamic_controller_is_not_without_concept() {
+        let root = scratch_dir("identity_dynamic_controller");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :project_menu do |menu|\n\
+             \x20 menu.push :dynamic_item, { controller: options[:controller], action: \"index\" }\n\
+             end\n",
+        );
+
+        let (_, report) = extract_regions_with_report(&root, "openproject");
+        assert_eq!(report.with_dynamic_controller, 1, "{report:?}");
+        assert_eq!(report.without_concept, 0, "{report:?}");
+        assert_eq!(report.with_concept_derived_matched, 0, "{report:?}");
+        assert_eq!(report.with_concept_derived_unmatched, 0, "{report:?}");
+
+        // A dynamic controller emits no surfaces_concept (no static token).
+        let quads = extract_menu_quads(&root, "openproject");
+        let q = quads
+            .iter()
+            .find(|q| q.node == "openproject:dynamic_item")
+            .unwrap();
+        assert_eq!(q.identity_concept, None);
+        assert!(
+            !q.to_triples().iter().any(|t| t.p == "surfaces_concept"),
+            "dynamic controller must not emit surfaces_concept"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1869,11 +1934,22 @@ mod tests {
             entries.iter().filter(|e| e.menu == "top_menu").collect();
         assert!(!top_menu_items.is_empty(), "{report:?}");
 
-        // The `surfaces_concept` identity-binding 4-bucket ledger (SPEC v2):
+        // The `surfaces_concept` identity-binding 5-bucket ledger (SPEC v2):
         // the CRUD spine (`work_packages`/`projects`/`time_entries`) is the
         // load-bearing nav core, so at least one derived token must resolve
         // against the real model roster.
         assert!(report.with_concept_derived_matched >= 1, "{report:?}");
+        // Conservation: every entry lands in EXACTLY one bucket, so the five
+        // buckets sum to the entry count (each `menu.push` is one entry).
+        assert_eq!(
+            report.without_concept
+                + report.with_dynamic_controller
+                + report.with_concept_declared
+                + report.with_concept_derived_matched
+                + report.with_concept_derived_unmatched,
+            entries.len(),
+            "{report:?}"
+        );
 
         eprintln!(
             "region-arm corpus probe: {} files, {} map_blocks, {} items, {} with_parent, {} unresolved",
@@ -1884,9 +1960,11 @@ mod tests {
             report.unresolved_order,
         );
         eprintln!(
-            "identity-binding ledger: without_concept={} with_concept_declared={} \
-             with_concept_derived_matched={} with_concept_derived_unmatched={}",
+            "identity-binding ledger: without_concept={} with_dynamic_controller={} \
+             with_concept_declared={} with_concept_derived_matched={} \
+             with_concept_derived_unmatched={}",
             report.without_concept,
+            report.with_dynamic_controller,
             report.with_concept_declared,
             report.with_concept_derived_matched,
             report.with_concept_derived_unmatched,
