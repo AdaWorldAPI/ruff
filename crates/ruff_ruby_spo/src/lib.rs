@@ -53,8 +53,8 @@ pub use actions::{
 };
 pub use menu::{MenuScanReport, extract_menu_edges, extract_menu_edges_with_report};
 pub use menu_regions::{
-    Position, RegionEntry, RegionScanReport, extract_menu_quads, extract_regions,
-    extract_regions_with_report,
+    Position, RegionEntry, RegionScanReport, extract_menu_guards, extract_menu_quads,
+    extract_regions, extract_regions_with_report,
 };
 pub use navigation::{
     NavScanReport, NavShape, NavVocab, RubyNavEdge, extract_nav_edges,
