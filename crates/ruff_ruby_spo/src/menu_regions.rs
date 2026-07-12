@@ -880,6 +880,9 @@ pub fn extract_menu_quads(root: &Path, namespace: &str) -> Vec<MenuQuad> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use ruff_spo_triplet::{ExamConfig, build_nav_digest};
 
     fn write_file(root: &Path, rel: &str, content: &str) {
         let path = root.join(rel);
@@ -1378,6 +1381,245 @@ mod tests {
             report.items,
             report.with_parent,
             report.unresolved_order,
+        );
+    }
+
+    /// Non-corpus fixture — the twin of `ruff_spo_triplet::nav_digest::tests::
+    /// menu_quad_lowers_location_as_a_classid_radix_path`, but for the BARE
+    /// fallback path a Rails `MenuQuad` actually exercises: `to_quad` never
+    /// binds `identity_concept`, so no `surfaces_concept`/classid ever
+    /// resolves and `menu_address`'s fallback (bare screen name per
+    /// ancestor) is the ONLY path this arm's harvest can hit. Hand-build a
+    /// 3-level chain (root -> child -> grandchild) via `MenuQuad::parent`,
+    /// lower through `build_nav_digest`, and assert the grandchild's `loc`
+    /// is the root-first 3-segment bare-name path with `action=navigate`,
+    /// while the parentless root gets `action=leaf` (NOT `root` — the
+    /// `root` action requires a `navigates_to`/`selects_view` out-edge,
+    /// which a menu-quad-only triple set never carries; see the corpus
+    /// probe below for the same finding on real data).
+    #[test]
+    fn menu_quad_round_trip_lowers_bare_name_chain_without_classid() {
+        let quads = vec![
+            MenuQuad {
+                node: "app:root_item".to_string(),
+                parent: None,
+                part_of_tier: Provenance::Authoritative,
+                purpose: PurposeRole::List,
+                identity_concept: None,
+            },
+            MenuQuad {
+                node: "app:child_item".to_string(),
+                parent: Some("app:root_item".to_string()),
+                part_of_tier: Provenance::Authoritative,
+                purpose: PurposeRole::Detail,
+                identity_concept: None,
+            },
+            MenuQuad {
+                node: "app:grandchild_item".to_string(),
+                parent: Some("app:child_item".to_string()),
+                part_of_tier: Provenance::Authoritative,
+                purpose: PurposeRole::Form,
+                identity_concept: None,
+            },
+        ];
+        let triples: Vec<Triple> = quads.iter().flat_map(MenuQuad::to_triples).collect();
+        let digest = build_nav_digest(&triples, &ExamConfig::default());
+        assert!(
+            digest.contains(
+                "grandchild_item  loc=root_item/child_item/grandchild_item  purpose=form  id=-  action=navigate"
+            ),
+            "grandchild must lower to the root-first bare-name chain:\n{digest}"
+        );
+        assert!(
+            digest.contains(
+                "child_item  loc=root_item/child_item  purpose=detail  id=-  action=navigate"
+            ),
+            "child must lower to its 2-segment bare-name chain:\n{digest}"
+        );
+        assert!(
+            digest.contains("root_item  loc=root_item  purpose=list  id=-  action=leaf"),
+            "root must lower to its own single-segment address; no navigates_to/selects_view\
+             here so action=leaf, not root:\n{digest}"
+        );
+    }
+
+    /// Corpus probe (the `[H]->[G]` gate) — env-gated, self-skipping. Harvests
+    /// the real `OpenProject` menu tree as `MenuQuad`s, lowers them through
+    /// the shared `build_nav_digest`, and proves the `[menu-quad]` section's
+    /// `loc=` radix addresses reflect the harvested `part_of` nesting — the
+    /// structure-parity twin of the value-parity MySQL/lance-datafusion
+    /// reconciler oracle (see `.claude/knowledge/
+    /// consumer-transcode-furnace-playbook.md` in the consumer repos).
+    ///
+    /// Every harvested `(child, parent)` edge is checked, not just the
+    /// deepest one: the child's digest `loc` must equal the parent's `loc`
+    /// plus the child's own bare name — the address IS the walked rail, at
+    /// every depth, not merely at the maximum. `parent_of` conflict
+    /// resolution (smallest parent wins, per `part_of_raw`'s sorted-set
+    /// `or_insert`) is replayed here exactly as `nav_digest` resolves it
+    /// internally, so this probe stays correct even if the corpus ever
+    /// reuses an item name across two different menus (`MenuQuad::to_quad`
+    /// namespaces on `{ns}:{item}`, not `{ns}:{menu}.{item}`, so that
+    /// collision is a real possibility, not a hypothetical).
+    ///
+    /// A parentless node NEVER resolves to `action=root` here (that action
+    /// requires a `navigates_to`/`selects_view` out-edge, which a
+    /// menu-quad-only triple set never emits) — every parentless node is
+    /// `action=leaf` with a single-segment address equal to its own bare
+    /// name. This is asserted explicitly below rather than assumed.
+    #[test]
+    #[allow(clippy::print_stderr)] // diagnostic emission gated on env var (real-corpus gate)
+    fn corpus_probe_menu_quad_round_trip_over_openproject() {
+        let Ok(root) = std::env::var("RAILS_CORPUS_SRC") else {
+            eprintln!("RAILS_CORPUS_SRC unset; skipping menu-quad round-trip corpus probe");
+            return;
+        };
+        let path = Path::new(&root);
+        let quads = extract_menu_quads(path, "openproject");
+        assert!(
+            !quads.is_empty(),
+            "expected at least one harvested menu quad over the real corpus"
+        );
+
+        let triples: Vec<Triple> = quads.iter().flat_map(MenuQuad::to_triples).collect();
+        assert!(!triples.is_empty(), "{quads:?}");
+
+        let config = ExamConfig::default();
+        let digest = build_nav_digest(&triples, &config);
+
+        // Determinism: the same harvest must lower to a byte-identical
+        // digest on a second build (the digest's own shuffle-invariance
+        // guarantee, exercised here against the real corpus rather than a
+        // hand-built fixture).
+        let digest_again = build_nav_digest(&triples, &config);
+        assert_eq!(digest, digest_again, "digest must be deterministic");
+
+        // Parse the [menu-quad] section into node -> (loc, action).
+        let section = digest
+            .split("[menu-quad]\n")
+            .nth(1)
+            .expect("digest must carry a [menu-quad] section");
+        let mut lines: HashMap<String, (String, String)> = HashMap::new();
+        for line in section.lines() {
+            // "<node>  loc=<addr>  purpose=<p>  id=<id>  action=<action>"
+            let mut fields = line.split("  ");
+            let Some(node) = fields.next() else { continue };
+            let mut loc = String::new();
+            let mut action = String::new();
+            for field in fields {
+                if let Some(v) = field.strip_prefix("loc=") {
+                    loc = v.to_string();
+                } else if let Some(v) = field.strip_prefix("action=") {
+                    action = v.to_string();
+                }
+            }
+            lines.insert(node.to_string(), (loc, action));
+        }
+        assert!(!lines.is_empty(), "[menu-quad] section must not be empty");
+
+        // Replay nav_digest's own (bare) child -> parent resolution: sorted
+        // (child, parent) set, smallest parent wins on conflict.
+        let bare = |n: &str| n.split_once(':').map_or(n, |(_, tail)| tail).to_string();
+        let mut part_of_raw: BTreeSet<(String, String)> = BTreeSet::new();
+        for q in &quads {
+            if let Some(parent) = &q.parent {
+                part_of_raw.insert((bare(&q.node), bare(parent)));
+            }
+        }
+        assert!(
+            !part_of_raw.is_empty(),
+            "expected at least one part_of edge in the real menu harvest"
+        );
+        let mut parent_of: BTreeMap<String, String> = BTreeMap::new();
+        for (child, parent) in &part_of_raw {
+            parent_of
+                .entry(child.clone())
+                .or_insert_with(|| parent.clone());
+        }
+
+        // Independent radix-walk mirroring `nav_digest::menu_address`'s
+        // fallback path (bare node name per ancestor — Rails MenuQuads never
+        // bind `identity_concept`, so classid resolution never fires here).
+        fn expected_address(node: &str, parent_of: &BTreeMap<String, String>) -> String {
+            let mut chain = Vec::new();
+            let mut seen = BTreeSet::new();
+            let mut cur = node.to_string();
+            loop {
+                if !seen.insert(cur.clone()) || chain.len() >= 32 {
+                    break;
+                }
+                chain.push(cur.clone());
+                match parent_of.get(&cur) {
+                    Some(p) => cur = p.clone(),
+                    None => break,
+                }
+            }
+            chain.reverse();
+            chain.join("/")
+        }
+
+        // Structure-parity check: EVERY harvested (child, parent) edge, not
+        // just the deepest chain — the digest's loc must equal the
+        // independently-walked rail, and must carry the parent's own loc as
+        // a root-first prefix.
+        let mut max_depth = 1usize;
+        for (child, parent) in &parent_of {
+            let (child_loc, child_action) = lines.get(child).unwrap_or_else(|| {
+                panic!("no [menu-quad] digest line for harvested node {child:?}")
+            });
+            assert_eq!(
+                child_action, "navigate",
+                "{child} has a part_of parent, so its digest action must be navigate"
+            );
+            let expected = expected_address(child, &parent_of);
+            assert_eq!(
+                *child_loc, expected,
+                "loc address for {child} must equal the walked part_of rail"
+            );
+            max_depth = max_depth.max(expected.split('/').count());
+
+            if let Some((parent_loc, _)) = lines.get(parent) {
+                assert!(
+                    child_loc.starts_with(parent_loc.as_str()),
+                    "{child}'s address {child_loc} must carry its parent {parent}'s address \
+                     {parent_loc} as a root-first prefix"
+                );
+            }
+        }
+        assert!(
+            max_depth >= 2,
+            "expected at least one nested (depth >= 2) menu-quad chain in the real corpus"
+        );
+
+        // Every parentless node's address is exactly its own bare name (the
+        // depth-1 base case of the root-first path property), and its
+        // action is `leaf` — never `root`, since this triple set carries no
+        // navigates_to/selects_view out-edges for `menu_roots` to key off.
+        let mut parentless_checked = 0usize;
+        for (node, (loc, action)) in &lines {
+            if !parent_of.contains_key(node) {
+                assert_eq!(
+                    loc, node,
+                    "a parentless node's address must be its own bare name"
+                );
+                assert_eq!(
+                    action, "leaf",
+                    "a parentless node in a menu-quad-only triple set must be action=leaf"
+                );
+                parentless_checked += 1;
+            }
+        }
+        assert!(
+            parentless_checked > 0,
+            "expected at least one parentless menu-quad node"
+        );
+
+        eprintln!(
+            "menu-quad round-trip corpus probe: {} quads, {} triples, {} part_of edges, max depth {}",
+            quads.len(),
+            triples.len(),
+            parent_of.len(),
+            max_depth,
         );
     }
 }
