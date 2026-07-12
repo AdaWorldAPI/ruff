@@ -342,15 +342,69 @@ pub fn mint_with_classid(triples: &[Triple], classid_of: impl Fn(&str) -> u32) -
         })
         .collect();
 
-    // ── 2. Children (sorted) + roots, for each forest — the rank basis. ──
-    let (po_children, po_roots) = forest(&nodes, &po_parent);
-    let (ia_children, ia_roots) = forest(&nodes, &ia_parent);
+    // ── 2-3. Rank each node in both forests and pack its facet. ──
+    mint_from_parents(&nodes, &po_parent, &ia_parent, classid_of)
+}
 
-    // ── 3. Mint each node. ──
+/// Mint facets from PRE-BUILT `(child → parent)` forests — the
+/// predicate-agnostic core of [`mint_with_classid`] (stages forest → ranks →
+/// [`Facet::from_parts`]). A caller that has already parsed its domain's
+/// containment / inheritance edges into parent maps mints through THIS entry;
+/// the parse that produced the maps stays the caller's concern.
+///
+/// This is the seam that lets two callers with **disjoint predicate
+/// vocabularies** share the rank/pack machinery without ever conflating their
+/// address spaces: the structural minter feeds a `has_field`/`has_function`
+/// forest, a menu minter feeds a `part_of` navigation forest, and neither can
+/// see the other's edges — the forests are built before this call, so no
+/// predicate ever crosses over.
+///
+/// - `nodes` — every facet key (each node gets exactly one [`Facet`]).
+/// - `po_parent` / `ia_parent` — `child → parent` for the `part_of` / `is_a`
+///   forests. A node absent from a map is a root of that forest.
+/// - `classid_of(node)` — stamps bytes `[0..4)` of each facet.
+///
+/// **Dormant-axis rule:** an axis whose parent map is EMPTY (no edges in the
+/// whole corpus) is DORMANT — every node's chain for that axis is `[0; TIERS]`,
+/// not a positional root-rank. This is the semantically-honest encoding: with
+/// no containment/inheritance edges there is no hierarchy to address, so the
+/// slot is left zero rather than filled with meaningless sibling positions.
+/// It is exactly what a menu forest needs — menu nodes carry a `part_of`
+/// navigation tree but no `is_a`, so their `is_a` chain is `[0; TIERS]`.
+/// Structural mints are unaffected (both maps are always non-empty there).
+///
+/// Determinism + the 6-tier / 255-sibling caps are inherited unchanged from
+/// [`ranks`] (a node exceeding either is flagged in [`Mint`]'s `truncated`).
+#[must_use]
+pub fn mint_from_parents<'a>(
+    nodes: &BTreeSet<&'a str>,
+    po_parent: &BTreeMap<&'a str, &'a str>,
+    ia_parent: &BTreeMap<&'a str, &'a str>,
+    classid_of: impl Fn(&str) -> u32,
+) -> Mint {
+    // A forest with no edges is a dormant axis: rank to `[0; TIERS]` instead
+    // of treating every node as its own root (positional noise in a slot that
+    // has no hierarchy to encode).
+    let po_dormant = po_parent.is_empty();
+    let ia_dormant = ia_parent.is_empty();
+
+    // Children (sorted) + roots, for each active forest — the rank basis.
+    let (po_children, po_roots) = forest(nodes, po_parent);
+    let (ia_children, ia_roots) = forest(nodes, ia_parent);
+
+    // Mint each node.
     let mut out = Mint::default();
-    for &n in &nodes {
-        let (po, po_trunc) = ranks(n, &po_parent, &po_children, &po_roots);
-        let (ia, ia_trunc) = ranks(n, &ia_parent, &ia_children, &ia_roots);
+    for &n in nodes {
+        let (po, po_trunc) = if po_dormant {
+            ([0u8; TIERS], false)
+        } else {
+            ranks(n, po_parent, &po_children, &po_roots)
+        };
+        let (ia, ia_trunc) = if ia_dormant {
+            ([0u8; TIERS], false)
+        } else {
+            ranks(n, ia_parent, &ia_children, &ia_roots)
+        };
         out.facets
             .insert(n.to_owned(), Facet::from_parts(classid_of(n), po, ia));
         if po_trunc || ia_trunc {
@@ -438,11 +492,25 @@ pub fn mint_factored(triples: &[Triple]) -> Mint {
     // ── 2. part_of: base-255 positional spread from the virtual root. ──
     let mut part_of: BTreeMap<&str, [u8; TIERS]> = BTreeMap::new();
     let mut truncated: BTreeSet<&str> = BTreeSet::new();
-    assign_b255(&po_roots, &po_children, [0; TIERS], 0, &mut part_of, &mut truncated);
+    assign_b255(
+        &po_roots,
+        &po_children,
+        [0; TIERS],
+        0,
+        &mut part_of,
+        &mut truncated,
+    );
 
     // ── 3. is_a: inherits lineage for classes; bounded kind enum for members. ──
     let mut is_a: BTreeMap<&str, [u8; TIERS]> = BTreeMap::new();
-    assign_b255(&ia_roots, &ia_children, [0; TIERS], 0, &mut is_a, &mut truncated);
+    assign_b255(
+        &ia_roots,
+        &ia_children,
+        [0; TIERS],
+        0,
+        &mut is_a,
+        &mut truncated,
+    );
     // Members (no inherits edge) carry their kind in is_a tier-0 instead of an
     // inherits-tree position — the masked, never-exploding kind discriminator.
     for &n in &nodes {
@@ -458,7 +526,8 @@ pub fn mint_factored(triples: &[Triple]) -> Mint {
     for &n in &nodes {
         let po = part_of.get(n).copied().unwrap_or([0; TIERS]);
         let ia = is_a.get(n).copied().unwrap_or([0; TIERS]);
-        out.facets.insert(n.to_owned(), Facet::from_parts(0, po, ia));
+        out.facets
+            .insert(n.to_owned(), Facet::from_parts(0, po, ia));
     }
     out.truncated = truncated.into_iter().map(str::to_owned).collect();
     out
@@ -609,7 +678,11 @@ mod tests {
     #[test]
     fn facet_bytes_match_facetcascade_layout() {
         // part_of in hi (byte 5,7,9,…), is_a in lo (byte 4,6,8,…), classid LE.
-        let f = Facet::from_parts(0xDEAD_BEEF, [0xAB, 0xCD, 0, 0, 0, 0], [0x01, 0x02, 0, 0, 0, 0]);
+        let f = Facet::from_parts(
+            0xDEAD_BEEF,
+            [0xAB, 0xCD, 0, 0, 0, 0],
+            [0x01, 0x02, 0, 0, 0, 0],
+        );
         let b = f.to_bytes();
         assert_eq!(&b[0..4], &[0xEF, 0xBE, 0xAD, 0xDE]); // classid LE
         assert_eq!(b[4], 0x01); // tier0 lo = is_a
@@ -649,7 +722,11 @@ mod tests {
         assert_eq!(kdnr.part_of_chain()[0], patient.part_of_chain()[0]);
         assert_eq!(save.part_of_chain()[0], patient.part_of_chain()[0]);
         // …and Patient sits one tier shallower than its members.
-        assert_eq!(patient.part_of_chain()[1], 0, "Patient is a part_of root → only tier 0 set");
+        assert_eq!(
+            patient.part_of_chain()[1],
+            0,
+            "Patient is a part_of root → only tier 0 set"
+        );
         assert_ne!(kdnr.part_of_chain()[1], 0, "kdnr is one level deeper");
     }
 
@@ -697,8 +774,20 @@ mod tests {
         }];
         for i in 0..300 {
             let field = format!("m:Big.f{i:03}");
-            tr.push(Triple { s: "m:Big".into(), p: "has_field".into(), o: field.clone(), f: 1.0, c: 0.9 });
-            tr.push(Triple { s: field, p: "rdf:type".into(), o: "ogit:Property".into(), f: 1.0, c: 0.9 });
+            tr.push(Triple {
+                s: "m:Big".into(),
+                p: "has_field".into(),
+                o: field.clone(),
+                f: 1.0,
+                c: 0.9,
+            });
+            tr.push(Triple {
+                s: field,
+                p: "rdf:type".into(),
+                o: "ogit:Property".into(),
+                f: 1.0,
+                c: 0.9,
+            });
         }
 
         // Naive mint collides (the 300 members past index 255 saturate to 255).
@@ -712,14 +801,25 @@ mod tests {
         // Factored mint is injective and truncates nothing (2 tiers suffice).
         let m = mint_factored(&tr);
         let distinct: BTreeSet<_> = m.iter().map(|(_, f)| f).collect();
-        assert_eq!(distinct.len(), m.len(), "factored mint must be injective past 255");
-        assert!(m.truncated().is_empty(), "300 members fit in 2 base-255 tiers");
+        assert_eq!(
+            distinct.len(),
+            m.len(),
+            "factored mint must be injective past 255"
+        );
+        assert!(
+            m.truncated().is_empty(),
+            "300 members fit in 2 base-255 tiers"
+        );
 
         // The members extend the class's part_of prefix (still prefix-routable).
         let big = m.facet("m:Big").unwrap().part_of_chain();
         let f000 = m.facet("m:Big.f000").unwrap().part_of_chain();
         let big_depth = big.iter().take_while(|&&b| b != 0).count();
-        assert_eq!(&f000[..big_depth], &big[..big_depth], "member extends class prefix");
+        assert_eq!(
+            &f000[..big_depth],
+            &big[..big_depth],
+            "member extends class prefix"
+        );
         // is_a tier-0 carries the bounded kind enum (1 = field), never a mega-root rank.
         assert_eq!(m.facet("m:Big.f000").unwrap().is_a_chain()[0], 1);
     }
@@ -736,8 +836,20 @@ mod tests {
         }];
         for i in 0..300 {
             let field = format!("m:Big.f{i:03}");
-            tr.push(Triple { s: "m:Big".into(), p: "has_field".into(), o: field.clone(), f: 1.0, c: 0.9 });
-            tr.push(Triple { s: field, p: "rdf:type".into(), o: "ogit:Property".into(), f: 1.0, c: 0.9 });
+            tr.push(Triple {
+                s: "m:Big".into(),
+                p: "has_field".into(),
+                o: field.clone(),
+                f: 1.0,
+                c: 0.9,
+            });
+            tr.push(Triple {
+                s: field,
+                p: "rdf:type".into(),
+                o: "ogit:Property".into(),
+                f: 1.0,
+                c: 0.9,
+            });
         }
         let m = mint_factored(&tr);
         let cb = m.radix_codebook(Axis::PartOf);
@@ -751,7 +863,11 @@ mod tests {
         let big_depth = big.iter().take_while(|&&b| b != 0).count();
         let members = cb.under_prefix(big, big_depth);
         // Big + its 300 members all share Big's prefix; the members extend it.
-        assert_eq!(members.len(), 301, "Big and its 300 members share the prefix");
+        assert_eq!(
+            members.len(),
+            301,
+            "Big and its 300 members share the prefix"
+        );
         // depth 0 returns the whole codebook.
         assert_eq!(cb.under_prefix([0; TIERS], 0).len(), m.len());
     }
@@ -774,5 +890,126 @@ mod tests {
         });
         assert_eq!(m.facet("medcare:Patient").unwrap().facet_classid(), 0x0901);
         assert_eq!(m.facet("medcare:Patient.kdnr").unwrap().facet_classid(), 0);
+    }
+
+    /// [`mint_from_parents`] mints from PRE-BUILT parent forests — the shape a
+    /// menu minter uses: a `child → parent` `part_of` forest (the INVERTED edge
+    /// direction vs the structural `has_field` `insert(object, subject)`), an
+    /// EMPTY `is_a` forest (menu nodes carry no class inheritance), and a
+    /// classid stamped from the node's own resolver. This guards the seam
+    /// `ogar-from-ruff::mint_menu_facets` will consume:
+    /// - the `part_of` chain is root-first (root shallowest, leaf deepest) —
+    ///   proving the caller's `insert(child, parent)` orientation is correct;
+    /// - the `is_a` chain is `[0; TIERS]` for every node (empty forest).
+    #[test]
+    fn mint_from_parents_mints_a_menu_shaped_forest() {
+        // Menu tree: op:top → op:work_packages → op:wp_summary. The caller
+        // (a menu minter) inserts child → parent from the `part_of` triples.
+        let nodes: BTreeSet<&str> = ["op:top", "op:work_packages", "op:wp_summary"]
+            .into_iter()
+            .collect();
+        let po_parent: BTreeMap<&str, &str> = [
+            ("op:work_packages", "op:top"),
+            ("op:wp_summary", "op:work_packages"),
+        ]
+        .into_iter()
+        .collect();
+        let ia_parent: BTreeMap<&str, &str> = BTreeMap::new(); // no is_a for menu nodes
+
+        let m = mint_from_parents(&nodes, &po_parent, &ia_parent, |n| {
+            if n == "op:work_packages" {
+                0x0102_0001
+            } else {
+                0
+            }
+        });
+
+        let top = m.facet("op:top").unwrap();
+        let wp = m.facet("op:work_packages").unwrap();
+        let summary = m.facet("op:wp_summary").unwrap();
+
+        // Root-first orientation: the root ranks at tier 0 only; each descendant
+        // extends the chain one tier deeper. An inverted `insert(parent, child)`
+        // would put the LEAF at tier 0 and flip this.
+        assert_eq!(top.part_of_chain(), [1, 0, 0, 0, 0, 0]);
+        assert_eq!(wp.part_of_chain(), [1, 1, 0, 0, 0, 0]);
+        assert_eq!(summary.part_of_chain(), [1, 1, 1, 0, 0, 0]);
+
+        // Empty is_a forest → an all-zero is_a chain on every node.
+        assert_eq!(top.is_a_chain(), [0; TIERS]);
+        assert_eq!(wp.is_a_chain(), [0; TIERS]);
+        assert_eq!(summary.is_a_chain(), [0; TIERS]);
+
+        // The node resolver stamps bytes [0..4) (a real classid on the CRUD
+        // spine node, 0 on the others — the zero-fallback ladder).
+        assert_eq!(wp.facet_classid(), 0x0102_0001);
+        assert_eq!(top.facet_classid(), 0);
+        assert_eq!(summary.facet_classid(), 0);
+    }
+
+    /// [`mint_from_parents`] is the factored core of [`mint_with_classid`]:
+    /// feeding it the SAME forests the structural minter builds reproduces the
+    /// structural mint byte-for-byte (the refactor is behaviour-preserving).
+    #[test]
+    fn mint_from_parents_reproduces_the_structural_mint() {
+        let triples = medcare_patient();
+        let via_public =
+            mint_with_classid(
+                &triples,
+                |iri| {
+                    if iri == "medcare:Patient" { 0x0901 } else { 0 }
+                },
+            );
+
+        // Rebuild the structural forests exactly as `mint_with_classid` does.
+        let mut po_parent: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut ia_inherit: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut ia_type: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut nodes: BTreeSet<&str> = BTreeSet::new();
+        for t in &triples {
+            let (s, p, o) = (t.s.as_str(), t.p.as_str(), t.o.as_str());
+            match p {
+                "has_field" | "has_function" => {
+                    po_parent.insert(o, s);
+                    nodes.insert(s);
+                    nodes.insert(o);
+                }
+                "inherits_from" => {
+                    ia_inherit.insert(s, o);
+                    nodes.insert(s);
+                    nodes.insert(o);
+                }
+                "rdf:type" => {
+                    ia_type.insert(s, o);
+                    nodes.insert(s);
+                    nodes.insert(o);
+                }
+                _ => {
+                    nodes.insert(s);
+                }
+            }
+        }
+        let ia_parent: BTreeMap<&str, &str> = nodes
+            .iter()
+            .filter_map(|&n| {
+                ia_inherit
+                    .get(n)
+                    .or_else(|| ia_type.get(n))
+                    .map(|&p| (n, p))
+            })
+            .collect();
+
+        let via_parents = mint_from_parents(&nodes, &po_parent, &ia_parent, |iri| {
+            if iri == "medcare:Patient" { 0x0901 } else { 0 }
+        });
+
+        for n in ["medcare:Patient", "medcare:Patient.kdnr"] {
+            assert_eq!(
+                via_public.facet(n).map(Facet::to_bytes),
+                via_parents.facet(n).map(Facet::to_bytes),
+                "{n} facet must be byte-identical through both entries"
+            );
+        }
+        assert_eq!(via_public.len(), via_parents.len());
     }
 }
