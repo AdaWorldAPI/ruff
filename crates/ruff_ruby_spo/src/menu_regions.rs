@@ -58,7 +58,7 @@
 //! 4. `content_for :sidebar` is a `left_nav` sub-panel, not a region —
 //!    downstream-config concern, irrelevant to this harvester.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -123,6 +123,14 @@ pub struct RegionEntry {
     /// Whether the push declares a `controller:` target — used to distinguish
     /// "no target at all" from "target with the implicit `index` action".
     pub has_controller: bool,
+    /// The `controller:` kwarg's VALUE (e.g. `"/work_packages"`,
+    /// `"/admin/settings"`), when STATICALLY resolvable (a `Sym`/`Str`
+    /// literal) — the identity-binding arm's raw signal (see
+    /// [`derive_model_from_controller`]). `None` for an absent `controller:`
+    /// (mirrors `has_controller == false`) OR a dynamic value (e.g.
+    /// `options[:controller]` in the each-loop expansion — `has_controller`
+    /// stays `true` there, but there is nothing static to derive from).
+    pub controller: Option<String>,
     /// The statically-extractable permission symbols named in the push's `if:`
     /// visibility guard, deduped + sorted for determinism. Empty when the push
     /// has no `if:`, when the guard names no `allowed_*` permission (a bare
@@ -175,6 +183,24 @@ pub struct RegionScanReport {
     pub unresolved_order: usize,
     /// Distinct `menu_names` seen, sorted.
     pub menus: Vec<String>,
+    // ── the `surfaces_concept` identity-binding 4-bucket ledger (SPEC v2) ──
+    /// Entries with no `controller:` target at all — identity dormant BY
+    /// DESIGN (settings/help/external-URL items have no backing model).
+    pub without_concept: usize,
+    /// Entries whose identity is bound from a DECLARED literal (a Rails
+    /// config-row arm, if one is ever added — always 0 today; Rails only
+    /// has the derived arm below). Kept for report-shape parity with the
+    /// Odoo/C# arms, which DO have a declared source.
+    pub with_concept_declared: usize,
+    /// Entries whose `controller:`-derived model token matched the real
+    /// roster — the honest `OpenProjectExtracted` emission.
+    pub with_concept_derived_matched: usize,
+    /// Entries whose `controller:`-derived model token did NOT match the
+    /// real roster — visible refusal (irregular plurals, a namespaced
+    /// controller the `/`-fix doesn't cover, or a genuinely model-less
+    /// controller). A low `with_concept_*` fraction overall is correct, not
+    /// a failure — most menu items are not resource-CRUD screens.
+    pub with_concept_derived_unmatched: usize,
 }
 
 /// One collected `menu.push` site, pre-tab_order-resolution. Frontend-local
@@ -191,6 +217,8 @@ struct Registration {
     /// Whether the push carries a `controller:` target (so a missing `action:`
     /// resolves to the REST-style `index` default rather than no signal at all).
     has_controller: bool,
+    /// The `controller:` kwarg's value. See [`RegionEntry::controller`].
+    controller: Option<String>,
     /// Permission symbols named in the push's `if:` guard (deduped + sorted).
     /// See [`RegionEntry::permissions`].
     permissions: Vec<String>,
@@ -243,6 +271,7 @@ pub fn extract_regions_with_report(
             tab_order,
             action: r.action,
             has_controller: r.has_controller,
+            controller: r.controller,
             permissions: r.permissions,
             file: r.file,
         })
@@ -259,6 +288,16 @@ pub fn extract_regions_with_report(
     menus.sort();
     menus.dedup();
     report.menus = menus;
+
+    // The `surfaces_concept` identity-binding 4-bucket ledger.
+    let roster = crate::schema::model_roster(root);
+    for binding in bind_identities(&entries, &roster) {
+        match binding {
+            IdentityBinding::WithoutConcept => report.without_concept += 1,
+            IdentityBinding::DerivedMatched(_) => report.with_concept_derived_matched += 1,
+            IdentityBinding::DerivedUnmatched => report.with_concept_derived_unmatched += 1,
+        }
+    }
 
     (entries, report)
 }
@@ -663,7 +702,13 @@ fn handle_push(menu: &str, item_override: Option<String>, args: &[Node], w: &mut
     // hash and any trailing kwargs into one vec, so `action`/`controller` are
     // plain key lookups (distinct from the routes arm, which reads routes.rb).
     let action = kwarg(&pairs, "action").and_then(sym_or_str);
-    let has_controller = kwarg(&pairs, "controller").is_some();
+    let controller_kwarg = kwarg(&pairs, "controller");
+    let has_controller = controller_kwarg.is_some();
+    // The literal VALUE, when statically resolvable (a Sym/Str) — `None` for
+    // an absent `controller:` OR a dynamic value (e.g. `options[:controller]`
+    // in the each-loop expansion), same "never fabricated" discipline as
+    // every other static-only extraction in this arm.
+    let controller = controller_kwarg.and_then(sym_or_str);
     let permissions = kwarg(&pairs, "if")
         .map(extract_guard_permissions)
         .unwrap_or_default();
@@ -674,6 +719,7 @@ fn handle_push(menu: &str, item_override: Option<String>, args: &[Node], w: &mut
         position,
         action,
         has_controller,
+        controller,
         permissions,
         file: w.file.clone(),
     });
@@ -1037,7 +1083,11 @@ impl RegionEntry {
             parent: self.parent.as_ref().map(|p| format!("{namespace}:{p}")),
             part_of_tier: Provenance::Authoritative,
             purpose,
+            // Identity is dormant here by design — [`extract_menu_quads`]
+            // binds it in a post-pass (roster cross-check needs `root`,
+            // which this per-entry projection doesn't have).
             identity_concept: None,
+            identity_tier: Provenance::Authoritative,
         }
     }
 
@@ -1066,15 +1116,94 @@ impl RegionEntry {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// The `surfaces_concept` identity-binding arm (SPEC v2, council-consolidated)
+//
+// `controller -> model` is DERIVED, not declared config (unlike Odoo's
+// `res_model` or C#'s `roomAliases`) — deterministic (the same singularize
+// inflection the schema arm uses) but not curated, so it is emitted ONLY
+// after a cross-check against the REAL model roster (the set of models
+// actually backed by a DB table, per `crate::schema::model_roster`). A
+// derived token that doesn't match the roster is a visible refusal
+// (`derived_unmatched`), never a fabricated `surfaces_concept`.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One entry's identity-binding outcome — the 4-bucket conservation ledger's
+/// per-entry classification, index-aligned with the entry slice (same
+/// discipline as [`resolve_tab_orders`]'s parallel `Option<u32>` vec).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityBinding {
+    /// No `controller:` target at all — identity dormant BY DESIGN (a
+    /// settings/help/external-URL item has no backing model to bind).
+    WithoutConcept,
+    /// A `controller:`-derived model token that is NOT in the real model
+    /// roster — the visible failure-rate bucket (irregular plurals, a
+    /// namespaced controller the `/`-fix doesn't cover, or a genuinely
+    /// model-less controller). NOT emitted.
+    DerivedUnmatched,
+    /// A `controller:`-derived model token found in the roster — the
+    /// honest [`Provenance::OpenProjectExtracted`] emission.
+    DerivedMatched(String),
+}
+
+/// `controller:` value -> candidate model-name token: strip a leading `/`,
+/// take the LAST `/`-segment (so `admin/settings` inflects on its meaningful
+/// stem `settings`, NOT the garbage `Admin/setting` a naive `_`-split would
+/// produce), then run it through the SAME table->model inflection the
+/// schema arm uses ([`crate::schema::model_name_for_table`]) — no
+/// duplicated `IRREGULAR` table (E4 discipline, `routes.rs`'s
+/// `singularize_local` comment).
+fn derive_model_from_controller(controller: &str) -> String {
+    let stem = controller.trim_start_matches('/');
+    let last = stem.rsplit('/').next().unwrap_or(stem);
+    crate::schema::model_name_for_table(last)
+}
+
+/// Cross-check every entry's `controller:` target against the real model
+/// `roster`, deriving via [`derive_model_from_controller`]. One
+/// [`IdentityBinding`] per entry, index-aligned with `entries`.
+fn bind_identities(entries: &[RegionEntry], roster: &HashSet<String>) -> Vec<IdentityBinding> {
+    entries
+        .iter()
+        .map(|e| match &e.controller {
+            None => IdentityBinding::WithoutConcept,
+            Some(controller) => {
+                let derived = derive_model_from_controller(controller);
+                if roster.contains(&derived) {
+                    IdentityBinding::DerivedMatched(derived)
+                } else {
+                    IdentityBinding::DerivedUnmatched
+                }
+            }
+        })
+        .collect()
+}
+
 /// Harvest every menu item as a [`MenuQuad`] — the `location`/`purpose` half of
-/// the Klickwege menu quad. Companion to [`extract_regions`] (the layout
-/// plane); both read the same `menu.push` sites. Nodes use the bare
-/// `{namespace}:{item}` grammar.
+/// the Klickwege menu quad, PLUS the `identity` axis (`surfaces_concept`):
+/// each entry's `controller:` target is cross-checked against the real model
+/// roster ([`crate::schema::model_roster`]) via [`bind_identities`]; a
+/// roster match binds `identity_concept` at
+/// [`Provenance::OpenProjectExtracted`], everything else stays dormant
+/// (`None`, [`RegionEntry::to_quad`]'s default). Companion to
+/// [`extract_regions`] (the layout plane); both read the same `menu.push`
+/// sites. Nodes use the bare `{namespace}:{item}` grammar.
 #[must_use]
 pub fn extract_menu_quads(root: &Path, namespace: &str) -> Vec<MenuQuad> {
-    extract_regions(root)
+    let entries = extract_regions(root);
+    let roster = crate::schema::model_roster(root);
+    let bindings = bind_identities(&entries, &roster);
+    entries
         .iter()
-        .map(|e| e.to_quad(namespace))
+        .zip(bindings)
+        .map(|(e, binding)| {
+            let mut quad = e.to_quad(namespace);
+            if let IdentityBinding::DerivedMatched(model) = binding {
+                quad.identity_concept = Some(model);
+                quad.identity_tier = Provenance::OpenProjectExtracted;
+            }
+            quad
+        })
         .collect()
 }
 
@@ -1345,6 +1474,7 @@ mod tests {
             tab_order: Some(3),
             action: None,
             has_controller: false,
+            controller: None,
             permissions: vec![],
             file: "config/initializers/menus.rb".to_string(),
         };
@@ -1411,6 +1541,156 @@ mod tests {
         let part_of = wp.iter().find(|t| t.p == "part_of").unwrap();
         assert_eq!(part_of.s, "openproject:work_packages");
         assert_eq!(part_of.o, "openproject:overview");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // The `surfaces_concept` identity-binding arm (SPEC v2)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Write a minimal `db/migrate/tables/<table>.rb` baseline-squash
+    /// fixture so `crate::schema::model_roster` sees `<table>` as a
+    /// real, table-backed model — the roster the identity-binding arm
+    /// cross-checks derived tokens against.
+    fn write_roster_table(root: &Path, table: &str) {
+        write_file(
+            root,
+            &format!("db/migrate/tables/{table}.rb"),
+            &format!("create_table :{table} do |t|\n  t.string :name\nend\n"),
+        );
+    }
+
+    /// A `controller:`-derived token that MATCHES the roster (`work_packages`
+    /// -> `WorkPackage`, present in the fixture roster) binds
+    /// `identity_concept` at `OpenProjectExtracted`, and the emitted
+    /// `surfaces_concept` triple carries that tier's `(0.95, 0.88)` truth —
+    /// NOT the hardcoded `Authoritative` the pre-fix `to_triples` emitted.
+    #[test]
+    fn derived_identity_matched_binds_open_project_extracted() {
+        let root = scratch_dir("identity_matched");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :work_packages, { controller: \"/work_packages\", action: \"index\" }\n\
+             end\n",
+        );
+        write_roster_table(&root, "work_packages");
+
+        let (entries, report) = extract_regions_with_report(&root, "openproject");
+        assert_eq!(report.with_concept_derived_matched, 1, "{report:?}");
+        assert_eq!(report.with_concept_derived_unmatched, 0, "{report:?}");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+
+        let quads = extract_menu_quads(&root, "openproject");
+        let q = quads
+            .iter()
+            .find(|q| q.node == "openproject:work_packages")
+            .unwrap();
+        assert_eq!(q.identity_concept.as_deref(), Some("WorkPackage"));
+        assert_eq!(q.identity_tier, Provenance::OpenProjectExtracted);
+
+        let triples = q.to_triples();
+        let sc = triples
+            .iter()
+            .find(|t| t.p == "surfaces_concept")
+            .unwrap_or_else(|| panic!("no surfaces_concept triple: {triples:?}"));
+        assert_eq!(sc.o, "WorkPackage");
+        assert_eq!(
+            (sc.f, sc.c),
+            Provenance::OpenProjectExtracted.truth(),
+            "must NOT be the hardcoded Authoritative tier"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A namespaced controller (`admin/settings`) derives on its LAST
+    /// `/`-segment (`settings` -> `Setting`), not a naive `_`-split garbage
+    /// token (`Admin/setting`) — the `/`-aware fix (SPEC v2 §5).
+    #[test]
+    fn namespaced_controller_derives_on_last_path_segment() {
+        let root = scratch_dir("identity_namespaced");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :admin_menu do |menu|\n\
+             \x20 menu.push :settings, { controller: \"/admin/settings\" }\n\
+             end\n",
+        );
+        write_roster_table(&root, "settings");
+
+        let quads = extract_menu_quads(&root, "openproject");
+        let q = quads
+            .iter()
+            .find(|q| q.node == "openproject:settings")
+            .unwrap();
+        assert_eq!(q.identity_concept.as_deref(), Some("Setting"));
+        assert_eq!(q.identity_tier, Provenance::OpenProjectExtracted);
+
+        let (_, report) = extract_regions_with_report(&root, "openproject");
+        assert_eq!(report.with_concept_derived_matched, 1, "{report:?}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `controller:`-derived token that does NOT match the roster (no
+    /// backing table for `widgets` in this fixture) emits NO
+    /// `surfaces_concept` — a visible refusal counted in
+    /// `derived_unmatched`, never a fabricated binding.
+    #[test]
+    fn derived_identity_unmatched_emits_nothing() {
+        let root = scratch_dir("identity_unmatched");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :widgets, { controller: \"/widgets\", action: \"index\" }\n\
+             end\n",
+        );
+        // No roster fixture at all -> no table backs `widgets`.
+
+        let (_, report) = extract_regions_with_report(&root, "openproject");
+        assert_eq!(report.with_concept_derived_matched, 0, "{report:?}");
+        assert_eq!(report.with_concept_derived_unmatched, 1, "{report:?}");
+
+        let quads = extract_menu_quads(&root, "openproject");
+        let q = quads
+            .iter()
+            .find(|q| q.node == "openproject:widgets")
+            .unwrap();
+        assert_eq!(q.identity_concept, None);
+        assert!(
+            !q.to_triples().iter().any(|t| t.p == "surfaces_concept"),
+            "unmatched derivation must not emit surfaces_concept"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A menu item with no `controller:` target at all (a URL/settings-only
+    /// push) is identity-dormant BY DESIGN — `without_concept`, not a
+    /// failure to derive anything.
+    #[test]
+    fn no_controller_target_is_without_concept() {
+        let root = scratch_dir("identity_without_concept");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :help, \"https://example.com/help\"\n\
+             end\n",
+        );
+
+        let (_, report) = extract_regions_with_report(&root, "openproject");
+        assert_eq!(report.without_concept, 1, "{report:?}");
+        assert_eq!(report.with_concept_derived_matched, 0, "{report:?}");
+        assert_eq!(report.with_concept_derived_unmatched, 0, "{report:?}");
+
+        let quads = extract_menu_quads(&root, "openproject");
+        let q = quads.iter().find(|q| q.node == "openproject:help").unwrap();
+        assert_eq!(q.identity_concept, None);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1589,6 +1869,12 @@ mod tests {
             entries.iter().filter(|e| e.menu == "top_menu").collect();
         assert!(!top_menu_items.is_empty(), "{report:?}");
 
+        // The `surfaces_concept` identity-binding 4-bucket ledger (SPEC v2):
+        // the CRUD spine (`work_packages`/`projects`/`time_entries`) is the
+        // load-bearing nav core, so at least one derived token must resolve
+        // against the real model roster.
+        assert!(report.with_concept_derived_matched >= 1, "{report:?}");
+
         eprintln!(
             "region-arm corpus probe: {} files, {} map_blocks, {} items, {} with_parent, {} unresolved",
             report.files_scanned,
@@ -1597,14 +1883,25 @@ mod tests {
             report.with_parent,
             report.unresolved_order,
         );
+        eprintln!(
+            "identity-binding ledger: without_concept={} with_concept_declared={} \
+             with_concept_derived_matched={} with_concept_derived_unmatched={}",
+            report.without_concept,
+            report.with_concept_declared,
+            report.with_concept_derived_matched,
+            report.with_concept_derived_unmatched,
+        );
     }
 
     /// Non-corpus fixture — the twin of `ruff_spo_triplet::nav_digest::tests::
     /// menu_quad_lowers_location_as_a_classid_radix_path`, but for the BARE
-    /// fallback path a Rails `MenuQuad` actually exercises: `to_quad` never
-    /// binds `identity_concept`, so no `surfaces_concept`/classid ever
-    /// resolves and `menu_address`'s fallback (bare screen name per
-    /// ancestor) is the ONLY path this arm's harvest can hit. Hand-build a
+    /// fallback path this hand-built triple set exercises: no `part_of`
+    /// ancestor here binds `identity_concept` (`None` on every quad below,
+    /// mirroring `to_quad`'s own dormant default — the roster-verified
+    /// binding lives in `extract_menu_quads`'s post-pass, not in `to_quad`
+    /// itself), so no `surfaces_concept`/classid triple exists for
+    /// `menu_address` to resolve and its fallback (bare screen name per
+    /// ancestor) is the only path THIS fixture can hit. Hand-build a
     /// 3-level chain (root -> child -> grandchild) via `MenuQuad::parent`,
     /// lower through `build_nav_digest`, and assert the grandchild's `loc`
     /// is the root-first 3-segment bare-name path with `action=navigate`,
@@ -1621,6 +1918,7 @@ mod tests {
                 part_of_tier: Provenance::Authoritative,
                 purpose: PurposeRole::List,
                 identity_concept: None,
+                identity_tier: Provenance::Authoritative,
             },
             MenuQuad {
                 node: "app:child_item".to_string(),
@@ -1628,6 +1926,7 @@ mod tests {
                 part_of_tier: Provenance::Authoritative,
                 purpose: PurposeRole::Detail,
                 identity_concept: None,
+                identity_tier: Provenance::Authoritative,
             },
             MenuQuad {
                 node: "app:grandchild_item".to_string(),
@@ -1635,6 +1934,7 @@ mod tests {
                 part_of_tier: Provenance::Authoritative,
                 purpose: PurposeRole::Form,
                 identity_concept: None,
+                identity_tier: Provenance::Authoritative,
             },
         ];
         let triples: Vec<Triple> = quads.iter().flat_map(MenuQuad::to_triples).collect();
@@ -1682,6 +1982,18 @@ mod tests {
     /// menu-quad-only triple set never emits) — every parentless node is
     /// `action=leaf` with a single-segment address equal to its own bare
     /// name. This is asserted explicitly below rather than assumed.
+    ///
+    /// **Identity-tier note:** `extract_menu_quads` now binds
+    /// `identity_concept` (`surfaces_concept`) for CRUD-spine nodes whose
+    /// derived `controller -> model` token is roster-verified — see
+    /// `derived_identity_matched_binds_open_project_extracted` above. That
+    /// does NOT change this probe's expected `loc`/`action` shape:
+    /// `ExamConfig::default()` carries an empty `codebook`, so
+    /// `resolve_token` never resolves ANY `surfaces_concept` token here
+    /// (bound or not) — `classid_of` stays empty and `menu_address`'s bare-
+    /// name fallback is exercised exactly as before. A real codebook (Lane
+    /// B's `mint_menu_facets`) is what turns a bound identity into a
+    /// resolved `id=0x<ID>`, not this structure-only probe.
     #[test]
     #[allow(clippy::print_stderr)] // diagnostic emission gated on env var (real-corpus gate)
     fn corpus_probe_menu_quad_round_trip_over_openproject() {
