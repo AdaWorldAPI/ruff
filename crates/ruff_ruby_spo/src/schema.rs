@@ -108,7 +108,7 @@
 //!   `t.exclusion_constraint` lines are constraint/index facts, not
 //!   columns — skipped here (a later slice can lift them).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -266,6 +266,31 @@ pub fn extract_app_with_schema(source_tree: &Path, namespace: &str) -> (ModelGra
     }
 
     (graph, report)
+}
+
+/// The set of Rails-inflected model names backed by a real DB table — the
+/// roster [`crate::menu_regions`]'s identity-binding arm cross-checks a
+/// `controller → model` derived token against before emitting
+/// `surfaces_concept` at [`ruff_spo_triplet::Provenance::OpenProjectExtracted`].
+///
+/// Lightweight: parses only the migration/table DSL via the same
+/// baseline-vs-classic layout sniffing [`extract_app_with_schema`] uses
+/// (`db/migrate/tables/*.rb` squash if present, else `db/migrate/*.rb`
+/// classic replay) — no class-body extraction, no [`ModelGraph`] built. The
+/// roster IS the honesty mechanism: a derived token that doesn't name a real
+/// table-backed model resolves to `derived_unmatched`, never a fabricated
+/// `surfaces_concept`.
+#[must_use]
+pub(crate) fn model_roster(source_tree: &Path) -> HashSet<String> {
+    let use_classic_migrations = !dir_has_rb_files(&source_tree.join("db/migrate/tables"))
+        && dir_has_rb_files(&source_tree.join("db/migrate"));
+    let mut report = SchemaReport::default();
+    let tables = if use_classic_migrations {
+        parse_migrations_dir(source_tree, &mut report)
+    } else {
+        parse_tables_dir(source_tree, &mut report)
+    };
+    tables.into_iter().map(|t| t.model_name).collect()
 }
 
 /// **D-AR-3.5 compute linkage.** For each `def compute_<x>` in `model.functions`,

@@ -28,17 +28,30 @@
 //! multi-line tag has been observed here, unlike the arch-body scan
 //! [`super::odoo_regions`] needs a full-text tokenizer for).
 //!
+//! # Identity binding (`surfaces_concept`, SPEC v2)
+//!
+//! Odoo's identity binding is the EASY arm (unlike Rails' derived
+//! `controller -> singularize -> model`): the target action's
+//! `res_model` (`account.move`) IS the model token directly — a DECLARED
+//! literal read verbatim from `<field name="res_model">…</field>`, no
+//! inflection, no roster cross-check needed. `identity_concept` is bound
+//! from the SAME `act_window` join [`collect_action_records`] already does
+//! for `view_mode`, at [`Provenance::Authoritative`] (the declaration IS
+//! the fact — same certainty tier as C#'s `roomAliases` config row, per
+//! the shared [`ruff_spo_triplet::MenuQuad::identity_tier`] doc).
+//!
 //! # What is NOT captured (by design, not oversight)
 //!
-//! - **`identity_concept`** — deferred to the concept-binding arm, exactly
-//!   like the Rails quad arm.
-//! - **Menuitems with no resolvable action, or an action with no
-//!   `view_mode`** — classify to the fallback [`PurposeRole::Detail`], the
-//!   same "no signal → plain navigation trigger" doctrine the Rails arm
-//!   applies to a target-less push (there it falls to `Action`; here Odoo's
-//!   own semantics make an actionless/modeless menuitem a bare navigation
-//!   entry, so `Detail` is the honest default rather than borrowing Rails'
-//!   `Action` label for a different frontend's vocabulary).
+//! - **Menuitems with no resolvable action, an action with no `res_model`
+//!   (a server action), or no `view_mode`** — classify to the fallback
+//!   [`PurposeRole::Detail`], the same "no signal → plain navigation
+//!   trigger" doctrine the Rails arm applies to a target-less push (there
+//!   it falls to `Action`; here Odoo's own semantics make an
+//!   actionless/modeless menuitem a bare navigation entry, so `Detail` is
+//!   the honest default rather than borrowing Rails' `Action` label for a
+//!   different frontend's vocabulary). The same actionless/modeless
+//!   menuitem also leaves `identity_concept` at `None` — no model, no
+//!   identity, honest refusal.
 
 use std::fs;
 use std::path::Path;
@@ -92,6 +105,11 @@ struct MenuItemRaw {
     /// The target action's first `view_mode` token, or `""` when the
     /// menuitem has no resolvable action / the action has no `view_mode`.
     view_mode_token: String,
+    /// The target action's `res_model`, verbatim (`account.move`) — the
+    /// `identity` axis's DECLARED-literal token. `None` when the menuitem
+    /// has no resolvable action, or the action has no `res_model` (a
+    /// server action).
+    res_model: Option<String>,
 }
 
 /// Harvest every `<menuitem>` as a [`MenuQuad`] — the `location`/`purpose`
@@ -111,12 +129,12 @@ pub fn extract_menu_quads(root: &Path, namespace: &str) -> Vec<MenuQuad> {
         xml_contents.push((relative_path(root, path), content));
     }
 
-    // Pass 1: every act_window record's (xml_id -> first `view_mode` token),
-    // across ALL files — addons split actions and menuitems across files
-    // (mirrors odoo_nav's Shape B cross-file join).
-    let mut actions: Vec<(String, Option<String>)> = Vec::new();
+    // Pass 1: every act_window record's (xml_id -> (first `view_mode` token,
+    // `res_model`)), across ALL files — addons split actions and menuitems
+    // across files (mirrors odoo_nav's Shape B cross-file join).
+    let mut actions: Vec<(String, Option<String>, Option<String>)> = Vec::new();
     for (_, content) in &xml_contents {
-        collect_action_view_modes(content, &mut actions);
+        collect_action_records(content, &mut actions);
     }
 
     // Pass 2: menuitems, joined against the addon-wide action map.
@@ -138,18 +156,28 @@ pub fn extract_menu_quads(root: &Path, namespace: &str) -> Vec<MenuQuad> {
                 parent: item.parent.map(|p| format!("{namespace}:{p}")),
                 part_of_tier: Provenance::Authoritative,
                 purpose,
-                identity_concept: None,
+                // A DECLARED literal (`res_model`), read verbatim — no
+                // inflection, no roster cross-check. Authoritative: the
+                // declaration IS the fact.
+                identity_concept: item.res_model,
+                identity_tier: Provenance::Authoritative,
             }
         })
         .collect()
 }
 
 /// Pass 1: append every `<record id="X" model="ir.actions.act_window">`
-/// block's `(xml_id -> first view_mode token)` from one file into the
-/// ADDON-WIDE `actions` map (mirrors
-/// `odoo_nav::collect_act_window_records`, reading `view_mode` instead of
-/// `res_model`).
-fn collect_action_view_modes(content: &str, actions: &mut Vec<(String, Option<String>)>) {
+/// block's `(xml_id -> (first view_mode token, res_model))` from one file
+/// into the ADDON-WIDE `actions` map (mirrors
+/// `odoo_nav::collect_act_window_records`, reading BOTH `view_mode` — the
+/// `purpose` axis's signal — and `res_model` verbatim — the `identity`
+/// axis's DECLARED-literal token, unlike `odoo_nav`'s `normalize_model`
+/// which dot-to-underscore normalizes it for screen-name matching; here the
+/// raw dotted form IS the model token `PortSpec::class_id` resolves).
+fn collect_action_records(
+    content: &str,
+    actions: &mut Vec<(String, Option<String>, Option<String>)>,
+) {
     let mut in_record: Option<usize> = None; // index into `actions`
     for line in content.lines() {
         let t = line.trim();
@@ -157,7 +185,7 @@ fn collect_action_view_modes(content: &str, actions: &mut Vec<(String, Option<St
             && t.contains("model=\"ir.actions.act_window\"")
             && let Some(id) = attr_value(t, "id")
         {
-            actions.push((id, None));
+            actions.push((id, None, None));
             in_record = Some(actions.len() - 1);
         } else if t.starts_with("<record") {
             // A different record kind closes any open act_window context.
@@ -171,20 +199,27 @@ fn collect_action_view_modes(content: &str, actions: &mut Vec<(String, Option<St
         {
             let first = modes.split(',').next().unwrap_or("").trim().to_string();
             actions[idx].1 = Some(first);
+        } else if let Some(idx) = in_record
+            && t.starts_with("<field")
+            && attr_value(t, "name").as_deref() == Some("res_model")
+            && let Some(model) = tag_text(t)
+        {
+            actions[idx].2 = Some(model);
         }
     }
 }
 
 /// Pass 2: `<menuitem id="X" parent="Y" action="Z"/>` lines in one file,
-/// each recorded as a [`MenuItemRaw`] with its `view_mode_token` resolved by
-/// joining `action` against the addon-wide action map (module-qualified
-/// `action="mod.X"` joins on its local part, mirroring
+/// each recorded as a [`MenuItemRaw`] with its `view_mode_token`/`res_model`
+/// resolved by joining `action` against the addon-wide action map
+/// (module-qualified `action="mod.X"` joins on its local part, mirroring
 /// `odoo_nav::scan_menuitems`). A menuitem with no `action`, or whose action
-/// has no known `view_mode`, gets an empty token (classifies to the
-/// fallback).
+/// has no known `view_mode`/`res_model`, gets an empty token / `None` (the
+/// former classifies to the fallback purpose; the latter leaves identity
+/// dormant).
 fn scan_menuitems(
     content: &str,
-    actions: &[(String, Option<String>)],
+    actions: &[(String, Option<String>, Option<String>)],
     items: &mut Vec<MenuItemRaw>,
 ) {
     for line in content.lines() {
@@ -193,23 +228,25 @@ fn scan_menuitems(
             && let Some(id) = attr_value(t, "id")
         {
             let parent = attr_value(t, "parent");
-            let view_mode_token = attr_value(t, "action")
-                .and_then(|action_ref| {
-                    let local = action_ref
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(&action_ref)
-                        .to_string();
-                    actions
-                        .iter()
-                        .find(|(aid, _)| *aid == local || *aid == action_ref)
-                        .and_then(|(_, vm)| vm.clone())
-                })
+            let matched = attr_value(t, "action").and_then(|action_ref| {
+                let local = action_ref
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&action_ref)
+                    .to_string();
+                actions
+                    .iter()
+                    .find(|(aid, _, _)| *aid == local || *aid == action_ref)
+            });
+            let view_mode_token = matched
+                .and_then(|(_, vm, _)| vm.clone())
                 .unwrap_or_default();
+            let res_model = matched.and_then(|(_, _, rm)| rm.clone());
             items.push(MenuItemRaw {
                 id,
                 parent,
                 view_mode_token,
+                res_model,
             });
         }
     }
@@ -291,6 +328,45 @@ mod tests {
         assert_eq!(
             quad(&quads, "menu_child").parent.as_deref(),
             Some("odoo:menu_root")
+        );
+
+        cleanup(dir);
+    }
+
+    /// Identity: the target action's `res_model`, read verbatim (no
+    /// inflection) — a DECLARED literal, `Authoritative` tier. A menuitem
+    /// with no `action` at all, or whose action has no `res_model`, leaves
+    /// `identity_concept` at `None`.
+    #[test]
+    fn identity_binds_from_declared_res_model_verbatim() {
+        let dir = tempdir("identity");
+        write(&dir, "views/menu.xml", MENU_XML);
+
+        let quads = extract_menu_quads(&dir, "odoo");
+        assert_eq!(
+            quad(&quads, "menu_child").identity_concept.as_deref(),
+            Some("account.move")
+        );
+        assert_eq!(
+            quad(&quads, "menu_child").identity_tier,
+            Provenance::Authoritative
+        );
+        // No `action` at all -> no res_model -> dormant identity.
+        assert_eq!(quad(&quads, "menu_root").identity_concept, None);
+
+        let triples = quad(&quads, "menu_child").to_triples();
+        let sc = triples
+            .iter()
+            .find(|t| t.p == "surfaces_concept")
+            .unwrap_or_else(|| panic!("no surfaces_concept triple: {triples:?}"));
+        assert_eq!(sc.o, "account.move");
+        assert_eq!((sc.f, sc.c), Provenance::Authoritative.truth());
+        // A dormant identity emits no surfaces_concept triple at all.
+        assert!(
+            !quad(&quads, "menu_root")
+                .to_triples()
+                .iter()
+                .any(|t| t.p == "surfaces_concept")
         );
 
         cleanup(dir);
