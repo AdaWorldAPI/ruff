@@ -346,6 +346,22 @@ closed-vocab predicates already apply (so you extend rather than invent).
 
 ### 8.1 odoo → odoo-rs  [G — closest fit to existing vocab]
 
+> **Status update (2026-07-16): the region-grammar row below is BUILT and
+> live, no longer prospective.** ruff #79 shipped the Odoo arm
+> (`ruff_python_spo::extract_odoo_view_regions` — arch element stack,
+> innermost-container docking, depth-0 comodel exclusion, `root` fallback
+> for `<xpath>` extension views pending the `inherit_id` join); its merge
+> promoted `RegionFact`/`region_triples` into `ruff_spo_triplet` as the
+> shared frontend-agnostic carrier (canonical `{screen}.{control}` subject,
+> one `build_nav_digest` for Odoo/Rails/WinForms). The consumer half closed
+> in odoo-rs #35 (`odoo_regions.conf` + `[regions]` digest + a live-harvest
+> byte-parity fuse over real `account` views — no `unmapped:` leak). The
+> kausal arms also closed end-to-end (ruff #49 → OGAR #168/#169/#192:
+> 11/11 real-source kausal pin), and OGAR #192 shipped the V3 SoA sink
+> (`CompiledClass` → 512-B CANON `NodeRow`). Remaining odoo slag: the
+> `inherit_id` region join; the od-server hydration writer (odoo-rs #36's
+> named follow-up).
+
 - **Ore source:** Python models + XML views. Harvester: **`ruff_python_spo`**.
 - **METHOD axis:** `_name`/`_inherit` classes, `@api.model`/`@api.depends`
   methods, `_compute_*` bodies (fuzzy → recipe codebook, `fuzzy-recipe-codebook.md`).
