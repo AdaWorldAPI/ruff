@@ -1,0 +1,24 @@
+[package]
+name = "ruff_ruby_spo"
+version = "0.1.0"
+publish = false
+edition = "2024"
+rust-version = "1.86"
+description = "SCAFFOLD: Ruby/Rails (OpenProject) frontend for ruff_spo_triplet. Walks an app/models tree and fills a language-agnostic ModelGraph, which expands to the same SPO triples as the Python/Odoo frontend. Extraction points are todo!() stubs documented with the exact Rails construct to read; the target triple shape is already locked by a passing test."
+license = "MIT"
+
+[lib]
+name = "ruff_ruby_spo"
+
+[dependencies]
+ruff_spo_triplet = { workspace = true }
+
+# Pure-Rust Ruby parser (typed AST, no Ruby runtime). Operator-locked
+# direction for D-AR-3 (the real extractor): the AST gives us
+# class-body node access without the brittleness of line/regex scanning,
+# so the 67-name DSL routing dispatches on `Node` variants instead of
+# string prefixes.
+lib-ruby-parser = { version = "4.0", default-features = false }
+
+[lints]
+workspace = true
