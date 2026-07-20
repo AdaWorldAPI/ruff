@@ -3,6 +3,8 @@ fail_fast: false
 exclude: |
   (?x)^(
     .github/workflows/release.yml|
+    \.claude/.*|
+    crates/ruff_python_dto_check/tests/golden/.*|
     crates/ty_vendored/vendor/.*|
     crates/ty_project/resources/.*|
     crates/ty/docs/(configuration|rules|cli|environment).md|

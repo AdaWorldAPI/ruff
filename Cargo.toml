@@ -40,6 +40,9 @@ ruff_python_stdlib = { version = "0.0.5", path = "crates/ruff_python_stdlib" }
 ruff_python_trivia = { version = "0.0.5", path = "crates/ruff_python_trivia" }
 ruff_server = { version = "0.0.5", path = "crates/ruff_server" }
 ruff_source_file = { version = "0.0.5", path = "crates/ruff_source_file" }
+# AdaWorldAPI SPO/transcode crates (fork-internal; not published to crates.io)
+ruff_cpp_codegen = { path = "crates/ruff_cpp_codegen" }
+ruff_spo_triplet = { path = "crates/ruff_spo_triplet" }
 ruff_mdtest = { path = "crates/ruff_mdtest" }
 ruff_ranged_value = { version = "0.0.5", path = "crates/ruff_ranged_value" }
 ruff_text_size = { version = "0.0.5", path = "crates/ruff_text_size" }

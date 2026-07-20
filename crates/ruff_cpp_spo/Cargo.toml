@@ -1,0 +1,63 @@
+[package]
+name = "ruff_cpp_spo"
+version = "0.1.0"
+publish = false
+edition = "2024"
+rust-version = "1.86"
+description = "C++ machine-plane frontend for ruff_spo_triplet. Walks a C++ corpus (Tesseract first) via libclang and fills a language-agnostic ModelGraph, which expands to the same SPO triples as the Python/Odoo and Ruby/Rails frontends. The per-TU walker (`walk_tu`, behind the `libclang` feature) is implemented and tested against real libclang; the corpus-tree orchestration (`extract`) remains. C++ source corpora stay UPSTREAM — never vendored into this repo or into tesseract-rs."
+license = "MIT"
+
+[lib]
+name = "ruff_cpp_spo"
+
+[dependencies]
+ruff_spo_triplet = { workspace = true }
+
+# libclang C++ parser, behind the non-default `libclang` feature so the
+# workspace builds with zero system deps by default. `runtime` = dlopen
+# libclang at runtime (no link-time version coupling); set `LIBCLANG_PATH`
+# (e.g. /usr/lib/llvm-18/lib) if it is not on the default search path. The
+# shared `ruff_spo_triplet` core stays serde-only — the FFI dep lives ONLY
+# here.
+# `clang_5_0` gates the exception-specification API (noexcept detection);
+# it is the compile-time binding level — runtime libclang may be newer
+# (libclang-18 is fine: newer is backward-compatible). `runtime` = dlopen.
+clang = { version = "2", optional = true, default-features = false, features = [
+    "runtime",
+    "clang_5_0",
+] }
+
+[features]
+# Enables the real libclang walker (`walk_tu`). Off by default.
+libclang = ["dep:clang"]
+
+# The harvest example needs the libclang walker; `required-features` keeps a
+# plain `cargo build --all-targets` (no features) from trying to compile it.
+[[example]]
+name = "harvest_unicharset"
+required-features = ["libclang"]
+
+[[example]]
+name = "harvest_network"
+required-features = ["libclang"]
+
+[[example]]
+name = "harvest_tesseract_dict"
+required-features = ["libclang"]
+
+[[example]]
+name = "harvest_textord"
+required-features = ["libclang"]
+
+[[example]]
+name = "harvest_leptonica_scale"
+required-features = ["libclang"]
+
+[dev-dependencies]
+# End-to-end pipeline test only (harvest -> reassemble -> ruff_cpp_codegen emit).
+# The harvester does NOT depend on the codegen at runtime — this is the test
+# integration point where both ends of the C++->Rust pipeline meet.
+ruff_cpp_codegen = { workspace = true }
+
+[lints]
+workspace = true
