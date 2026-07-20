@@ -14,6 +14,7 @@ extend-exclude = [
 ]
 
 [default.extend-words]
+nd = "nd"
 "arange" = "arange"  # e.g. `numpy.arange`
 hel = "hel"
 whos = "whos"
@@ -25,6 +26,13 @@ BA = "BA" # acronym for "Bad Allowed", used in testing.
 jod = "jod" # e.g., `jod-thread`
 Numer = "Numer" # Library name 'NumerBlox' in "Who's Using Ruff?"
 CPY = "CPY"  # it's a Ruff rule category
+# AdaWorldAPI SPO/transcode fork vocabulary
+mis = "mis"  # "mis-" prefix in domain prose (mis-attribution, mis-encode, mis-parse)
+oce = "oce"  # C# harvester var for ObjectCreationExpressionSyntax
+tage = "tage"  # DTO codegen test-fixture field name
+statistc = "statistc"  # real Tesseract header filename (ccstruct/statistc.h)
+modul = "modul"  # guard-predicate category in a harvester comment
+Aparent = "Aparent"  # deliberate test identifier (sibling of Zparent)
 
 [default]
 extend-ignore-re = [
