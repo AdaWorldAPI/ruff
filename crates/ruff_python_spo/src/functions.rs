@@ -59,7 +59,14 @@ use crate::{RawMethod, expr_str};
 /// ruby's `AR_MUTATORS`: deliberately narrow (not every call, just the ORM's
 /// own mutator vocabulary) per `.claude/knowledge/fuzzy-recipe-codebook.md`
 /// §2.
-const ORM_MUTATORS: &[&str] = &["create", "write", "unlink", "update", "copy", "flush_recordset"];
+const ORM_MUTATORS: &[&str] = &[
+    "create",
+    "write",
+    "unlink",
+    "update",
+    "copy",
+    "flush_recordset",
+];
 
 /// Analyse a method into its decorator + body facts.
 pub(crate) fn analyze_method(func: &StmtFunctionDef) -> RawMethod {

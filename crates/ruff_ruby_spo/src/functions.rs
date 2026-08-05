@@ -1373,7 +1373,10 @@ class M
 end
 "#,
         );
-        assert!(funcs[0].writes.is_empty(), "ivar or-asgn must not be a field write");
+        assert!(
+            funcs[0].writes.is_empty(),
+            "ivar or-asgn must not be a field write"
+        );
         assert!(funcs[0].guarded_writes.is_empty());
     }
 

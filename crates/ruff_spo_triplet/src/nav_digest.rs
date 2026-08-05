@@ -460,7 +460,10 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
         } else {
             "leaf"
         };
-        let _ = writeln!(out, "{node}  loc={loc}  purpose={purpose}  id={id}  action={action}");
+        let _ = writeln!(
+            out,
+            "{node}  loc={loc}  purpose={purpose}  id={id}  action={action}"
+        );
     }
 
     out
@@ -581,7 +584,12 @@ mod tests {
                 "form",
                 Provenance::Inferred,
             ),
-            Triple::new("app:Invoice", Predicate::Purpose, "list", Provenance::Inferred),
+            Triple::new(
+                "app:Invoice",
+                Predicate::Purpose,
+                "list",
+                Provenance::Inferred,
+            ),
         ]
     }
 
@@ -702,17 +710,44 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
             ..ExamConfig::default()
         };
         let triples = vec![
-            Triple::new("app:Root", Predicate::SurfacesConcept, "root_c", Provenance::Authoritative),
-            Triple::new("app:Mid", Predicate::SurfacesConcept, "mid_c", Provenance::Authoritative),
-            Triple::new("app:Leaf", Predicate::SurfacesConcept, "leaf_c", Provenance::Authoritative),
-            Triple::new("app:Mid", Predicate::PartOf, "app:Root", Provenance::Inferred),
-            Triple::new("app:Leaf", Predicate::PartOf, "app:Mid", Provenance::Inferred),
+            Triple::new(
+                "app:Root",
+                Predicate::SurfacesConcept,
+                "root_c",
+                Provenance::Authoritative,
+            ),
+            Triple::new(
+                "app:Mid",
+                Predicate::SurfacesConcept,
+                "mid_c",
+                Provenance::Authoritative,
+            ),
+            Triple::new(
+                "app:Leaf",
+                Predicate::SurfacesConcept,
+                "leaf_c",
+                Provenance::Authoritative,
+            ),
+            Triple::new(
+                "app:Mid",
+                Predicate::PartOf,
+                "app:Root",
+                Provenance::Inferred,
+            ),
+            Triple::new(
+                "app:Leaf",
+                Predicate::PartOf,
+                "app:Mid",
+                Provenance::Inferred,
+            ),
             Triple::new("app:Leaf", Predicate::Purpose, "form", Provenance::Inferred),
         ];
         let digest = build_nav_digest(&triples, &config);
         // Leaf's location is the full ancestor classid path, root-first.
         assert!(
-            digest.contains("Leaf  loc=0x0900/0x0910/0x0911  purpose=form  id=0x0911  action=navigate"),
+            digest.contains(
+                "Leaf  loc=0x0900/0x0910/0x0911  purpose=form  id=0x0911  action=navigate"
+            ),
             "leaf must lower to the pure radix path 0x0900/0x0910/0x0911:\n{digest}"
         );
         // Root: parentless, has no out-edge here, so it is a leaf node with its
@@ -727,8 +762,18 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
     #[test]
     fn menu_quad_conflicting_part_of_is_order_independent() {
         let mut triples = vec![
-            Triple::new("app:Leaf", Predicate::PartOf, "app:Zparent", Provenance::Inferred),
-            Triple::new("app:Leaf", Predicate::PartOf, "app:Aparent", Provenance::Inferred),
+            Triple::new(
+                "app:Leaf",
+                Predicate::PartOf,
+                "app:Zparent",
+                Provenance::Inferred,
+            ),
+            Triple::new(
+                "app:Leaf",
+                Predicate::PartOf,
+                "app:Aparent",
+                Provenance::Inferred,
+            ),
         ];
         let forward = build_nav_digest(&triples, &config());
         triples.reverse();
