@@ -249,6 +249,9 @@ mod tests {
     #[test]
     fn malformed_region_row_with_no_separator_is_skipped() {
         let cfg = parse("region=bogus\nregion=left:left_nav\n");
-        assert_eq!(cfg.regions, vec![("left".to_string(), "left_nav".to_string())]);
+        assert_eq!(
+            cfg.regions,
+            vec![("left".to_string(), "left_nav".to_string())]
+        );
     }
 }

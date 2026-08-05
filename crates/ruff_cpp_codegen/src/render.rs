@@ -207,7 +207,14 @@ mod tests {
         // generated text stops compiling in the consumer repo (operator-gated,
         // rarely run) — this catches the render side in-env. (baton-auditor
         // boundary guard.)
-        for field in ["name:", "params:", "ret:", "is_const:", "is_static:", "overrides:"] {
+        for field in [
+            "name:",
+            "params:",
+            "ret:",
+            "is_const:",
+            "is_static:",
+            "overrides:",
+        ] {
             assert!(
                 s.contains(field),
                 "rendered MethodSig literal must carry the `{field}` field"

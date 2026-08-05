@@ -470,7 +470,11 @@ class AccountMove(models.Model):
         write(&dir, "models/account_move.py", PY_ACTION);
         let v = vocab(&["account_move_line"]);
         let (edges, report) = extract_odoo_nav_edges_with_report(&dir, &v);
-        assert_eq!(edges.len(), 1, "exactly the literal-res_model edge: {edges:?}");
+        assert_eq!(
+            edges.len(),
+            1,
+            "exactly the literal-res_model edge: {edges:?}"
+        );
         assert_eq!(edges[0].source, "account_move");
         assert_eq!(edges[0].target, "account_move_line");
         assert_eq!(edges[0].via, "act_window_return");
@@ -532,7 +536,10 @@ class MoveExt(models.Model):
         // `account_move_lines` (plural) deliberately does NOT match.
         let v = vocab(&["account_move_lines"]);
         let (edges, report) = extract_odoo_nav_edges_with_report(&dir, &v);
-        assert!(edges.is_empty(), "exact matching must reject the plural: {edges:?}");
+        assert!(
+            edges.is_empty(),
+            "exact matching must reject the plural: {edges:?}"
+        );
         assert_eq!(report.raw_act_window_refs, 2);
         cleanup(dir);
     }
