@@ -26,6 +26,7 @@
 //! | 3b · **slag** | [`slag`] | addressed residual rows; shape id + reason; **no `Other`, ever** |
 //! | — · drill key + config tree | [`facet`], [`convention`] | the 16-byte address, and longest-prefix-wins config over it |
 //! | 4 · DTO / codebook factoring | [`vocab`] | feeds lance-graph `ogar_codebook` **read-only** |
+//! | 5 · sink | [`sink`] | where refined truth lands — trait + offline backend; lance-graph SoA is implemented downstream, not here |
 //! | — · artifact set | `examples/harvest_r2il.rs` | the deliverable, per MedCare-rs / openproject-nexgen-rs |
 //!
 //! Refined concern *contracts* are a later, measured furnace output. This crate does not invent
@@ -66,5 +67,6 @@ pub mod convention;
 pub mod facet;
 pub mod furnace;
 pub mod ore;
+pub mod sink;
 pub mod slag;
 pub mod vocab;
