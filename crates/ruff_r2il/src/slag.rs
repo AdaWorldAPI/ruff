@@ -51,7 +51,7 @@ use crate::ore::{FactProvenance, OpTag};
 // FNV-1a 64, implemented inline — no hashing dependency. The exact constants
 // from the FNV specification.
 const FNV_OFFSET_BASIS_64: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME_64: u64 = 0x1_0000_0001_b3;
+const FNV_PRIME_64: u64 = 0x0100_0000_01b3;
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = FNV_OFFSET_BASIS_64;
@@ -145,9 +145,7 @@ impl ResidualReason {
             ResidualReason::CustomSpaceNotInConvention { .. } => "custom_space_not_in_convention",
             ResidualReason::FacetOverflowAtKey { .. } => "facet_overflow_at_key",
             ResidualReason::VariadicArity { .. } => "variadic_arity",
-            ResidualReason::PhiFanInExceedsPredecessors { .. } => {
-                "phi_fan_in_exceeds_predecessors"
-            }
+            ResidualReason::PhiFanInExceedsPredecessors { .. } => "phi_fan_in_exceeds_predecessors",
             ResidualReason::MemoryObjectEscaped => "memory_object_escaped",
             ResidualReason::IndirectTarget => "indirect_target",
             ResidualReason::NoFacetCoordinate => "no_facet_coordinate",

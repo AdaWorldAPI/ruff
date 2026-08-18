@@ -193,12 +193,17 @@ impl FunctionBehavior {
     /// `(block_addr, op_idx)` → `InstId`, via `SsaGraph::inst_id_for_op_site`. The inverse of
     /// [`Self::op_site`] — see §8 test 6's round trip.
     pub fn inst_at(&self, block_addr: u64, op_idx: usize) -> Option<InstId> {
-        self.artifact.graph().inst_id_for_op_site(block_addr, op_idx)
+        self.artifact
+            .graph()
+            .inst_id_for_op_site(block_addr, op_idx)
     }
 
     /// `ValueId` → the `SSAVar` it interns, via `SsaGraph::value`.
     pub fn value_var(&self, value: ValueId) -> Option<&SSAVar> {
-        self.artifact.graph().value(value).map(|graph_value| &graph_value.var)
+        self.artifact
+            .graph()
+            .value(value)
+            .map(|graph_value| &graph_value.var)
     }
 
     /// `ValueId` → the `InstId` that defines it, via `SsaGraph::def_inst`.
@@ -266,9 +271,7 @@ mod tests {
         assert!(FunctionBehavior::from_blocks_raw(&[], None).is_none());
 
         let mut single = R2ILBlock::new(0x2000, 2);
-        single.push(r2il::R2ILOp::Return {
-            target: con(0, 8),
-        });
+        single.push(r2il::R2ILOp::Return { target: con(0, 8) });
         assert!(FunctionBehavior::from_blocks_raw(&[single], None).is_some());
     }
 

@@ -356,7 +356,7 @@ mod tests {
     }
 
     /// 1. `vocab_table_is_order_independent` — the same 5 names in two orders (one with
-    /// duplicates) build equal tables; anti-vacuity: `len() == 5` and at least two ids differ.
+    ///    duplicates) build equal tables; anti-vacuity: `len() == 5` and at least two ids differ.
     #[test]
     fn vocab_table_is_order_independent() {
         let ordered = VocabTable::from_names(["alpha", "beta", "gamma", "delta", "epsilon"]);
@@ -374,8 +374,8 @@ mod tests {
     }
 
     /// 2. `harvest_counts_every_userop_mention_but_interns_names_once` — two `CallOther`s sharing
-    /// `userop: 7` plus one with `9` → `unique_userops == 2`, `userop_mentions == 3` (both
-    /// exact), reused name interned once.
+    ///    `userop: 7` plus one with `9` → `unique_userops == 2`, `userop_mentions == 3` (both
+    ///    exact), reused name interned once.
     ///
     /// The fixture: a single `Return`-terminated block (proven ingestible in isolation by
     /// `behavior::tests::empty_block_list_is_none_not_a_panic`) whose first two `CallOther`s both
@@ -424,8 +424,9 @@ mod tests {
     }
 
     /// 3. (recommended) `typed_custom_space_ids_are_the_oracle_for_the_string_set` —
-    /// `custom_space_ids_from_blocks == {7}`; the string-recovered set equals it on this fixture,
-    /// with a doc comment recording that the equality is a measurement, not a guarantee.
+    ///    `custom_space_ids_from_blocks == {7}`; the string-recovered set equals it on this
+    ///    fixture, with a doc comment recording that the equality is a measurement, not a
+    ///    guarantee.
     #[test]
     fn typed_custom_space_ids_are_the_oracle_for_the_string_set() {
         let mut block = R2ILBlock::new(0x1010, 4);

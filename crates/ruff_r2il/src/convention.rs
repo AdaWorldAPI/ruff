@@ -271,12 +271,19 @@ fn push_row_toml(out: &mut String, row: &ConventionRow) {
             out.push_str("prefix_depth = 1\n");
             out.push_str(&format!("space = {discriminant}\n"));
         }
-        FacetPrefix::SpaceOffset { discriminant, offset } => {
+        FacetPrefix::SpaceOffset {
+            discriminant,
+            offset,
+        } => {
             out.push_str("prefix_depth = 2\n");
             out.push_str(&format!("space = {discriminant}\n"));
             out.push_str(&format!("offset = {offset}\n"));
         }
-        FacetPrefix::SpaceOffsetSize { discriminant, offset, size } => {
+        FacetPrefix::SpaceOffsetSize {
+            discriminant,
+            offset,
+            size,
+        } => {
             out.push_str("prefix_depth = 3\n");
             out.push_str(&format!("space = {discriminant}\n"));
             out.push_str(&format!("offset = {offset}\n"));
@@ -372,7 +379,8 @@ mod tests {
         let known = Varnode::register(0, 8);
         let known_facet = project(&known, conv.spaces()).expect("must project");
         assert_eq!(
-            conv.resolved_prefix(&known_facet).map(|prefix| prefix.depth()),
+            conv.resolved_prefix(&known_facet)
+                .map(|prefix| prefix.depth()),
             Some(3),
             "a known register must resolve to the depth-3 row"
         );
@@ -386,7 +394,8 @@ mod tests {
             .expect("an unknown register offset must still fall through to the space row");
         assert_eq!(row.state, ValidationState::Unmeasured);
         assert_eq!(
-            conv.resolved_prefix(&unknown_facet).map(|prefix| prefix.depth()),
+            conv.resolved_prefix(&unknown_facet)
+                .map(|prefix| prefix.depth()),
             Some(1),
             "an unknown register offset must resolve at depth 1, not depth 3 and not None"
         );
@@ -397,7 +406,10 @@ mod tests {
         let mut conv = R2ilConvention::minimal_pass_one();
         let discriminant = SPACE_REGISTER;
         let offset: u64 = 0x10;
-        let coarse_prefix = FacetPrefix::SpaceOffset { discriminant, offset };
+        let coarse_prefix = FacetPrefix::SpaceOffset {
+            discriminant,
+            offset,
+        };
         let fine_prefix = FacetPrefix::SpaceOffsetSize {
             discriminant,
             offset,
