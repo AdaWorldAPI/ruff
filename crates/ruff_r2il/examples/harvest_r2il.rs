@@ -13,12 +13,12 @@
 //!
 //! - `r2il-pass1.ore.tsv`      — one row per melted `FlatFact`, `smelt` order, `at` as 32 hex chars
 //! - `r2il-pass1-census.md`    — `furnace::census()` by fact kind / by opcode (`BTreeMap` order)
-//! - `r2il-pass1-slag.tsv`     — `ResidualLedger::grouped()` + `by_address()`, merged across every
-//!                               harvested function
+//! - `r2il-pass1-slag.tsv` — `ResidualLedger::grouped()` + `by_address()`, merged across
+//!   every harvested function
 //! - `r2il-convention.toml`    — `R2ilConvention::to_toml()`, the one convention every function used
 //! - `PROVENANCE.md`           — corpus manifest (FNV-1a 64, not a sha), commit pin, env caps
-//! - `TRIAGE-RESULT.md`        — the three pre-registered bars B1/B2/B3, stated BEFORE the measured
-//!                               section, plus the non-bar 60-80% Op-classify prediction
+//! - `TRIAGE-RESULT.md` — the three pre-registered bars B1/B2/B3, stated BEFORE the measured
+//!   section, plus the non-bar 60-80% Op-classify prediction
 //!
 //! **These artifacts are evidence, never a re-ingest path — nothing in ruff parses them back.**
 //!
@@ -30,6 +30,19 @@
 //! ```sh
 //! cargo run --manifest-path crates/ruff_r2il/Cargo.toml --features lift --example harvest_r2il
 //! ```
+
+// The workspace `clippy.toml` disallows `std::fs::*` and `std::env::var` with the reason "Use
+// System::… instead **in ty crates**" — that policy exists so ty routes filesystem access through
+// its `System` virtual-filesystem abstraction for testability. This is not a ty crate: `ruff_r2il`
+// is workspace-EXCLUDED and does not (and should not) depend on `ty`, so `System` is unreachable
+// here. The writes below are the deliverable itself — real harvest artifacts on real disk — and
+// the env reads are the documented `R2IL_HARVEST_*` overrides. Suppressed narrowly and visibly
+// (`expect`, per the repo's "prefer expect over allow" rule) rather than evaded by reaching for a
+// non-disallowed API, which would hide that this crate sits outside the policy.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "not a ty crate: `System` is unavailable to this workspace-excluded crate, and these are the example's real artifact writes and documented env overrides"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -100,6 +113,14 @@ fn pass_one_seven() -> [OpTag; 7] {
 /// `phi_fan_in_exceeds_predecessors` / `variadic_arity` / `no_facet_coordinate` — reasons that can
 /// only fire on a non-seven opcode or a row with no parent op at all — must belong to a
 /// seven-opcode parent. Labelled an APPROXIMATION in `TRIAGE-RESULT.md`, not an exact count.
+/// Merged `ResidualLedger::grouped()` rows, keyed by `(shape_id.0, reason)` -> `(count, example
+/// facet bytes)`. Aliased because the tuple-in-map shape trips `clippy::type_complexity` at both
+/// its definition and its render-fn parameter.
+type ReasonBucket = BTreeMap<(u64, &'static str), (usize, Option<[u8; 16]>)>;
+
+/// Merged `ResidualLedger::by_address()` rows, keyed by `(resolved prefix, shape_id.0)` -> count.
+type AddrBucket = BTreeMap<(Option<FacetPrefix>, u64), usize>;
+
 const SEVEN_ELIGIBLE_RESIDUAL_REASONS: &[&str] = &[
     "no_convention_row_at_address",
     "indirect_target",
@@ -124,7 +145,7 @@ mod elf {
     const SHF_EXECINSTR: u64 = 0x4;
     const STT_FUNC: u8 = 2;
 
-    pub struct Section {
+    pub(crate) struct Section {
         pub name: String,
         pub sh_type: u32,
         pub flags: u64,
@@ -134,22 +155,22 @@ mod elf {
     }
 
     impl Section {
-        pub fn is_exec(&self) -> bool {
+        pub(crate) fn is_exec(&self) -> bool {
             self.flags & SHF_EXECINSTR != 0 && self.sh_type != SHT_NOBITS
         }
 
-        pub fn contains_range(&self, addr: u64, size: u64) -> bool {
+        pub(crate) fn contains_range(&self, addr: u64, size: u64) -> bool {
             addr >= self.addr && addr.saturating_add(size) <= self.addr.saturating_add(self.size)
         }
     }
 
-    pub struct FuncSym {
+    pub(crate) struct FuncSym {
         pub name: String,
         pub value: u64,
         pub size: u64,
     }
 
-    pub struct ElfInfo {
+    pub(crate) struct ElfInfo {
         pub sections: Vec<Section>,
         /// `STT_FUNC` symbols with `st_size > 0`, each already verified to sit inside a single
         /// executable section. Sorted, deduped by address.
@@ -194,7 +215,7 @@ mod elf {
 
     /// Parse an ELF64 LE x86-64 binary's header, section headers, and `STT_FUNC` symbol table.
     /// Returns `None` the instant any read is out of bounds or a fixed-field check fails.
-    pub fn parse(data: &[u8]) -> Option<ElfInfo> {
+    pub(crate) fn parse(data: &[u8]) -> Option<ElfInfo> {
         if data.len() < 64 {
             return None;
         }
@@ -268,7 +289,7 @@ mod elf {
                     symtab.entsize as usize
                 };
                 if entsize > 0 {
-                    let count = symtab.size as usize / entsize;
+                    let count = (symtab.size as usize).checked_div(entsize).unwrap_or(0);
                     for i in 0..count {
                         let Some(rel) = i.checked_mul(entsize) else {
                             break;
@@ -469,9 +490,9 @@ struct Accum {
     rows: Vec<OreRow>,
     /// Merged `ResidualLedger::grouped()` output across every harvested function, keyed by
     /// `(shape_id.0, reason)`.
-    reason_bucket: BTreeMap<(u64, &'static str), (usize, Option<[u8; 16]>)>,
+    reason_bucket: ReasonBucket,
     /// Merged `ResidualLedger::by_address()` output across every harvested function.
-    addr_bucket: BTreeMap<(Option<FacetPrefix>, u64), usize>,
+    addr_bucket: AddrBucket,
     combined: HarvestReport,
     remaining_func_budget: usize,
 }
@@ -480,10 +501,18 @@ struct Accum {
 // Per-binary / per-function driver
 // ================================================================================================
 
+/// The three handles that stay INVARIANT across every function of every binary: one
+/// `Disassembler`, one `ArchSpec`, one `R2ilConvention` (built once by `from_arch`, per §11).
+/// Bundled so the per-binary driver takes a context rather than eight positional parameters —
+/// the grouping is the readable shape, and it also settles `clippy::too_many_arguments`.
+struct LiftCtx<'a> {
+    disasm: &'a Disassembler,
+    spec: &'a ArchSpec,
+    conv: &'a R2ilConvention,
+}
+
 fn process_elf_symtab_functions(
-    disasm: &Disassembler,
-    spec: &ArchSpec,
-    conv: &R2ilConvention,
+    ctx: &LiftCtx<'_>,
     binary_label: &str,
     data: &[u8],
     info: &elf::ElfInfo,
@@ -543,7 +572,7 @@ fn process_elf_symtab_functions(
             continue;
         }
 
-        let blocks = lift_function_blocks(disasm, code, func.value);
+        let blocks = lift_function_blocks(ctx.disasm, code, func.value);
         if blocks.is_empty() {
             eprintln!(
                 "[harvest] {binary_label}: fn '{}' @ {:#x} produced no liftable blocks, skip",
@@ -552,7 +581,7 @@ fn process_elf_symtab_functions(
             continue;
         }
 
-        let Some(behavior) = FunctionBehavior::from_blocks_raw(&blocks, Some(spec)) else {
+        let Some(behavior) = FunctionBehavior::from_blocks_raw(&blocks, Some(ctx.spec)) else {
             eprintln!(
                 "[harvest] {binary_label}: fn '{}' @ {:#x} — from_blocks_raw returned None, skip",
                 func.name, func.value
@@ -561,7 +590,7 @@ fn process_elf_symtab_functions(
         };
         let behavior = behavior.with_name(func.name.clone());
 
-        let (facts, ledger, report) = furnace::smelt(&behavior, &blocks, conv);
+        let (facts, ledger, report) = furnace::smelt(&behavior, &blocks, ctx.conv);
 
         accum.combined.harvested += report.harvested;
         accum.combined.classified += report.classified;
@@ -685,10 +714,7 @@ fn render_census_md(all_facts: &[FlatFact]) -> String {
     out
 }
 
-fn render_slag_tsv(
-    reason_bucket: &BTreeMap<(u64, &'static str), (usize, Option<[u8; 16]>)>,
-    addr_bucket: &BTreeMap<(Option<FacetPrefix>, u64), usize>,
-) -> String {
+fn render_slag_tsv(reason_bucket: &ReasonBucket, addr_bucket: &AddrBucket) -> String {
     let mut grouped: Vec<(u64, &'static str, usize, Option<[u8; 16]>)> = Vec::new();
     for (&(shape_id, reason), &(count, example)) in reason_bucket.iter() {
         grouped.push((shape_id, reason, count, example));
@@ -978,9 +1004,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let processed = process_elf_symtab_functions(
-            &disasm,
-            &spec,
-            &conv,
+            &LiftCtx {
+                disasm: &disasm,
+                spec: &spec,
+                conv: &conv,
+            },
             &label,
             &data,
             &info,
