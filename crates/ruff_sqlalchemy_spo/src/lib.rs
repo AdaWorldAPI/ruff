@@ -12,16 +12,16 @@
 //!   `WoA`'s convention, unlike Odoo's dotted `_name`; the `__tablename__`
 //!   value is recorded but not used as the model identity).
 //! - `col = db.Column(db.TYPE(...), nullable=, primary_key=, default=,
-//!   db.ForeignKey('table.col'))` → a [`Field`] (see [`columns`] for the
-//!   type-mapping table in [`types`]).
+//!   db.ForeignKey('table.col'))` → a [`Field`] (see `columns` for the
+//!   type-mapping table in `types`).
 //! - `rel = db.relationship('Target', backref=…, uselist=…)` → an
-//!   [`ruff_spo_triplet::AssocDecl`] (see [`relationships`]), opportunistically
+//!   [`ruff_spo_triplet::AssocDecl`] (see `relationships`), opportunistically
 //!   paired with a sibling FK column by the `<name>_id` convention — the raw
 //!   FK column is ALSO kept as a plain typed `Field` (mirrors the Rails
 //!   design: physical column + declared association, deduped downstream by
 //!   OGAR's `project_sqlalchemy_fields`, not here).
 //! - `def foo(self, …):` → a name-only [`Function`] (schema-only v0; body
-//!   facts are a follow-up — see [`functions`]).
+//!   facts are a follow-up — see `functions`).
 //!
 //! # Module layout (`SoC` mandate — Ruling a)
 //!
@@ -29,15 +29,15 @@
 //! dialect (Django, Sequel) can reuse the type-mapper without inheriting the
 //! Flask-SQLAlchemy-specific column/relationship recognition.
 //!
-//! - [`parse`] — source → raw classes (mirrors `ruff_python_spo::parse`).
-//! - [`walk`] — one class body → a [`RawClass`].
-//! - [`columns`] — the column-walker (`db.Column(...)` → [`columns::RawColumn`]).
-//! - [`relationships`] — the relationship-walker (`db.relationship(...)` →
-//!   [`relationships::RawRelationship`] + the to-one/to-many heuristic +
+//! - `parse` — source → raw classes (mirrors `ruff_python_spo::parse`).
+//! - `walk` — one class body → a `RawClass`.
+//! - `columns` — the column-walker (`db.Column(...)` → `columns::RawColumn`).
+//! - `relationships` — the relationship-walker (`db.relationship(...)` →
+//!   `relationships::RawRelationship` + the to-one/to-many heuristic +
 //!   FK pairing into [`ruff_spo_triplet::AssocDecl`]).
-//! - [`types`] — the SQLAlchemy DSL → `field_type` mapping table, standalone
+//! - `types` — the SQLAlchemy DSL → `field_type` mapping table, standalone
 //!   so it's reusable by a future dialect frontend.
-//! - [`functions`] — method harvest (name-only in v0).
+//! - `functions` — method harvest (name-only in v0).
 
 use std::fs;
 use std::path::Path;

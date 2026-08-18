@@ -105,7 +105,7 @@ fn push_unique(v: &mut Vec<String>, item: &str) {
 /// Reassemble a flat SPO triple stream into a [`ModelGraph`] on the
 /// **core-7 plane** (`Model::fields` / `Model::functions`) — the shape a
 /// "class + typed fields + methods" frontend (C#/Roslyn, Java, …) emits,
-/// and the shape [`crate::mint`]-adjacent consumers
+/// and the shape `crate::mint`-adjacent consumers
 /// (`ogar-from-ruff::compile_graph_csharp`) walk.
 ///
 /// Distinct from [`crate::reassemble::reassemble`], which recovers the

@@ -99,7 +99,7 @@ pub struct Model {
     /// language's plain "extends `<name>`"). Names are already
     /// frontend-normalised (dot→underscore); the expander emits
     /// `(ns:model, inherits_from, ns:parent)` per entry with
-    /// [`Provenance::Authoritative`]. Distinct from `bases` (C++ base
+    /// `Provenance::Authoritative`. Distinct from `bases` (C++ base
     /// classes, `CppExtracted`) and `sti` (single-parent Rails STI): a
     /// multi-parent list carrying no per-parent metadata. Self-references
     /// (an Odoo reopen where the sole `_inherit` == the model name) are
