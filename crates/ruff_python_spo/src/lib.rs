@@ -45,6 +45,7 @@ use std::path::Path;
 use ruff_python_ast::Expr;
 use ruff_spo_triplet::{Field, Function, Model, ModelGraph};
 
+mod drill;
 mod functions;
 mod navigation;
 mod odoo_nav;
@@ -56,6 +57,7 @@ mod plain;
 mod templates;
 mod walk;
 
+pub use drill::{CandidateRow, CrossCorpusRow, RowScope, classify_across_corpora, propose};
 pub use navigation::{
     NavScanReport, NavVocab, PyNavEdge, extract_nav_edges, extract_nav_edges_with_report,
 };
