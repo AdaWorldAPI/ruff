@@ -36,6 +36,11 @@ scarry = "scarry"
 # Tesseract really does ship `src/ccstruct/statistc.h` under that spelling.
 # "Correcting" it points the harvest docs at a file that does not exist.
 statistc = "statistc"
+# `oce` is the C# harvester's local for an ObjectCreationExpressionSyntax
+# pattern binding; `tage` is a legacy column name carried by a codegen fixture.
+# Both are identifiers under test — renaming them changes what is exercised.
+oce = "oce"
+tage = "tage"
 
 [default]
 extend-ignore-re = [
