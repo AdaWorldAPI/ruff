@@ -501,7 +501,7 @@ mod tests {
     /// Fence for the known codec edge (collapse-spec §2): the shared subject
     /// codec ([`RegionSubject::from_iri`](ruff_spo_triplet::RegionSubject))
     /// decodes on the LAST `.`, so a control that itself contains a `.` (a rare
-    /// Odoo related-field path like `currency_id.symbol`) would mis-split. On
+    /// Odoo related-field path like `currency_id.symbol`) would split wrongly. On
     /// this corpus controls are Python identifiers / `%(...)d` action refs —
     /// dotless. If a real dotted control ever appears this trips, and the
     /// canonical separator must escalate to `::` (with the C# harvester
@@ -512,7 +512,7 @@ mod tests {
         for f in &facts {
             assert!(
                 !f.control.contains('.'),
-                "dotted control {:?} would mis-rsplit through the shared subject codec",
+                "dotted control {:?} would rsplit wrongly through the shared subject codec",
                 f.control
             );
         }

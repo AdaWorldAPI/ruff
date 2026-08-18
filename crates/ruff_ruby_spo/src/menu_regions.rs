@@ -896,7 +896,7 @@ fn positional_args(args: &[Node]) -> Vec<&Node> {
 // (`Setting.*` / `admin?` / `logged?`). Both operands of a disjunction are
 // GUARDED-BY the item's visibility, so BOTH are emitted — the honest
 // weaker claim the OQ-GUARD-1 probe established (a flat "requires" would
-// mis-encode the one real disjunction in the corpus). Dynamic permission
+// misencode the one real disjunction in the corpus). Dynamic permission
 // arguments (a `Hash`/method-call, not a `Sym` literal) yield no symbol —
 // nothing is fabricated.
 // ─────────────────────────────────────────────────────────────────────────
@@ -2290,7 +2290,7 @@ mod tests {
     /// A disjunction (`allowed_globally?(:add_project) ||
     /// allowed_in_project?(:add_subprojects, project)`) → BOTH symbols
     /// emitted. This is the honest `guarded_by` semantics: both permissions
-    /// appear in the visibility guard, so a flat "requires" would mis-encode
+    /// appear in the visibility guard, so a flat "requires" would misencode
     /// it. (The `allowed_in_project?(:sym, project)` shape keeps `:sym` FIRST
     /// — the `project` receiver-context arg trails it, so this is normal-form,
     /// not receiver-style.)

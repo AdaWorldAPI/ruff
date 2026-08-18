@@ -1015,9 +1015,12 @@ and report — do not improvise a different one. Dependency direction: `facet �
     ```
 
     (`exclude` wins over the `crates/*` glob; the root `Cargo.lock` must stay untouched.)
+
 1. Run every gate in §15 centrally, once. Fix cross-file fallout itself — do not re-fan-out.
+
 1. Run the harvest example; commit the artifact set under `.claude/harvest/r2il/`, with
     `TRIAGE-RESULT.md`'s bar section written **before** the run and the measured section after.
+
 1. Commit on `claude/ruff-r2il-lancegraph-3tdt8d` with the board update in the **same** commit:
     plan open items **O1** and **O3** get measured values; the four honesty notes (§2) are recorded.
     Push and open the PR.

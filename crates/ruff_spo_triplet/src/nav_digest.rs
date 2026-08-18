@@ -59,7 +59,7 @@ fn control_of(iri: &str) -> &str {
 /// (`0x<ID>`) when it resolves, else its screen name (fallback). There is no
 /// stored ordinal — the address IS the walked rail (V3 LE-contract §3: the
 /// existing concept ontology is the radix trie; menu location is a path
-/// through it). Cycle-guarded and depth-bounded so a mis-declared `part_of`
+/// through it). Cycle-guarded and depth-bounded so a misdeclared `part_of`
 /// cycle terminates instead of looping.
 fn menu_address(
     node: &str,
@@ -668,7 +668,7 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
         // dot is NOT mistaken for the control boundary).
         assert!(
             digest.contains("widget_views.xml#view_form / center: partner_id(0)"),
-            "Odoo dotted-screen fact missing/mis-split in [regions]:\n{digest}"
+            "Odoo dotted-screen fact missing or wrongly split in [regions]:\n{digest}"
         );
     }
 
@@ -774,7 +774,7 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
             Triple::new(
                 "app:Leaf",
                 Predicate::PartOf,
-                "app:Aparent",
+                "app:Apparent",
                 Provenance::Inferred,
             ),
         ];
@@ -785,14 +785,14 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
             forward, reversed,
             "conflicting part_of must be order-independent"
         );
-        // Aparent (lexicographically smallest) is the canonical parent.
+        // Apparent (lexicographically smallest) is the canonical parent.
         assert!(
             forward.contains("Leaf  loc=Aparent/Leaf"),
             "smallest parent must win deterministically:\n{forward}"
         );
     }
 
-    /// A mis-declared `part_of` cycle must terminate (cycle-guarded walk), not
+    /// A misdeclared `part_of` cycle must terminate (cycle-guarded walk), not
     /// loop forever — the address is the bounded chain up to the first repeat.
     #[test]
     fn menu_quad_part_of_cycle_terminates() {
