@@ -393,11 +393,11 @@ mod tests {
     use super::*;
     use ruff_spo_triplet::{Predicate, Provenance};
 
-    /// A neutral synthetic view exercising: a `<header>` button (top_bar), a
-    /// `<searchpanel>` field (left_nav), a `<sheet>` field + a `<notebook>`
-    /// field (center), a `oe_chatter` div field (right_panel), a comodel field
+    /// A neutral synthetic view exercising: a `<header>` button (`top_bar`), a
+    /// `<searchpanel>` field (`left_nav`), a `<sheet>` field + a `<notebook>`
+    /// field (center), a `oe_chatter` div field (`right_panel`), a comodel field
     /// nested inside a `line_ids` field (must NOT dock), and an
-    /// `type="action"` button (opens_popup). No corpus tokens — all invented.
+    /// `type="action"` button (`opens_popup`). No corpus tokens — all invented.
     const FIXTURE: &str = r#"
 <odoo>
   <record id="view_widget_form" model="ir.ui.view">

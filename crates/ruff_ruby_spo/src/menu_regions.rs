@@ -1769,7 +1769,7 @@ mod tests {
     /// treated this as a cycle and emitted `unresolved_order`; that was a
     /// divergence from Rails, caught by the correctness adversary.)
     ///   alpha after:beta -> beta absent -> plain add -> [alpha]
-    ///   beta  after:alpha -> alpha at 0 -> add_at 1  -> [alpha, beta]
+    ///   beta  after:alpha -> alpha at 0 -> `add_at` 1  -> [alpha, beta]
     #[test]
     fn mutual_after_reference_resolves_deterministically_single_pass() {
         let root = scratch_dir("mutual_after");
@@ -1827,8 +1827,8 @@ mod tests {
     /// `last_count`), so the trailing `last:` band is still {a}; the plain
     /// `c` inserts just before it. A phase-separated model that applied Last
     /// after Before/After would push `b` to the very end — the confirmed bug.
-    ///   a last  -> push, last_count=1        -> [a]
-    ///   b after:a -> a at 0 -> add_at 1      -> [a, b]  (last_count still 1)
+    ///   a last  -> push, `last_count=1`        -> [a]
+    ///   b after:a -> a at 0 -> `add_at` 1      -> [a, b]  (`last_count` still 1)
     ///   c plain -> insert at 2-1=1           -> [a, c, b]
     #[test]
     fn plain_push_after_splice_onto_last_respects_live_boundary() {
@@ -1989,7 +1989,7 @@ mod tests {
     /// probe below for the same finding on real data).
     #[test]
     fn menu_quad_round_trip_lowers_bare_name_chain_without_classid() {
-        let quads = vec![
+        let quads = [
             MenuQuad {
                 node: "app:root_item".to_string(),
                 parent: None,
@@ -2145,6 +2145,10 @@ mod tests {
         // Independent radix-walk mirroring `nav_digest::menu_address`'s
         // fallback path (bare node name per ancestor — Rails MenuQuads never
         // bind `identity_concept`, so classid resolution never fires here).
+        #[expect(
+            clippy::items_after_statements,
+            reason = "helper is scoped to this one probe test and reads clearest right where it's used"
+        )]
         fn expected_address(node: &str, parent_of: &BTreeMap<String, String>) -> String {
             let mut chain = Vec::new();
             let mut seen = BTreeSet::new();

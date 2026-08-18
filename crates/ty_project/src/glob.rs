@@ -107,7 +107,7 @@ impl Default for IncludeExcludeFilter {
 
 impl std::fmt::Display for IncludeExcludeFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "include={}, exclude={}", &self.include, &self.exclude)
+        write!(f, "include={}, exclude={}", self.include, self.exclude)
     }
 }
 

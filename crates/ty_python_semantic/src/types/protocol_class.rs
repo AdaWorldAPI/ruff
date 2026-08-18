@@ -504,10 +504,10 @@ impl<'db> ProtocolMemberData<'db> {
                     ProtocolMemberKind::Property(property) => {
                         let mut d = f.debug_struct("PropertyMember");
                         if let Some(getter) = property.getter(self.db) {
-                            d.field("getter", &format_args!("`{}`", &getter.display(self.db)));
+                            d.field("getter", &format_args!("`{}`", getter.display(self.db)));
                         }
                         if let Some(setter) = property.setter(self.db) {
-                            d.field("setter", &format_args!("`{}`", &setter.display(self.db)));
+                            d.field("setter", &format_args!("`{}`", setter.display(self.db)));
                         }
                         d.finish()
                     }

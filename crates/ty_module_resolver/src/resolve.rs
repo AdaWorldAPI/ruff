@@ -2237,7 +2237,7 @@ mod tests {
             Some(foo_real),
             path_to_module(&db, &FilePath::System(src.join("foo.py")))
         );
-        assert!(foo_real != foo);
+        assert_ne!(foo_real, foo);
     }
 
     #[test]

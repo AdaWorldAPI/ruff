@@ -177,7 +177,7 @@ fn check_class_declaration<'db>(
             {
                 let mut diagnostic = builder.into_diagnostic(format_args!(
                     "Cannot overwrite NamedTuple attribute `{}`",
-                    &member.name
+                    member.name
                 ));
                 diagnostic.info("This will cause the class creation to fail at runtime");
             }
@@ -287,7 +287,7 @@ fn check_class_declaration<'db>(
                         ) {
                             let mut diagnostic = builder.into_diagnostic(format_args!(
                                 "Enum member `{}` value is not assignable to expected type",
-                                &member.name
+                                member.name
                             ));
                             diagnostic.info(format_args!(
                                 "Expected `{}`, got `{}`",
@@ -1061,7 +1061,7 @@ fn check_explicit_overrides<'db>(
     }
     diagnostic.info(format_args!(
         "No `{member}` definitions were found on any superclasses of `{class}`",
-        member = &member.name,
+        member = member.name,
         class = class.name(db)
     ));
 }
