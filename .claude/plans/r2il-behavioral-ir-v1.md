@@ -239,6 +239,50 @@ flattening. Do not mistake the cleanliness of r2il's Rust types for
 refinement — that mistake is exactly the "privileged direct path" the pivot
 forbids.
 
+## CARRIED FORWARD (2026-08-18) — the ruff/r2sleigh half of the console ruling
+
+The operator's Ghidra-console ruling belongs to a different session; the
+console, the Java extension, and the forensic product families are **out of
+scope here**. Four of its requirements are pure ruff/r2sleigh R2IL properties
+and DO carry momentum into PR 1. Recorded so they are not re-derived:
+
+**C1 — the library seam must survive an external caller.** Falsifiable test:
+*could a thin external caller analyze one function and obtain structured
+ore/furnace/slag results without parsing CLI strings or NDJSON?* **Measured
+YES** — every entry point is a typed Rust fn over library types
+(`FunctionBehavior::from_blocks_raw`, `furnace::smelt`, `ResidualLedger::*`,
+`HarvestReport::*`); the CLI/TSV/TOML surfaces exist ONLY inside the two
+`lift`-gated examples, whose artifacts are declared *evidence, never a
+re-ingest path*. **Do not seal the API around CLI-only assumptions** — no RPC
+protocol now, just keep the typed seam public.
+
+**C2 — provenance must reach the native instruction, not just the block.**
+`FactProvenance.op_site: (block_addr, op_idx)` →
+`R2ILBlock::op_metadata[op_idx].instruction_addr: Option<u64>`
+(r2il `metadata.rs:103`: *"Source instruction address for this operation when
+lifted as part of a block"*). **SSA does not carry it**, so this sidecar
+rejoin IS the anchor — the same `(block_addr, op_idx)` key
+`SsaGraph::op_inst_by_site` uses. Landed as `ore::instruction_addr(prov,
+blocks)` so a caller finds a named API instead of rediscovering a convention.
+Chain: `fact → concern route → SSA/R2IL fact → instruction address → artifact`.
+
+**C3 — the conservation ledger is load-bearing, not diagnostic decoration.**
+Three readings of one number: *what did the target fail to represent*
+(transcode) · *what have we not yet explained* (reconstruction) · *what still
+needs attention* (any investigative use). `dropped == 0` is what makes it
+evidence rather than a progress bar. Already the PR-1 invariant; this
+elevates it from QA metric to product property.
+
+**C4 — transcode is TARGET-ARCHITECTURE PROJECTION, not syntax conversion.**
+`behavioral truth → target recipe → generated implementation`. A recovered
+pointer graph does NOT oblige a pointer graph in the target; the furnace emits
+concern-separated facts and a target profile decides the layout. PR 1 contains
+no codegen, and `FlatFact` rows are concern-tagged + architecture-neutral, so
+nothing here binds a future emitter. Corollary for the eventual roundtrip
+oracle: **success is semantic/behavioral parity, never textual or binary
+equality** — which is exactly why §14's reconstruction oracle is specified as
+`R2IL → routes → semantic-equivalent R2IL`, with SPO explicitly NOT the oracle.
+
 ## Architecture (ratified by operator feedback 2026-08-17)
 
 ```
