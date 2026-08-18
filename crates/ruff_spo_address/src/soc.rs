@@ -35,7 +35,7 @@ pub const MAX_SIBLINGS_PER_TIER: usize = u8::MAX as usize;
 /// canonical GUID → `3×4` (all `G·D = 12`, 8-bit tiers; the per-group depth
 /// `D ∈ {2,3,4}` is a *per-class* constant, picked from the class condition).
 /// This module only bounds the god-object cardinality: `< 256` is maskable
-/// (clean), `≥ 256` is the SoC split signal. (operator 2026-06-29: the shape is
+/// (clean), `≥ 256` is the `SoC` split signal. (operator 2026-06-29: the shape is
 /// inherited — don't lock a `[u64; 4]` "quadruplet"; `D` is class-conditioned.)
 pub const FIELD_MASK_CAP: usize = MAX_SIBLINGS_PER_TIER;
 
