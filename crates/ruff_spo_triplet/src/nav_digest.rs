@@ -787,7 +787,7 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
         );
         // Apparent (lexicographically smallest) is the canonical parent.
         assert!(
-            forward.contains("Leaf  loc=Aparent/Leaf"),
+            forward.contains("Leaf  loc=Apparent/Leaf"),
             "smallest parent must win deterministically:\n{forward}"
         );
     }
