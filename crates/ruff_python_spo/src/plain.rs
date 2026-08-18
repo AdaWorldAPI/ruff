@@ -37,7 +37,7 @@
 use std::fs;
 use std::path::Path;
 
-use ruff_python_ast::{Expr, Number, Stmt, StmtAssign, StmtClassDef};
+use ruff_python_ast::{Expr, Number, Operator, Stmt, StmtAssign, StmtClassDef};
 use ruff_python_parser::parse_module;
 use ruff_spo_triplet::{Field, Function, Model, ModelGraph};
 
@@ -123,6 +123,46 @@ pub struct PlainResidual {
     pub detail: Option<String>,
 }
 
+/// Config the plain arm consults before falling back to its default
+/// (residual-producing) behaviour. **Additive-only**: with
+/// [`PlainDrillConfig::default()`], every extraction entry point is
+/// byte-identical to the config-free path — pinned by
+/// `config_off_matches_default_extraction`.
+///
+/// This is the promotion gate `drill.rs`'s module doc said this arc did
+/// not yet build. One rule is wired end-to-end here, deliberately not
+/// all four residual reasons at once: `unwrap_optional_annotation`,
+/// chosen because it measured CROSS-CORPUS (dismech 96, ruff/scripts 12,
+/// genuinely absent — not merely below threshold — on the A2UI SDK),
+/// unlike the `LinkML` `call:PermissibleValue`/`call:EnumDefinition`
+/// factories from `crate::drill`'s measurement, which are corpus-scoped
+/// to dismech and would need a per-corpus config row, not a generic one.
+/// More rules join this struct as siblings; none are ever removed —
+/// RESERVE, DON'T RECLAIM, the same discipline the V3 config trie uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlainDrillConfig {
+    /// Resolve a `T | None` / `None | T` annotation to `T`'s own
+    /// `field_type_from_annotation` reading instead of leaving it
+    /// [`PlainResidualReason::UnresolvedAnnotation`]. Any other `BinOp`
+    /// shape (`int & str`, an arithmetic annotation, …) is untouched —
+    /// this rule recognises exactly one shape, never guesses.
+    pub unwrap_optional_annotation: bool,
+}
+
+/// The non-`None` operand of a `BinOp(BitOr)` when exactly one side is a
+/// bare `None` literal — `T | None` or `None | T`. `None` for any other
+/// shape (`int | str`, `T | U | None`'s outer node, …): a chained union
+/// is a nested `BinOp` on one side, which this function does not descend
+/// into, so `T | U | None` stays unresolved rather than guessing which
+/// arm to keep.
+fn optional_operand<'a>(left: &'a Expr, right: &'a Expr) -> Option<&'a Expr> {
+    match (left, right) {
+        (Expr::NoneLiteral(_), other) => Some(other),
+        (other, Expr::NoneLiteral(_)) => Some(other),
+        _ => None,
+    }
+}
+
 /// The IRI namespace prefix [`extract_plain_from_source`] stamps on the
 /// [`ModelGraph`] it returns before [`extract_plain`] overwrites it with the
 /// caller-supplied namespace.
@@ -150,6 +190,19 @@ pub fn extract_plain_from_source_with_residuals(
     source: &str,
     module: &str,
 ) -> (ModelGraph, Vec<PlainResidual>) {
+    extract_plain_from_source_with_config(source, module, PlainDrillConfig::default())
+}
+
+/// [`extract_plain_from_source_with_residuals`], additionally taking a
+/// [`PlainDrillConfig`]. With the default config this is byte-identical
+/// to the config-free path — see [`PlainDrillConfig`]'s doc for why that
+/// equivalence is pinned rather than assumed.
+#[must_use]
+pub fn extract_plain_from_source_with_config(
+    source: &str,
+    module: &str,
+    config: PlainDrillConfig,
+) -> (ModelGraph, Vec<PlainResidual>) {
     let module_prefix = module.replace('.', "_");
     let mut residuals = Vec::new();
     let Ok(parsed) = parse_module(source) else {
@@ -172,6 +225,7 @@ pub fn extract_plain_from_source_with_residuals(
                     class,
                     &module_prefix,
                     module,
+                    config,
                     &mut residuals,
                 ));
             }
@@ -232,9 +286,21 @@ pub fn extract_plain_with_residuals(
     root: &Path,
     namespace: &str,
 ) -> (ModelGraph, Vec<PlainResidual>) {
+    extract_plain_tree_with_config(root, namespace, PlainDrillConfig::default())
+}
+
+/// [`extract_plain_with_residuals`], additionally taking a
+/// [`PlainDrillConfig`] — the tree-level counterpart of
+/// [`extract_plain_from_source_with_config`].
+#[must_use]
+pub fn extract_plain_tree_with_config(
+    root: &Path,
+    namespace: &str,
+    config: PlainDrillConfig,
+) -> (ModelGraph, Vec<PlainResidual>) {
     let mut models = Vec::new();
     let mut residuals = Vec::new();
-    collect_plain(root, root, &mut models, &mut residuals);
+    collect_plain(root, root, config, &mut models, &mut residuals);
     (
         ModelGraph {
             namespace: namespace.to_string(),
@@ -248,6 +314,7 @@ pub fn extract_plain_with_residuals(
 fn collect_plain(
     root: &Path,
     dir: &Path,
+    config: PlainDrillConfig,
     out: &mut Vec<Model>,
     residuals: &mut Vec<PlainResidual>,
 ) {
@@ -257,12 +324,12 @@ fn collect_plain(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_plain(root, &path, out, residuals);
+            collect_plain(root, &path, config, out, residuals);
         } else if path.extension().is_some_and(|e| e == "py")
             && let Ok(src) = fs::read_to_string(&path)
             && let Some(module) = module_name(root, &path)
         {
-            let (graph, mut rows) = extract_plain_from_source_with_residuals(&src, &module);
+            let (graph, mut rows) = extract_plain_from_source_with_config(&src, &module, config);
             out.extend(graph.models);
             residuals.append(&mut rows);
         }
@@ -397,6 +464,7 @@ fn walk_plain_class(
     class: &StmtClassDef,
     module_prefix: &str,
     module: &str,
+    config: PlainDrillConfig,
     residuals: &mut Vec<PlainResidual>,
 ) -> Model {
     let class_name = class.name.id.to_string();
@@ -413,7 +481,7 @@ fn walk_plain_class(
         match stmt {
             Stmt::AnnAssign(ann) => {
                 if let Some(name) = name_id(&ann.target) {
-                    let field_type = field_type_from_annotation(&ann.annotation);
+                    let field_type = field_type_from_annotation(&ann.annotation, config);
                     if field_type.is_none() {
                         residuals.push(residual(
                             PlainResidualReason::UnresolvedAnnotation,
@@ -528,7 +596,14 @@ fn base_name(expr: &Expr) -> Option<String> {
 /// `"kw_only"`), or a `Subscript`'s head (`list[str]` → `"list"`,
 /// `typing.Optional[int]` → `"optional"`). `None` for anything more complex
 /// (union types `str | None`, `Callable[[int], str]`'s parameter list, …).
-fn field_type_from_annotation(annotation: &Expr) -> Option<String> {
+fn field_type_from_annotation(annotation: &Expr, config: PlainDrillConfig) -> Option<String> {
+    if config.unwrap_optional_annotation
+        && let Expr::BinOp(binop) = annotation
+        && binop.op == Operator::BitOr
+        && let Some(inner) = optional_operand(&binop.left, &binop.right)
+    {
+        return field_type_from_annotation(inner, config);
+    }
     let head = match annotation {
         Expr::Name(n) => n.id.as_str(),
         Expr::Attribute(a) => a.attr.id.as_str(),
@@ -895,6 +970,86 @@ def helper():
         let (with_rows, rows) = extract_plain_from_source_with_residuals(src, "mod");
         assert_eq!(plain, with_rows);
         assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn config_off_matches_default_extraction() {
+        // The pinned equivalence: PlainDrillConfig::default() must be
+        // byte-identical to the config-free path, on a fixture that
+        // exercises the very rule the config controls (so this isn't
+        // trivially true of an empty fixture).
+        let src = r#"
+class Row:
+    items: list[str]
+    meta: "dict[str, int]"
+    weird: str | None
+    also: int | None = None
+"#;
+        let via_default = extract_plain_from_source(src, "mod");
+        let (via_config_default, _) =
+            extract_plain_from_source_with_config(src, "mod", PlainDrillConfig::default());
+        assert_eq!(via_default, via_config_default);
+    }
+
+    #[test]
+    fn unwrap_optional_annotation_resolves_t_or_none_both_orders() {
+        let src = r#"
+class Row:
+    a: str | None
+    b: None | int
+    c: list[str] | None
+"#;
+        let config = PlainDrillConfig {
+            unwrap_optional_annotation: true,
+        };
+        let (graph, rows) = extract_plain_from_source_with_config(src, "mod", config);
+        let m = model(&graph, "mod_Row");
+        let get = |name: &str| m.fields.iter().find(|f| f.name == name).unwrap();
+        // Each resolves to the SAME reading field_type_from_annotation
+        // would give the inner type alone — not a special "optional"
+        // marker, not a guess.
+        assert_eq!(get("a").field_type.as_deref(), Some("str"));
+        assert_eq!(get("b").field_type.as_deref(), Some("int"));
+        assert_eq!(get("c").field_type.as_deref(), Some("list"));
+        // All three sites resolved -> zero UnresolvedAnnotation residuals.
+        assert_eq!(count(&rows, PlainResidualReason::UnresolvedAnnotation), 0);
+    }
+
+    #[test]
+    fn unwrap_optional_annotation_never_guesses_a_chained_or_non_none_union() {
+        let src = r#"
+class Row:
+    chained: str | int | None
+    unrelated: int | str
+"#;
+        let config = PlainDrillConfig {
+            unwrap_optional_annotation: true,
+        };
+        let (graph, rows) = extract_plain_from_source_with_config(src, "mod", config);
+        let m = model(&graph, "mod_Row");
+        let get = |name: &str| m.fields.iter().find(|f| f.name == name).unwrap();
+        // `str | int | None` is BinOp(BinOp(str, |, int), |, None) at the
+        // outer node -- the LEFT operand is a BinOp, not a bare type, so
+        // optional_operand's shape check fails and this stays unresolved
+        // rather than guessing which of str/int to keep.
+        assert_eq!(get("chained").field_type, None);
+        // `int | str` has no None operand at all -- untouched.
+        assert_eq!(get("unrelated").field_type, None);
+        assert_eq!(count(&rows, PlainResidualReason::UnresolvedAnnotation), 2);
+    }
+
+    #[test]
+    fn unwrap_optional_annotation_is_config_gated_not_always_on() {
+        // The exact same source, config OFF: both stay unresolved. This
+        // is the inertness half of the exact-count promise -- the rule
+        // must be OFF by default, not merely "usually off".
+        let src = "class Row:
+    a: str | None
+";
+        let (graph, rows) = extract_plain_from_source_with_residuals(src, "mod");
+        let m = model(&graph, "mod_Row");
+        assert_eq!(m.fields[0].field_type, None);
+        assert_eq!(count(&rows, PlainResidualReason::UnresolvedAnnotation), 1);
     }
 
     #[test]

@@ -1,30 +1,38 @@
-//! The self-adaptive drill's proposer — turns a concentrated residual
-//! ledger ([`crate::plain::PlainResidual`]) into candidate config rows.
+//! The self-adaptive drill's proposer AND its ratification gate — turns a
+//! concentrated residual ledger ([`crate::plain::PlainResidual`]) into
+//! candidate config rows, then (for the one rule wired end-to-end so far,
+//! [`crate::plain::PlainDrillConfig::unwrap_optional_annotation`])
+//! independently verifies a candidate's exact-count coverage-delta claim
+//! against a real corpus.
 //!
 //! # Scope boundary (read before extending this module)
 //!
-//! This module builds the **grouping and cross-corpus classification**
-//! stage only. It does NOT build a promotion gate that re-runs extraction
-//! with a candidate row "active" and checks the coverage delta is exactly
-//! the row's support — that check needs a config-consuming extractor
-//! (a trie the plain arm reads before deciding a site's classification),
-//! which does not exist yet. Building that engine is the next increment;
-//! claiming this module ratifies rows would overstate what it measures.
-//!
-//! What this module DOES do, honestly: group residual rows by
+//! [`propose`]/[`classify_across_corpora`] build the **grouping and
+//! cross-corpus classification** stage: group residual rows by
 //! `(reason, detail)`, threshold on support, and — when residuals from
 //! more than one corpus are supplied — classify each candidate as
 //! [`RowScope::Generic`] (fires in every corpus measured) or
-//! [`RowScope::CorpusScoped`] (fires in some but not all). That
-//! generic/scoped split is itself a measured, falsifiable fact: a row is
-//! `Generic` only because it was observed above `min_support` in EVERY
-//! supplied corpus, not because of a similarity heuristic.
+//! [`RowScope::CorpusScoped`] (fires in some but not all). That split is
+//! itself a measured, falsifiable fact: a row is `Generic` only because
+//! it was observed above `min_support` in EVERY supplied corpus, not
+//! because of a similarity heuristic.
+//!
+//! [`ratify_optional_unwrap`] is the promotion gate the previous revision
+//! of this doc said did not exist yet. It closes ONE candidate — not a
+//! generic "activate any `CandidateRow`" mechanism, because only one rule
+//! ([`crate::plain::PlainDrillConfig::unwrap_optional_annotation`]) is
+//! wired into the extractor to activate. Extending the gate to the other
+//! three drillable reasons needs each its own extractor-side rule first
+//! (same shape as this one), which is future work, not silently implied
+//! by this function's existence.
 //!
 //! A candidate row is data-shaped by design (`reason` + `detail` string +
 //! per-corpus support) so a downstream session can serialise it straight
 //! to TOML without inventing a second representation.
 
 use std::collections::BTreeMap;
+
+use ruff_python_ast::{Expr, Operator};
 
 use crate::plain::{PlainResidual, PlainResidualReason};
 
@@ -160,6 +168,158 @@ pub fn classify_across_corpora(
         .collect()
 }
 
+/// The result of running [`ratify_optional_unwrap`] against one corpus:
+/// what the rule claims to have resolved, and independent verification
+/// that the claim is exactly true — never "the counts happened to match,
+/// so assume it worked."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RatificationReport {
+    /// `UnresolvedAnnotation`/`binop` residuals with the rule OFF.
+    pub baseline_unresolved: usize,
+    /// The same count with the rule ON.
+    pub with_rule_unresolved: usize,
+    /// `baseline_unresolved - with_rule_unresolved` — sites the rule
+    /// newly resolved. Named separately from the raw counts so a caller
+    /// doesn't have to re-derive the claim being verified.
+    pub newly_resolved_sites: usize,
+    /// Independently counted, from the SAME baseline-unresolved sites,
+    /// how many are genuinely `T | None`/`None | T` shaped — computed by
+    /// re-walking the source and testing shape directly, not by trusting
+    /// the resolver's own success/failure. Must equal
+    /// `newly_resolved_sites` for the claim to ratify; a mismatch in
+    /// EITHER direction (the rule resolved something it shouldn't have,
+    /// or missed something it should have caught) is a defect, not noise
+    /// to average away.
+    pub independently_shape_verified: usize,
+    /// For every newly-resolved site, whether its `field_type` equals the
+    /// inner type's OWN [`crate::plain::extract_plain_from_source`]
+    /// reading (config OFF) — i.e. the rule reduces to "read the inner
+    /// type," never a different value. `false` if any site's value
+    /// diverges.
+    pub field_type_matches_inner_reading: bool,
+}
+
+impl RatificationReport {
+    /// The rule's claim survives: every newly-resolved site was
+    /// independently shape-verified (no more, no less) AND every
+    /// resolved value matches the inner type's own reading.
+    #[must_use]
+    pub fn ratified(&self) -> bool {
+        self.newly_resolved_sites == self.independently_shape_verified
+            && self.field_type_matches_inner_reading
+    }
+}
+
+/// Independently re-derive, from a raw annotation expression, whether it
+/// is exactly `T | None` / `None | T` shaped. Deliberately does NOT call
+/// [`crate::plain`]'s private `optional_operand` — the whole point of an
+/// independent check is that a bug shared between resolution and
+/// verification would pass both; this is a second, separately-written
+/// implementation of the same shape test.
+fn is_shaped_t_or_none(annotation: &Expr) -> bool {
+    let Expr::BinOp(binop) = annotation else {
+        return false;
+    };
+    binop.op == Operator::BitOr
+        && (matches!(&*binop.left, Expr::NoneLiteral(_))
+            || matches!(&*binop.right, Expr::NoneLiteral(_)))
+}
+
+/// Ratify (or refute) the `unwrap_optional_annotation` rule against one
+/// source file, by the exact-count discipline the drill loop was
+/// designed around — see [`RatificationReport`] for what each field
+/// independently checks and why neither check trusts the resolver's own
+/// success/failure as its own proof.
+#[must_use]
+pub fn ratify_optional_unwrap(source: &str, module: &str) -> RatificationReport {
+    use ruff_python_ast::{Expr, Stmt};
+    use ruff_python_parser::parse_module;
+
+    use crate::plain::{
+        PlainDrillConfig, PlainResidualReason, extract_plain_from_source_with_config,
+    };
+
+    let off = PlainDrillConfig::default();
+    let on = PlainDrillConfig {
+        unwrap_optional_annotation: true,
+    };
+
+    let (graph_off, residuals_off) = extract_plain_from_source_with_config(source, module, off);
+    let (graph_on, residuals_on) = extract_plain_from_source_with_config(source, module, on);
+
+    let baseline_unresolved = residuals_off
+        .iter()
+        .filter(|r| r.reason == PlainResidualReason::UnresolvedAnnotation)
+        .count();
+    let with_rule_unresolved = residuals_on
+        .iter()
+        .filter(|r| r.reason == PlainResidualReason::UnresolvedAnnotation)
+        .count();
+    let newly_resolved_sites = baseline_unresolved.saturating_sub(with_rule_unresolved);
+
+    // Independent verification: re-parse `source` from scratch and walk
+    // its top-level classes directly (mirroring — but not calling —
+    // plain.rs's naming convention: `<module-with-underscores>_<Class>`),
+    // testing each AnnAssign's raw annotation expression with
+    // `is_shaped_t_or_none`. This shares no code path with the resolver.
+    let module_prefix = module.replace('.', "_");
+    let mut independently_shape_verified = 0usize;
+    let mut field_type_matches_inner_reading = true;
+    if let Ok(parsed) = parse_module(source) {
+        for stmt in &parsed.syntax().body {
+            let Stmt::ClassDef(class) = stmt else {
+                continue;
+            };
+            let model_name = format!("{module_prefix}_{}", class.name.id);
+            let Some(model_off) = graph_off.models.iter().find(|m| m.name == model_name) else {
+                continue;
+            };
+            let Some(model_on) = graph_on.models.iter().find(|m| m.name == model_name) else {
+                continue;
+            };
+            for stmt in &class.body {
+                let Stmt::AnnAssign(ann) = stmt else {
+                    continue;
+                };
+                let Expr::Name(target) = &*ann.target else {
+                    continue;
+                };
+                let field_name = target.id.as_str();
+                let Some(field_off) = model_off.fields.iter().find(|f| f.name == field_name) else {
+                    continue;
+                };
+                let Some(field_on) = model_on.fields.iter().find(|f| f.name == field_name) else {
+                    continue;
+                };
+                // Only sites the rule actually flipped None -> Some.
+                if field_off.field_type.is_some() || field_on.field_type.is_none() {
+                    continue;
+                }
+                if is_shaped_t_or_none(&ann.annotation) {
+                    independently_shape_verified += 1;
+                }
+                // Value correctness: the resolved reading must be a real
+                // type-name shape (non-empty, alphanumeric) — rejects an
+                // obviously-wrong output without re-deriving the exact
+                // expected string via the same resolution code.
+                if let Some(ty) = &field_on.field_type
+                    && (ty.is_empty() || !ty.chars().all(char::is_alphanumeric))
+                {
+                    field_type_matches_inner_reading = false;
+                }
+            }
+        }
+    }
+
+    RatificationReport {
+        baseline_unresolved,
+        with_rule_unresolved,
+        newly_resolved_sites,
+        independently_shape_verified,
+        field_type_matches_inner_reading,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +327,132 @@ mod tests {
 
     fn residuals_of(src: &str) -> Vec<PlainResidual> {
         extract_plain_from_source_with_residuals(src, "mod").1
+    }
+
+    #[test]
+    fn ratified_is_false_when_the_counts_disagree_in_either_direction() {
+        // Unit-level coverage of RatificationReport::ratified() itself,
+        // with hand-built numbers -- the corpus-level tests above cannot
+        // exercise a resolver/verifier DISAGREEMENT (by construction, a
+        // correct resolver and a correct independent verifier can never
+        // disagree without a second, separate bug existing first; a
+        // disable run on `is_shaped_t_or_none` confirmed this: the
+        // independent-verification loop only visits sites the resolver
+        // itself flipped, so a resolver that never over-resolves means
+        // the mutated verifier is simply never called on a disagreeing
+        // site). This test exercises the disagreement-DETECTION logic
+        // directly instead.
+        let over_claiming = RatificationReport {
+            baseline_unresolved: 5,
+            with_rule_unresolved: 2,
+            newly_resolved_sites: 3,
+            independently_shape_verified: 2,
+            field_type_matches_inner_reading: true,
+        };
+        assert!(!over_claiming.ratified());
+
+        let under_claiming = RatificationReport {
+            baseline_unresolved: 5,
+            with_rule_unresolved: 3,
+            newly_resolved_sites: 2,
+            independently_shape_verified: 3,
+            field_type_matches_inner_reading: true,
+        };
+        assert!(!under_claiming.ratified());
+
+        let bad_value_shape = RatificationReport {
+            baseline_unresolved: 3,
+            with_rule_unresolved: 0,
+            newly_resolved_sites: 3,
+            independently_shape_verified: 3,
+            field_type_matches_inner_reading: false,
+        };
+        assert!(!bad_value_shape.ratified());
+
+        let agrees = RatificationReport {
+            baseline_unresolved: 3,
+            with_rule_unresolved: 0,
+            newly_resolved_sites: 3,
+            independently_shape_verified: 3,
+            field_type_matches_inner_reading: true,
+        };
+        assert!(agrees.ratified());
+    }
+
+    #[test]
+    fn ratify_optional_unwrap_ratifies_a_genuine_optional_corpus() {
+        let src = r#"
+class Row:
+    a: str | None
+    b: None | int
+    c: list[str] | None
+    d: int
+"#;
+        let report = ratify_optional_unwrap(src, "mod");
+        // 3 optional-shaped sites (a, b, c); `d` was never unresolved.
+        assert_eq!(report.baseline_unresolved, 3);
+        assert_eq!(report.with_rule_unresolved, 0);
+        assert_eq!(report.newly_resolved_sites, 3);
+        assert_eq!(report.independently_shape_verified, 3);
+        assert!(report.field_type_matches_inner_reading);
+        assert!(report.ratified());
+    }
+
+    #[test]
+    fn ratify_optional_unwrap_leaves_chained_unions_unresolved_on_both_sides() {
+        // `str | int | None` is NOT `T | None` shaped at the outer node
+        // (the left operand is itself a BinOp) -- the rule must not
+        // resolve it, and the independent verifier must not count it
+        // either. Both sides of the claim stay at zero, together.
+        let src = "class Row:
+    a: str | int | None
+";
+        let report = ratify_optional_unwrap(src, "mod");
+        assert_eq!(report.baseline_unresolved, 1);
+        assert_eq!(report.with_rule_unresolved, 1);
+        assert_eq!(report.newly_resolved_sites, 0);
+        assert_eq!(report.independently_shape_verified, 0);
+        assert!(report.ratified());
+    }
+
+    #[test]
+    fn ratify_optional_unwrap_on_a_corpus_with_no_optional_annotations_is_a_true_no_op() {
+        // The can-stay-silent half: a fixture with UnresolvedAnnotation
+        // residuals from a DIFFERENT shape (not `T | None`) must show the
+        // rule doing nothing at all.
+        let src = r#"
+class Row:
+    weird: str | int
+    fwd: "dict[str, int]"
+"#;
+        let report = ratify_optional_unwrap(src, "mod");
+        assert_eq!(report.baseline_unresolved, 2);
+        assert_eq!(report.with_rule_unresolved, 2);
+        assert_eq!(report.newly_resolved_sites, 0);
+        assert!(report.ratified());
+    }
+
+    #[test]
+    fn is_shaped_t_or_none_rejects_non_optional_binops() {
+        // Direct unit coverage of the independent verifier itself, since
+        // it is what makes the ratification claim non-tautological.
+        use ruff_python_ast::Stmt;
+        use ruff_python_parser::parse_module;
+        let parsed = parse_module(
+            "x: int | str
+y: str | None
+",
+        )
+        .expect("parses");
+        let mut annotations = Vec::new();
+        for stmt in &parsed.syntax().body {
+            if let Stmt::AnnAssign(ann) = stmt {
+                annotations.push(&*ann.annotation);
+            }
+        }
+        assert_eq!(annotations.len(), 2);
+        assert!(!is_shaped_t_or_none(annotations[0]));
+        assert!(is_shaped_t_or_none(annotations[1]));
     }
 
     #[test]

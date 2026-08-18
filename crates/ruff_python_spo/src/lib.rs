@@ -57,7 +57,10 @@ mod plain;
 mod templates;
 mod walk;
 
-pub use drill::{CandidateRow, CrossCorpusRow, RowScope, classify_across_corpora, propose};
+pub use drill::{
+    CandidateRow, CrossCorpusRow, RatificationReport, RowScope, classify_across_corpora, propose,
+    ratify_optional_unwrap,
+};
 pub use navigation::{
     NavScanReport, NavVocab, PyNavEdge, extract_nav_edges, extract_nav_edges_with_report,
 };
@@ -73,8 +76,9 @@ pub use odoo_views::{
     OdooViewScanReport, extract_odoo_view_field_sets, extract_odoo_view_field_sets_with_report,
 };
 pub use plain::{
-    PlainResidual, PlainResidualReason, extract_plain, extract_plain_from_source,
-    extract_plain_from_source_with_residuals, extract_plain_with_residuals,
+    PlainDrillConfig, PlainResidual, PlainResidualReason, extract_plain, extract_plain_from_source,
+    extract_plain_from_source_with_config, extract_plain_from_source_with_residuals,
+    extract_plain_tree_with_config, extract_plain_with_residuals,
 };
 pub use templates::{
     ViewFieldSet, ViewScanReport, ViewTarget, extract_template_field_sets,
