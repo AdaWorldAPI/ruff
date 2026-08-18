@@ -920,7 +920,15 @@ jobs:
 
   pgo:
     name: "PGO"
-    runs-on: depot-ubuntu-24.04-8
+    # Unlike the other bare `depot-*` jobs in this file, this job's own `if:`
+    # does NOT gate on `github.repository == 'astral-sh/ruff'` — it fires
+    # whenever release-relevant files changed, fork or not. `depot-*` labels
+    # are Depot.dev custom runners registered only for the upstream org; on
+    # a fork nothing can ever claim that label, so the job queues forever
+    # (confirmed: stuck 40+ min with zero runner pickup on two separate
+    # attempts, blocking the whole run from ever reaching a clean terminal
+    # state for a failed-jobs rerun).
+    runs-on: ${{ github.repository == 'astral-sh/ruff' && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
     needs: determine_changes
     if: ${{ needs.determine_changes.outputs.release == 'true' && !contains(github.event.pull_request.labels.*.name, 'no-build') }}
     timeout-minutes: 20
