@@ -75,8 +75,15 @@ impl VarnodeFacet {
         let size = self.size();
         [
             FacetPrefix::Space { discriminant },
-            FacetPrefix::SpaceOffset { discriminant, offset },
-            FacetPrefix::SpaceOffsetSize { discriminant, offset, size },
+            FacetPrefix::SpaceOffset {
+                discriminant,
+                offset,
+            },
+            FacetPrefix::SpaceOffsetSize {
+                discriminant,
+                offset,
+                size,
+            },
         ]
     }
 }
@@ -85,9 +92,18 @@ impl VarnodeFacet {
 /// [`R2ilConvention`] (`convention.rs`) drills on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FacetPrefix {
-    Space { discriminant: u16 },
-    SpaceOffset { discriminant: u16, offset: u64 },
-    SpaceOffsetSize { discriminant: u16, offset: u64, size: u32 },
+    Space {
+        discriminant: u16,
+    },
+    SpaceOffset {
+        discriminant: u16,
+        offset: u64,
+    },
+    SpaceOffsetSize {
+        discriminant: u16,
+        offset: u64,
+        size: u32,
+    },
 }
 
 impl FacetPrefix {
@@ -305,8 +321,14 @@ mod tests {
         let f_small = project(&vn_small, &table).expect("project raw=5");
         let f_big = project(&vn_big, &table).expect("project raw=65541");
         assert_ne!(f_small, f_big, "65541 must not truncate onto 5's facet");
-        assert_eq!(unproject(&f_small, &table).expect("unproject raw=5"), vn_small);
-        assert_eq!(unproject(&f_big, &table).expect("unproject raw=65541"), vn_big);
+        assert_eq!(
+            unproject(&f_small, &table).expect("unproject raw=5"),
+            vn_small
+        );
+        assert_eq!(
+            unproject(&f_big, &table).expect("unproject raw=65541"),
+            vn_big
+        );
     }
 
     #[test]

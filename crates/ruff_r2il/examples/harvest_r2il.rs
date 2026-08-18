@@ -715,7 +715,9 @@ fn render_slag_tsv(
             Some(bytes) => hex16(bytes),
             None => "-".to_string(),
         };
-        out.push_str(&format!("grouped\t{shape_id:016x}\t{reason}\t{count}\t{facet}\n"));
+        out.push_str(&format!(
+            "grouped\t{shape_id:016x}\t{reason}\t{count}\t{facet}\n"
+        ));
     }
     out.push_str(
         "#section by_address — ResidualLedger::by_address(), the proposer's work queue, merged across every harvested function\n",
@@ -928,7 +930,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let fnv = fnv1a64(&data);
-        eprintln!("[harvest] {label}: {} bytes, fnv1a64={fnv:016x}", data.len());
+        eprintln!(
+            "[harvest] {label}: {} bytes, fnv1a64={fnv:016x}",
+            data.len()
+        );
 
         let Some(info) = elf::parse(&data) else {
             eprintln!("[harvest] {label}: skip — not a recognized ELF64 LE x86-64 binary");

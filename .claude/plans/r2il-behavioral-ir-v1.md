@@ -283,6 +283,32 @@ oracle: **success is semantic/behavioral parity, never textual or binary
 equality** — which is exactly why §14's reconstruction oracle is specified as
 `R2IL → routes → semantic-equivalent R2IL`, with SPO explicitly NOT the oracle.
 
+## SUBSTRATE RULING (operator, 2026-08-18): THREE backends, none privileged
+
+The refined-truth sink must support **all three**, chosen at the seam, never
+baked into the furnace:
+
+1. **Offline V3 substrate** — file/artifact-shaped, self-contained, no service.
+   What the PR-1 harvest artifacts already are.
+2. **lance-graph zero-copy SoA** — live storage AND audit layer, so a future
+   external consumer can drill on the fly instead of re-harvesting. Zero-copy is
+   the point: rows are read in place from the SoA, never re-materialized.
+3. **S3 object storage via `AWS_*` env vars (Railway Tigris)** — the same V3
+   artifacts addressed remotely. Tigris is S3-compatible, so this is credential
+   plumbing (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+   `AWS_ENDPOINT_URL_S3` / `AWS_REGION`), **not** a fourth format. Never hardcode
+   an endpoint or embed a key; read the environment, and if unset fall back to
+   local offline mode rather than failing.
+
+**PR-1 consequence — a door to keep open, not work to do now.** The furnace
+already returns `Vec<FlatFact>` + `ResidualLedger` + `HarvestReport` in memory
+and persists nothing; the examples write artifacts, the library does not. That
+is exactly the shape all three backends need, so **PR 1 requires no change** —
+the constraint is: do NOT introduce a persistence assumption into
+`furnace`/`ore`/`slag`. PR 2 adds a sink trait behind which offline / lance-graph
+/ S3 are implementations. Provenance (C2, `ore::instruction_addr`) is what makes
+backend 2 an *audit* layer rather than a cache — keep it.
+
 ## Architecture (ratified by operator feedback 2026-08-17)
 
 ```

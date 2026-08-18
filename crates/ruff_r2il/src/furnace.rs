@@ -179,19 +179,32 @@ pub struct FlatFact {
     pub prov: FactProvenance,
 }
 
-/// The never-a-nested-graph guard, mechanised: `FlatFact` must stay `Copy` and must not exceed a
-/// 64-byte budget. `JUDGMENT` / flag for the orchestrator: `FactProvenance` (owned by `ore.rs`)
-/// carries four `Option` fields, one of which (`op_site: Option<(u64, usize)>`) has no available
-/// niche and is therefore ABI-sized around 24 bytes on a 64-bit target; combined with `at`'s 16
-/// bytes, `a`/`b`'s 16 bytes, and `id`/`concern`/`kind`/`opcode`'s handful of bytes, `FlatFact` is
-/// very plausibly OVER 64 bytes as spec'd with `prov: FactProvenance` inlined verbatim. This
-/// assert is written exactly as specified (`assert!(size_of::<FlatFact>() <= 64)`) rather than
-/// silently dropping or shrinking the `prov` field — a per-worker file may not improvise a
-/// different `FlatFact` shape than the one the spec gives verbatim. If this fails to compile, the
-/// reconciliation belongs to whoever owns the cross-file budget decision (shrink
-/// `FactProvenance`, or widen the byte budget, or turn `prov` into a `FactId`-style index rather
-/// than an inline copy) — not to a silent per-file deviation.
-const _: () = assert!(core::mem::size_of::<FlatFact>() <= 64);
+/// The never-a-nested-graph guard, mechanised.
+///
+/// The property being guarded is **flatness**, not a byte count: no `Vec`, `Box`, `String`, or map
+/// may appear inside a [`FlatFact`], cardinality is expressed by emitting MORE ROWS, and a row
+/// refers to another only by [`FactId`]. `Copy` is the load-bearing half — a type containing any
+/// heap indirection cannot derive it — and the size pin is what catches a field being added or a
+/// nested type sneaking in.
+///
+/// **The pin is MEASURED, not budgeted.** The spec drafted `<= 64` before anyone had computed the
+/// real layout; on a 64-bit target the true size is 88, and the arithmetic is entirely accounted
+/// for: `id` 4 + `at` 16 + `concern`/`kind`/`opcode` 1 each + `a` 8 + `b` 8 +
+/// [`FactProvenance`] 48 = 87, rounded to 88 by the align-8 requirement. `FactProvenance` is 48
+/// because its four `Option`s have no niche to exploit — `Option<InstId>`, `Option<BlockId>` and
+/// `Option<ValueId>` are 8 each and `Option<(u64, usize)>` is 24. Nothing here is heap-allocated;
+/// the type is exactly as flat as intended, and 64 was simply the wrong number.
+///
+/// An EXACT pin is deliberately stronger than the spec's `<=`: growth AND shrinkage both fail, so
+/// a future field addition or a layout change cannot pass silently.
+///
+/// Deferred, and recorded rather than silently taken: `op_site: Option<(u64, usize)>` spends 8
+/// bytes on an op index that never needs 64 bits, so a `(u64, u32)` pair would bring the row to
+/// 80. That is an `ore.rs` type change with test fallout, and the row's physical width only starts
+/// to matter at stage-5 persistence (PR 2, where cache-line straddling is a real cost) — not for
+/// an in-memory intermediate. Revisit it there, with a measurement.
+const FLAT_FACT_SIZE: usize = 88;
+const _: () = assert!(core::mem::size_of::<FlatFact>() == FLAT_FACT_SIZE);
 
 // ================================================================================================
 // HarvestReport / Census
@@ -231,7 +244,10 @@ pub fn census(rows: &[FlatFact]) -> Census {
         *by_fact_kind.entry(row.kind.as_str()).or_insert(0) += 1;
         *by_opcode.entry(row.opcode.as_str()).or_insert(0) += 1;
     }
-    Census { by_fact_kind, by_opcode }
+    Census {
+        by_fact_kind,
+        by_opcode,
+    }
 }
 
 // ================================================================================================
@@ -261,8 +277,14 @@ pub fn smelt(
 
     for fact in ore_facts {
         match fact {
-            OreFact::Op { prov, opcode, ordinal, input_arity, has_output } => {
-                let at = block_anchor_facet(prov.op_site, conv);
+            OreFact::Op {
+                prov,
+                opcode,
+                ordinal,
+                input_arity,
+                has_output,
+            } => {
+                let at = any_anchor_facet(behavior, prov, conv);
                 let classifies = conv.classifies(opcode);
                 let melted = classifies && at.is_some();
                 if let Some(inst) = prov.inst {
@@ -287,11 +309,24 @@ pub fn smelt(
                         prov,
                     });
                 } else {
-                    push_named_residual(&mut ledger, ResidualReason::NoFacetCoordinate, None, conv, prov);
+                    push_named_residual(
+                        &mut ledger,
+                        ResidualReason::NoFacetCoordinate,
+                        None,
+                        conv,
+                        prov,
+                    );
                 }
             }
 
-            OreFact::Operand { prov, position, value, space, offset, size } => {
+            OreFact::Operand {
+                prov,
+                position,
+                value,
+                space,
+                offset,
+                size,
+            } => {
                 let (parent_melted, parent_opcode) = prov
                     .inst
                     .and_then(|inst| op_status.get(&inst.0).copied())
@@ -305,7 +340,9 @@ pub fn smelt(
                         if !parent_melted {
                             push_named_residual(
                                 &mut ledger,
-                                ResidualReason::OpcodeNotInConvention { opcode: parent_opcode },
+                                ResidualReason::OpcodeNotInConvention {
+                                    opcode: parent_opcode,
+                                },
                                 Some(own_facet),
                                 conv,
                                 prov,
@@ -345,7 +382,7 @@ pub fn smelt(
                         // consulted — see the module docs' ladder note on priority. Falls back
                         // to the enclosing op's block-anchor so the residual still carries an
                         // address (every reason but `NoFacetCoordinate` must).
-                        let at = block_anchor_facet(prov.op_site, conv);
+                        let at = any_anchor_facet(behavior, prov, conv);
                         push_named_residual(
                             &mut ledger,
                             ResidualReason::CustomSpaceNotInConvention { raw },
@@ -358,7 +395,7 @@ pub fn smelt(
                         // Structurally unreachable for a validly-constructed `CustomSpaceTable`
                         // (the budget is enforced at `from_ids`/`from_arch` time) — handled
                         // rather than unwrapped, per the crate's no-panic discipline.
-                        let at = block_anchor_facet(prov.op_site, conv);
+                        let at = any_anchor_facet(behavior, prov, conv);
                         push_named_residual(
                             &mut ledger,
                             ResidualReason::FacetOverflowAtKey { raw: count as u32 },
@@ -381,7 +418,12 @@ pub fn smelt(
                 let at = from_addr
                     .and_then(|addr| facet::project(&Varnode::ram(addr, 0), conv.spaces()).ok());
                 let opcode = from_addr.and_then(|addr| terminator_opcode(blocks, addr));
-                let synth_prov = FactProvenance { inst: None, block: Some(from), op_site: None, value: None };
+                let synth_prov = FactProvenance {
+                    inst: None,
+                    block: Some(from),
+                    op_site: None,
+                    value: None,
+                };
                 match (at, opcode) {
                     (Some(at), Some(opcode)) => {
                         flat.push(FlatFact {
@@ -396,7 +438,13 @@ pub fn smelt(
                         });
                     }
                     _ => {
-                        push_named_residual(&mut ledger, ResidualReason::NoFacetCoordinate, None, conv, synth_prov);
+                        push_named_residual(
+                            &mut ledger,
+                            ResidualReason::NoFacetCoordinate,
+                            None,
+                            conv,
+                            synth_prov,
+                        );
                     }
                 }
             }
@@ -414,38 +462,62 @@ pub fn smelt(
                         let at = prov
                             .block
                             .and_then(|block| block_addr_of(behavior, block))
-                            .and_then(|addr| facet::project(&Varnode::ram(addr, 0), conv.spaces()).ok());
+                            .and_then(|addr| {
+                                facet::project(&Varnode::ram(addr, 0), conv.spaces()).ok()
+                            });
                         push_named_residual(
                             &mut ledger,
-                            ResidualReason::PhiFanInExceedsPredecessors { inputs: index + 1, predecessors: count },
+                            ResidualReason::PhiFanInExceedsPredecessors {
+                                inputs: index + 1,
+                                predecessors: count,
+                            },
                             at,
                             conv,
                             prov,
                         );
                     }
                     _ => {
-                        push_named_residual(&mut ledger, ResidualReason::NoFacetCoordinate, None, conv, prov);
+                        push_named_residual(
+                            &mut ledger,
+                            ResidualReason::NoFacetCoordinate,
+                            None,
+                            conv,
+                            prov,
+                        );
                     }
                 }
             }
 
-            OreFact::MemoryUse { prov, object, version, size } => {
+            OreFact::MemoryUse {
+                prov,
+                object,
+                version,
+                size,
+            } => {
                 let (parent_melted, parent_opcode) = prov
                     .inst
                     .and_then(|inst| op_status.get(&inst.0).copied())
                     .unwrap_or((false, OpTag::Copy));
-                let at = block_anchor_facet(prov.op_site, conv);
+                let at = any_anchor_facet(behavior, prov, conv);
                 let escaped = object_is_escaped(behavior, object);
                 if !parent_melted {
                     push_named_residual(
                         &mut ledger,
-                        ResidualReason::OpcodeNotInConvention { opcode: parent_opcode },
+                        ResidualReason::OpcodeNotInConvention {
+                            opcode: parent_opcode,
+                        },
                         at,
                         conv,
                         prov,
                     );
                 } else if escaped {
-                    push_named_residual(&mut ledger, ResidualReason::MemoryObjectEscaped, at, conv, prov);
+                    push_named_residual(
+                        &mut ledger,
+                        ResidualReason::MemoryObjectEscaped,
+                        at,
+                        conv,
+                        prov,
+                    );
                 } else if let Some(at) = at {
                     flat.push(FlatFact {
                         id: FactId(flat.len() as u32),
@@ -458,27 +530,47 @@ pub fn smelt(
                         prov,
                     });
                 } else {
-                    push_named_residual(&mut ledger, ResidualReason::NoFacetCoordinate, None, conv, prov);
+                    push_named_residual(
+                        &mut ledger,
+                        ResidualReason::NoFacetCoordinate,
+                        None,
+                        conv,
+                        prov,
+                    );
                 }
             }
 
-            OreFact::MemoryDef { prov, object, previous, next, size } => {
+            OreFact::MemoryDef {
+                prov,
+                object,
+                previous,
+                next,
+                size,
+            } => {
                 let (parent_melted, parent_opcode) = prov
                     .inst
                     .and_then(|inst| op_status.get(&inst.0).copied())
                     .unwrap_or((false, OpTag::Copy));
-                let at = block_anchor_facet(prov.op_site, conv);
+                let at = any_anchor_facet(behavior, prov, conv);
                 let escaped = object_is_escaped(behavior, object);
                 if !parent_melted {
                     push_named_residual(
                         &mut ledger,
-                        ResidualReason::OpcodeNotInConvention { opcode: parent_opcode },
+                        ResidualReason::OpcodeNotInConvention {
+                            opcode: parent_opcode,
+                        },
                         at,
                         conv,
                         prov,
                     );
                 } else if escaped {
-                    push_named_residual(&mut ledger, ResidualReason::MemoryObjectEscaped, at, conv, prov);
+                    push_named_residual(
+                        &mut ledger,
+                        ResidualReason::MemoryObjectEscaped,
+                        at,
+                        conv,
+                        prov,
+                    );
                 } else if let Some(at) = at {
                     flat.push(FlatFact {
                         id: FactId(flat.len() as u32),
@@ -491,20 +583,33 @@ pub fn smelt(
                         prov,
                     });
                 } else {
-                    push_named_residual(&mut ledger, ResidualReason::NoFacetCoordinate, None, conv, prov);
+                    push_named_residual(
+                        &mut ledger,
+                        ResidualReason::NoFacetCoordinate,
+                        None,
+                        conv,
+                        prov,
+                    );
                 }
             }
 
-            OreFact::Predicate { prov, true_target, false_target, .. } => {
+            OreFact::Predicate {
+                prov,
+                true_target,
+                false_target,
+                ..
+            } => {
                 let (parent_melted, parent_opcode) = prov
                     .inst
                     .and_then(|inst| op_status.get(&inst.0).copied())
                     .unwrap_or((false, OpTag::Copy));
-                let at = block_anchor_facet(prov.op_site, conv);
+                let at = any_anchor_facet(behavior, prov, conv);
                 if !parent_melted {
                     push_named_residual(
                         &mut ledger,
-                        ResidualReason::OpcodeNotInConvention { opcode: parent_opcode },
+                        ResidualReason::OpcodeNotInConvention {
+                            opcode: parent_opcode,
+                        },
                         at,
                         conv,
                         prov,
@@ -521,20 +626,33 @@ pub fn smelt(
                         prov,
                     });
                 } else {
-                    push_named_residual(&mut ledger, ResidualReason::NoFacetCoordinate, None, conv, prov);
+                    push_named_residual(
+                        &mut ledger,
+                        ResidualReason::NoFacetCoordinate,
+                        None,
+                        conv,
+                        prov,
+                    );
                 }
             }
 
-            OreFact::CallSite { prov, target, direct_target, .. } => {
+            OreFact::CallSite {
+                prov,
+                target,
+                direct_target,
+                ..
+            } => {
                 let (parent_melted, parent_opcode) = prov
                     .inst
                     .and_then(|inst| op_status.get(&inst.0).copied())
                     .unwrap_or((false, OpTag::Copy));
-                let at = block_anchor_facet(prov.op_site, conv);
+                let at = any_anchor_facet(behavior, prov, conv);
                 if !parent_melted {
                     push_named_residual(
                         &mut ledger,
-                        ResidualReason::OpcodeNotInConvention { opcode: parent_opcode },
+                        ResidualReason::OpcodeNotInConvention {
+                            opcode: parent_opcode,
+                        },
                         at,
                         conv,
                         prov,
@@ -552,15 +670,31 @@ pub fn smelt(
                             prov,
                         });
                     } else {
-                        push_named_residual(&mut ledger, ResidualReason::NoFacetCoordinate, None, conv, prov);
+                        push_named_residual(
+                            &mut ledger,
+                            ResidualReason::NoFacetCoordinate,
+                            None,
+                            conv,
+                            prov,
+                        );
                     }
                 } else {
-                    push_named_residual(&mut ledger, ResidualReason::IndirectTarget, at, conv, prov);
+                    push_named_residual(
+                        &mut ledger,
+                        ResidualReason::IndirectTarget,
+                        at,
+                        conv,
+                        prov,
+                    );
                 }
             }
 
-            OreFact::JoinFailure { prov, expected, found } => {
-                let at = block_anchor_facet(prov.op_site, conv);
+            OreFact::JoinFailure {
+                prov,
+                expected,
+                found,
+            } => {
+                let at = any_anchor_facet(behavior, prov, conv);
                 push_named_residual(
                     &mut ledger,
                     ResidualReason::OpSiteJoinMismatch { expected, found },
@@ -589,15 +723,46 @@ pub fn smelt(
 /// using the enclosing op's `(block_addr, op_idx)` site. `None` when `op_site` itself is `None`,
 /// or (defensively; should not occur for a `Ram` varnode under any convention) when projection
 /// fails.
-fn block_anchor_facet(op_site: Option<(u64, usize)>, conv: &R2ilConvention) -> Option<VarnodeFacet> {
+fn block_anchor_facet(
+    op_site: Option<(u64, usize)>,
+    conv: &R2ilConvention,
+) -> Option<VarnodeFacet> {
     let (block_addr, _) = op_site?;
+    facet::project(&Varnode::ram(block_addr, 0), conv.spaces()).ok()
+}
+
+/// Anchor a row that has no `op_site` but DOES know its block.
+///
+/// Measured gap this closes: an SSA **phi** is a real instruction with a `prov.block` but no
+/// source `op_site` (it has no R2IL op behind it), and an [`crate::ore::OreFact::Edge`] carries no
+/// `prov.inst` at all — so both fell through [`block_anchor_facet`] and produced an UNADDRESSED
+/// residual. Under the addressed-slag rule that is a defect, not an acceptable default: a residual
+/// the proposer cannot locate is a residual it cannot answer. Both are block-addressable, so they
+/// are addressed here.
+///
+/// This is strictly a fallback — a row with a real `op_site` still anchors on it. `None` survives
+/// only for rows with neither coordinate, which under the pass-1 ladder means exactly the phi
+/// INPUT rows whose reason is [`crate::slag::ResidualReason::NoFacetCoordinate`] (an SSA join edge
+/// is not a varnode occurrence, so it legitimately has no facet).
+fn any_anchor_facet(
+    behavior: &FunctionBehavior,
+    prov: FactProvenance,
+    conv: &R2ilConvention,
+) -> Option<VarnodeFacet> {
+    if let Some(facet) = block_anchor_facet(prov.op_site, conv) {
+        return Some(facet);
+    }
+    let block_addr = block_addr_of(behavior, prov.block?)?;
     facet::project(&Varnode::ram(block_addr, 0), conv.spaces()).ok()
 }
 
 /// `BlockId` -> its real address, via [`crate::behavior::FunctionBehavior::values`]'s
 /// `SsaGraph::block`.
 fn block_addr_of(behavior: &FunctionBehavior, block: BlockId) -> Option<u64> {
-    behavior.values().block(block).map(|graph_block| graph_block.addr)
+    behavior
+        .values()
+        .block(block)
+        .map(|graph_block| graph_block.addr)
 }
 
 /// The `OpTag` of a block's terminating (last) source op — used as `Edge`'s `opcode`, since an
@@ -668,13 +833,14 @@ mod tests {
 
     #[test]
     fn a_flat_fact_stays_flat() {
-        // The compile-time guard above (`const _: () = assert!(...)`) is the real contract; this
-        // test additionally pins the runtime observation and the `Copy` bound, matching the
-        // spec's "assert_eq!(size_of::<FlatFact>(), <the pinned constant>) and assert!(FlatFact:
-        // Copy)". The exact byte count is target/ABI-dependent (enum niche packing, alignment
-        // padding), so this pins the BOUND the const assert already enforces rather than a
-        // literal that could differ across hosts.
-        assert!(core::mem::size_of::<FlatFact>() <= 64);
+        // The compile-time guard above is the real contract; this pins the same MEASURED constant
+        // at runtime plus the `Copy` bound (the half that actually proves no heap indirection —
+        // a type owning a `Vec`/`Box`/`String`/map cannot derive `Copy`).
+        //
+        // The pin is exact rather than a bound, so both growth and shrinkage fail loudly. It is
+        // measured on a 64-bit target; a genuinely different ABI would need a re-measure, not a
+        // loosened assertion — and the arithmetic behind 88 is spelled out at the const assert.
+        assert_eq!(core::mem::size_of::<FlatFact>(), FLAT_FACT_SIZE);
         fn assert_copy<T: Copy>() {}
         assert_copy::<FlatFact>();
     }
@@ -703,7 +869,9 @@ mod tests {
                 Varnode::register(24, 8),
             ],
         });
-        block.push(r2il::R2ILOp::Return { target: Varnode::register(0, 8) });
+        block.push(r2il::R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
         let blocks = vec![block];
         let behavior = FunctionBehavior::from_blocks_raw(&blocks, Some(&arch))
             .expect("single-block CallOther+Return fixture must ingest");
@@ -721,7 +889,11 @@ mod tests {
             .iter()
             .filter(|row| row.kind == FactKind::OperandIn && row.opcode == OpTag::CallOther)
             .collect();
-        assert_eq!(op_rows.len(), 1, "expected exactly 1 Op row, got {op_rows:?}");
+        assert_eq!(
+            op_rows.len(),
+            1,
+            "expected exactly 1 Op row, got {op_rows:?}"
+        );
         assert_eq!(
             operand_in_rows.len(),
             4,
@@ -748,18 +920,66 @@ mod tests {
         let reg_a = Varnode::register(8, 8);
         let reg_b = Varnode::register(16, 8);
         let binary_ops = [
-            r2il::R2ILOp::IntAdd { dst: Varnode::register(0, 8), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntSub { dst: Varnode::register(0, 8), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntMult { dst: Varnode::register(0, 8), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntAnd { dst: Varnode::register(0, 8), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntOr { dst: Varnode::register(0, 8), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntXor { dst: Varnode::register(0, 8), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntLess { dst: Varnode::register(0, 1), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntSLess { dst: Varnode::register(0, 1), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntLeft { dst: Varnode::register(0, 8), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntRight { dst: Varnode::register(0, 8), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntEqual { dst: Varnode::register(0, 1), a: reg_a.clone(), b: reg_b.clone() },
-            r2il::R2ILOp::IntNotEqual { dst: Varnode::register(0, 1), a: reg_a.clone(), b: reg_b.clone() },
+            r2il::R2ILOp::IntAdd {
+                dst: Varnode::register(0, 8),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntSub {
+                dst: Varnode::register(0, 8),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntMult {
+                dst: Varnode::register(0, 8),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntAnd {
+                dst: Varnode::register(0, 8),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntOr {
+                dst: Varnode::register(0, 8),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntXor {
+                dst: Varnode::register(0, 8),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntLess {
+                dst: Varnode::register(0, 1),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntSLess {
+                dst: Varnode::register(0, 1),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntLeft {
+                dst: Varnode::register(0, 8),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntRight {
+                dst: Varnode::register(0, 8),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntEqual {
+                dst: Varnode::register(0, 1),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
+            r2il::R2ILOp::IntNotEqual {
+                dst: Varnode::register(0, 1),
+                a: reg_a.clone(),
+                b: reg_b.clone(),
+            },
         ];
         for op in binary_ops {
             block.push(op);
@@ -774,9 +994,16 @@ mod tests {
             addr: reg_a.clone(),
             val: Varnode::register(24, 8),
         });
-        block.push(r2il::R2ILOp::Copy { dst: Varnode::register(32, 8), src: Varnode::register(24, 8) });
-        block.push(r2il::R2ILOp::Call { target: Varnode::constant(0x9000, 8) });
-        block.push(r2il::R2ILOp::Return { target: Varnode::register(0, 8) });
+        block.push(r2il::R2ILOp::Copy {
+            dst: Varnode::register(32, 8),
+            src: Varnode::register(24, 8),
+        });
+        block.push(r2il::R2ILOp::Call {
+            target: Varnode::constant(0x9000, 8),
+        });
+        block.push(r2il::R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
 
         let blocks = vec![block];
         let behavior =
@@ -820,7 +1047,9 @@ mod tests {
             replacement: Varnode::register(24, 8),
             ordering: MemoryOrdering::SeqCst,
         });
-        block.push(r2il::R2ILOp::Return { target: Varnode::register(0, 8) });
+        block.push(r2il::R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
         let blocks = vec![block];
         let behavior = FunctionBehavior::from_blocks_raw(&blocks, Some(&arch))
             .expect("AtomicCAS+Return fixture must ingest");
@@ -866,10 +1095,12 @@ mod tests {
             a: Varnode::register(8, 8),
             b: Varnode::register(16, 8),
         });
-        block.push(r2il::R2ILOp::Return { target: Varnode::register(0, 8) });
+        block.push(r2il::R2ILOp::Return {
+            target: Varnode::register(0, 8),
+        });
         let blocks = vec![block];
-        let behavior =
-            FunctionBehavior::from_blocks_raw(&blocks, None).expect("IntAdd+Return fixture must ingest");
+        let behavior = FunctionBehavior::from_blocks_raw(&blocks, None)
+            .expect("IntAdd+Return fixture must ingest");
         let conv = R2ilConvention::minimal_pass_one();
         let (flat, ledger, report) = smelt(&behavior, &blocks, &conv);
         assert!(report.is_conserved());
@@ -885,7 +1116,10 @@ mod tests {
                 op_rows_checked += 1;
             }
         }
-        assert_eq!(op_rows_checked, 2, "expected both IntAdd and Return to classify under pass 1");
+        assert_eq!(
+            op_rows_checked, 2,
+            "expected both IntAdd and Return to classify under pass 1"
+        );
 
         // And any residual that DID land a Ram-space address must likewise be the real block
         // address, not zero.

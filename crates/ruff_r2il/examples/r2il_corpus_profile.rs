@@ -157,9 +157,7 @@ mod elf {
         }
 
         let section_header_off = |index: u16| -> Option<usize> {
-            let off = e_shoff.checked_add(
-                u64::from(index).checked_mul(u64::from(e_shentsize))?,
-            )?;
+            let off = e_shoff.checked_add(u64::from(index).checked_mul(u64::from(e_shentsize))?)?;
             usize::try_from(off).ok()
         };
 
@@ -178,8 +176,8 @@ mod elf {
             let sh_size = read_u64(bytes, hdr + 32)?;
             let sh_link = read_u32(bytes, hdr + 40)?;
             let sh_entsize = read_u64(bytes, hdr + 56)?;
-            let name = read_name(bytes, shstrtab_offset, shstrtab_size, sh_name)
-                .unwrap_or_default();
+            let name =
+                read_name(bytes, shstrtab_offset, shstrtab_size, sh_name).unwrap_or_default();
             sections.push((
                 Section {
                     name,
@@ -195,8 +193,9 @@ mod elf {
         }
 
         let mut functions = Vec::new();
-        if let Some((symtab, link, entsize)) =
-            sections.iter().find(|(s, _, _)| s.sh_type == ELF_SHT_SYMTAB)
+        if let Some((symtab, link, entsize)) = sections
+            .iter()
+            .find(|(s, _, _)| s.sh_type == ELF_SHT_SYMTAB)
         {
             let entsize = if *entsize == 0 { 24 } else { *entsize };
             if let Some((strtab, _, _)) = sections.get(*link as usize) {
@@ -411,7 +410,13 @@ fn lift_window(bytes: &[u8], offset: usize) -> Vec<u8> {
 
 /// Linear op-level sweep of one section's bytes, capped at `cap` bytes. On `Ok`, advances by
 /// `block.size.max(1)`; on `Err`, counts one undecodable instruction and advances one byte.
-fn pass1_sweep(disasm: &Disassembler, bytes: &[u8], base_addr: u64, cap: usize, stats: &mut Pass1Stats) {
+fn pass1_sweep(
+    disasm: &Disassembler,
+    bytes: &[u8],
+    base_addr: u64,
+    cap: usize,
+    stats: &mut Pass1Stats,
+) {
     let limit = bytes.len().min(cap);
     let mut offset = 0usize;
     while offset < limit {
@@ -707,10 +712,14 @@ fn print_pass2(stats: &Pass2Stats) {
     print_distribution("vocab.ssa_name_bytes", &stats.vocab_ssa_name_bytes);
     print_distribution("vocab.interned_id_bytes", &stats.vocab_interned_id_bytes);
 
-    let facet_total = stats.facet_ok + stats.facet_unknown_custom_space + stats.facet_ordinal_exhausted;
+    let facet_total =
+        stats.facet_ok + stats.facet_unknown_custom_space + stats.facet_ordinal_exhausted;
     println!(
         "    facet::project sweep: ok={} FacetOverflow(UnknownCustomSpace)={} FacetOverflow(CustomOrdinalExhausted)={} total={}",
-        stats.facet_ok, stats.facet_unknown_custom_space, stats.facet_ordinal_exhausted, facet_total
+        stats.facet_ok,
+        stats.facet_unknown_custom_space,
+        stats.facet_ordinal_exhausted,
+        facet_total
     );
 
     let conserved = stats.smelt_dropped == 0
@@ -769,7 +778,13 @@ fn process_binary(setup: &Setup, path: &Path) {
         let Some(section_bytes) = bytes.get(start..start.saturating_add(len)) else {
             continue;
         };
-        pass1_sweep(&setup.disasm, section_bytes, section.addr, setup.max_section_bytes, &mut p1);
+        pass1_sweep(
+            &setup.disasm,
+            section_bytes,
+            section.addr,
+            setup.max_section_bytes,
+            &mut p1,
+        );
     }
     print_pass1(&p1);
     println!();
@@ -834,11 +849,21 @@ fn run_pass2_over(
             .min(section.end_addr())
             .min(section_capped_end);
         if fn_end <= fn_start {
-            skip_function(&mut stats, symbol, "empty range after capping to section bytes");
+            skip_function(
+                &mut stats,
+                symbol,
+                "empty range after capping to section bytes",
+            );
             continue;
         }
 
-        let infos = sweep_function_instructions(&setup.disasm, section_bytes, section.addr, fn_start, fn_end);
+        let infos = sweep_function_instructions(
+            &setup.disasm,
+            section_bytes,
+            section.addr,
+            fn_start,
+            fn_end,
+        );
         let leaders = compute_leaders(fn_start, fn_end, &infos);
         let ranges = basic_block_ranges(fn_end, &leaders);
         let Some(bbs) = lift_blocks(&setup.disasm, section_bytes, section.addr, &ranges) else {
@@ -846,7 +871,11 @@ fn run_pass2_over(
             continue;
         };
         let Some(behavior) = FunctionBehavior::from_blocks_raw(&bbs, Some(&setup.spec)) else {
-            skip_function(&mut stats, symbol, "FunctionBehavior::from_blocks_raw returned None");
+            skip_function(
+                &mut stats,
+                symbol,
+                "FunctionBehavior::from_blocks_raw returned None",
+            );
             continue;
         };
 
@@ -860,7 +889,9 @@ fn run_pass2_over(
         }
         stats.values_per_fn.push(behavior.values().values.len());
         stats.call_sites_per_fn.push(behavior.calls().by_id.len());
-        stats.predicates_per_fn.push(behavior.predicates().predicates.len());
+        stats
+            .predicates_per_fn
+            .push(behavior.predicates().predicates.len());
 
         let harvest = VocabHarvest::from_behavior(&behavior);
         let vstats = harvest.stats();
@@ -876,9 +907,7 @@ fn run_pass2_over(
             .push(vstats.unique_custom_spaces_from_strings);
         stats.vocab_total_values.push(vstats.total_values);
         stats.vocab_ssa_name_bytes.push(vstats.ssa_name_bytes);
-        stats
-            .vocab_interned_id_bytes
-            .push(vstats.interned_id_bytes);
+        stats.vocab_interned_id_bytes.push(vstats.interned_id_bytes);
 
         for block in &bbs {
             for op in &block.ops {

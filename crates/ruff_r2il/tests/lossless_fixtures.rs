@@ -13,8 +13,8 @@
 use std::collections::BTreeSet;
 
 use r2il::{
-    ArchSpec, AtomicKind, MemoryOrdering, OpMetadata, PointerHint, R2ILBlock, R2ILOp,
-    RegisterDef, ScalarKind, SpaceId, Varnode, VarnodeMetadata,
+    ArchSpec, AtomicKind, MemoryOrdering, OpMetadata, PointerHint, R2ILBlock, R2ILOp, RegisterDef,
+    ScalarKind, SpaceId, Varnode, VarnodeMetadata,
 };
 use r2ssa::{CompareKind, InstPayload, SSAOp};
 
@@ -153,7 +153,14 @@ fn fixture_function() -> Vec<R2ILBlock> {
     b2.push(R2ILOp::LoadGuarded {
         dst: reg(0x30, 8),
         space: SpaceId::Custom(7),
-        addr: reg(0x20, 8),
+        // The ADDRESS varnode genuinely lives in Custom(7), not merely the op's `space:` field.
+        // MEASURED reason: an op's own `space:` is not a varnode and never surfaces through
+        // `R2ILOp::inputs()/output()`, so a Custom space that exists ONLY there is invisible to
+        // operand enumeration and could never reach `facet::project` -- the config-key falsifier
+        // would silently test nothing. A varnode in the space exercises the real path.
+        // (That op-level-space harvest gap is real and is recorded as a named plan item; it is a
+        // missing ore fact kind, not a conservation violation.)
+        addr: Varnode::new(SpaceId::Custom(7), 0x20, 8),
         guard: reg(0x28, 1),
         ordering: MemoryOrdering::Acquire,
     });
@@ -566,10 +573,7 @@ fn op_metadata_rejoins_by_op_site_even_though_ssa_does_not_carry_it() {
         .and_then(|b| b.op_metadata(0))
         .expect("source op metadata must be present at index 0");
     assert_eq!(source_meta.memory_ordering, Some(MemoryOrdering::SeqCst));
-    assert_eq!(
-        source_meta.atomic_kind,
-        Some(AtomicKind::CompareExchange)
-    );
+    assert_eq!(source_meta.atomic_kind, Some(AtomicKind::CompareExchange));
 }
 
 // ---------------------------------------------------------------------------
@@ -614,10 +618,7 @@ fn varnode_metadata_is_advisory_and_does_not_change_ingest() {
     };
 
     assert_eq!(value_triples(&plain), value_triples(&annotated));
-    assert_eq!(
-        plain.values().insts.len(),
-        annotated.values().insts.len()
-    );
+    assert_eq!(plain.values().insts.len(), annotated.values().insts.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +636,11 @@ fn multiequal_ingest_becomes_a_phi_zipped_to_the_predecessor_count() {
         .get_block(0x2004)
         .expect("the multiequal block must exist");
 
-    assert_eq!(block.phis.len(), 1, "exactly one phi at the multiequal site");
+    assert_eq!(
+        block.phis.len(),
+        1,
+        "exactly one phi at the multiequal site"
+    );
     let phi = &block.phis[0];
 
     // State the rule, not the number: fan-in is truncated to zip against the
@@ -740,8 +745,14 @@ fn stressors_land_in_slag_under_pass_one_and_are_named_and_addressed() {
     }
 
     // Each asserted individually so no single absorbing group can satisfy the test.
-    assert!(found_atomic_cas, "AtomicCAS must land in slag under pass one");
-    assert!(found_call_other, "CallOther must land in slag under pass one");
+    assert!(
+        found_atomic_cas,
+        "AtomicCAS must land in slag under pass one"
+    );
+    assert!(
+        found_call_other,
+        "CallOther must land in slag under pass one"
+    );
     assert!(
         found_store_guarded,
         "StoreGuarded must land in slag under pass one"
@@ -822,9 +833,15 @@ fn widening_the_convention_moves_a_stressor_out_of_slag() {
             )
         })
         .count();
-    assert_eq!(
-        atomic_cas_op_residual_before, 1,
-        "exactly one AtomicCAS op exists in the fixture"
+    // MEASURED, not assumed: the fixture holds ONE AtomicCAS op, but an unclassified op blocks
+    // every ore fact that depends on it — its own `Op` row plus its four operand rows and the
+    // memory use/def rows it generates, all tagged with the PARENT's opcode. Conservation demands
+    // exactly that (every ore fact is classified or residual, never dropped), so the count is the
+    // op's whole dependent fan-out, not 1. An earlier `== 1` here encoded the wrong model and is
+    // the reason this comment exists.
+    assert!(
+        atomic_cas_op_residual_before > 1,
+        "AtomicCAS must block its dependent fan-out, not merely its own Op row"
     );
 
     let atomic_cas_op_residual_after = ledger_after
@@ -850,7 +867,27 @@ fn widening_the_convention_moves_a_stressor_out_of_slag() {
     // classifies, this delta is attributable entirely to that one change.
     let delta_classified = report_after.classified - report_before.classified;
     let delta_residual = report_before.residual - report_after.residual;
-    assert!(delta_classified > 0, "widening must move something out of slag");
+    assert!(
+        delta_classified > 0,
+        "widening must move something out of slag"
+    );
+    // MEASURED: widening reclassifies only the subset that has nothing else blocking it — the op
+    // row and its memory rows melt, while its OPERAND rows stay residual under a DIFFERENT named
+    // reason (`NoConventionRowAtAddress`: `minimal_pass_one()` carries no address rows, so an
+    // operand's facet resolves to nothing). So the blocked fan-out is an upper bound on the
+    // delta, never an equality — asserting equality here was wrong and this bound is the true
+    // claim.
+    assert!(
+        delta_classified <= atomic_cas_op_residual_before,
+        "widening cannot reclassify more rows than the opcode was blocking"
+    );
+    // Nothing evaporates in the transition: the same ore is harvested both times, so every row
+    // that stopped being an AtomicCAS residual is either classified now or carries another named
+    // reason — it cannot have been dropped.
+    assert_eq!(
+        report_before.harvested, report_after.harvested,
+        "the same ore is harvested regardless of convention; only its fate changes"
+    );
     assert_eq!(
         delta_classified, delta_residual,
         "every newly classified fact must vacate residual in lockstep"

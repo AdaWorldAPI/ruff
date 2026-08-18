@@ -77,8 +77,8 @@
 
 use r2il::{R2ILBlock, R2ILOp, SpaceId};
 use r2ssa::{
-    BlockId, BlockTerminator, CallSiteId, CompareKind, InstId, InstPayload, ObjectId,
-    PredicateId, SSAOp, ValueId,
+    BlockId, BlockTerminator, CallSiteId, CompareKind, InstId, InstPayload, ObjectId, PredicateId,
+    SSAOp, ValueId,
 };
 
 use crate::behavior::FunctionBehavior;
@@ -681,10 +681,7 @@ pub fn enumerate(behavior: &FunctionBehavior, blocks: &[R2ILBlock]) -> Vec<OreFa
                     for (index, varnode) in source_op.inputs().into_iter().enumerate() {
                         let value = inst.inputs.get(index).copied();
                         facts.push(OreFact::Operand {
-                            prov: FactProvenance {
-                                value,
-                                ..base_prov
-                            },
+                            prov: FactProvenance { value, ..base_prov },
                             position: OperandPos::Input(index),
                             value,
                             space: varnode.space,
@@ -695,10 +692,7 @@ pub fn enumerate(behavior: &FunctionBehavior, blocks: &[R2ILBlock]) -> Vec<OreFa
                     if let Some(varnode) = source_op.output() {
                         let value = inst.output;
                         facts.push(OreFact::Operand {
-                            prov: FactProvenance {
-                                value,
-                                ..base_prov
-                            },
+                            prov: FactProvenance { value, ..base_prov },
                             position: OperandPos::Output,
                             value,
                             space: varnode.space,
