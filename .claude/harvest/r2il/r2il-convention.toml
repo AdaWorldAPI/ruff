@@ -6,8 +6,26 @@ classified_opcodes = ["copy", "load", "store", "int_add", "cbranch", "call", "re
 
 [[row]]
 prefix_depth = 1
+space = 0
+name = "ram"
+state = "unmeasured"
+
+[[row]]
+prefix_depth = 1
 space = 1
 name = "register"
+state = "unmeasured"
+
+[[row]]
+prefix_depth = 1
+space = 2
+name = "unique"
+state = "unmeasured"
+
+[[row]]
+prefix_depth = 1
+space = 3
+name = "const"
 state = "unmeasured"
 
 [[row]]

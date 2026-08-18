@@ -1,6 +1,6 @@
 # R2IL pass-1 census
 
-Total classified `FlatFact` rows: 10729
+Total classified `FlatFact` rows: 17557
 
 ## By fact kind
 
@@ -9,19 +9,19 @@ Total classified `FlatFact` rows: 10729
 | call_site | 108 |
 | edge | 456 |
 | op | 5340 |
-| operand_in | 2927 |
-| operand_out | 1898 |
+| operand_in | 7416 |
+| operand_out | 4237 |
 
 ## By opcode
 
 | opcode | count |
 |---|---|
 | branch | 25 |
-| call | 320 |
+| call | 428 |
 | call_ind | 4 |
-| cbranch | 601 |
-| copy | 4753 |
-| int_add | 2713 |
-| load | 1179 |
+| cbranch | 995 |
+| copy | 6753 |
+| int_add | 4768 |
+| load | 2394 |
 | return | 222 |
-| store | 912 |
+| store | 1968 |
