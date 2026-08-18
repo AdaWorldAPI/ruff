@@ -1302,7 +1302,7 @@ mod tests {
         // visibility-honestly (`guarded_by`, NOT `requires`): the OQ-GUARD-1
         // probe measured that guards combine permissions via `&&`/`||` plus
         // non-permission conditions, so a flat "requires" claim would
-        // mis-encode the disjunctions. Inferred — a proc-body heuristic) = 79.
+        // misencode the disjunctions. Inferred — a proc-body heuristic) = 79.
         // NB (#77 lesson): this count lives HERE only. No other arm may
         // re-assert it — cross-crate count duplication is the "monitor N pins"
         // anti-pattern; a predicate added here must never trip a routes.rs test.

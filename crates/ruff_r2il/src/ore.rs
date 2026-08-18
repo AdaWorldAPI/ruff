@@ -29,10 +29,10 @@
 //! mismatch — the `Multiequal` index shift (a phi extracted from `.ops` into `.phis` leaves a
 //! later r2il op's `.ops` index pointing at what SSA calls a different instruction), or a
 //! `CallDefine` insertion (a synthetic op with no r2il counterpart at all, shifting every later
-//! index) — emits [`OreFact::JoinFailure`], **never** a silently mis-attributed coordinate.
+//! index) — emits [`OreFact::JoinFailure`], **never** a silently misattributed coordinate.
 //!
 //! Rows with no source varnode at all — phi inputs (routed through the dedicated
-//! [`OreFact::PhiInput`], which carries no facet-coordinate fields to mis-attribute) and
+//! [`OreFact::PhiInput`], which carries no facet-coordinate fields to misattribute) and
 //! `SSAOp::CallDefine` (a fresh unknown-register value with no source op whatsoever, so no join
 //! is even attempted for it) — are the furnace's `NoFacetCoordinate` residual once melted; this
 //! module simply never manufactures a coordinate for them. Nothing is dropped: every
@@ -385,7 +385,7 @@ impl OpTag {
             OpTag::IntSRem => "int_srem",
             OpTag::IntNegate => "int_negate",
             OpTag::IntCarry => "int_carry",
-            OpTag::IntSCarry => "int_scarry",
+            OpTag::IntSCarry => "int_scary",
             OpTag::IntSBorrow => "int_sborrow",
             OpTag::IntAnd => "int_and",
             OpTag::IntOr => "int_or",

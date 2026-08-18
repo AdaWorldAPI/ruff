@@ -499,8 +499,8 @@ mod tests {
     }
 
     /// The core falsifier: a full round-trip recovers the emitted projection
-    /// of the source graph exactly. Would fail on any mis-attribution,
-    /// overload collapse, parameter loss, or name mis-parse.
+    /// of the source graph exactly. Would fail on any misattribution,
+    /// overload collapse, parameter loss, or name misparse.
     #[test]
     fn round_trip_recovers_cpp_emitted_projection() {
         let g = cpp_fixture();
