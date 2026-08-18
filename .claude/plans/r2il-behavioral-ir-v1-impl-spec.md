@@ -26,18 +26,18 @@ cleanliness of r2il's Rust types for refinement *is* the privileged-direct-path 
 
 - **(a) The ARM preserves that object graph untouched** — it never flattens at intake.
 - **(b) The FURNACE melts it** into flat, facet-addressed, concern-separated rows
-  (`FactId + VarnodeFacet + Concern` — plain flat `Vec`s, **never another object graph**).
+    (`FactId + VarnodeFacet + Concern` — plain flat `Vec`s, **never another object graph**).
 - **(c) The SLAG is what resisted flattening**, addressed at the facet coordinate where it resisted.
 
-| stage | module | role |
-|---|---|---|
-| 1 · intake arm / **ore carrier** | `behavior.rs` | lossless zero-copy assembly. **Not** an invented "contract" |
-| 2 · **ore** | `ore.rs` | deterministic typed fact enumeration over the object graph |
-| 3 · **furnace** | `furnace.rs` | melt → **flat** `FlatFact` rows; conservation ledger |
-| 3b · **slag** | `slag.rs` | addressed residual rows; shape id + reason; **no `Other`, ever** |
-| — · drill key + config tree | `facet.rs`, `convention.rs` | the 16-byte address, and longest-prefix-wins config over it |
-| 4 · DTO / codebook factoring | `vocab.rs` | feeds lance-graph `ogar_codebook` **read-only** |
-| — · artifact set | `examples/harvest_r2il.rs` | the deliverable, per MedCare-rs / openproject-nexgen-rs |
+| stage                            | module                      | role                                                             |
+| -------------------------------- | --------------------------- | ---------------------------------------------------------------- |
+| 1 · intake arm / **ore carrier** | `behavior.rs`               | lossless zero-copy assembly. **Not** an invented "contract"      |
+| 2 · **ore**                      | `ore.rs`                    | deterministic typed fact enumeration over the object graph       |
+| 3 · **furnace**                  | `furnace.rs`                | melt → **flat** `FlatFact` rows; conservation ledger             |
+| 3b · **slag**                    | `slag.rs`                   | addressed residual rows; shape id + reason; **no `Other`, ever** |
+| — · drill key + config tree      | `facet.rs`, `convention.rs` | the 16-byte address, and longest-prefix-wins config over it      |
+| 4 · DTO / codebook factoring     | `vocab.rs`                  | feeds lance-graph `ogar_codebook` **read-only**                  |
+| — · artifact set                 | `examples/harvest_r2il.rs`  | the deliverable, per MedCare-rs / openproject-nexgen-rs          |
 
 Refined concern *contracts* are a later, measured furnace output. This PR does not invent them.
 
@@ -45,34 +45,34 @@ Refined concern *contracts* are a later, measured furnace output. This PR does n
 
 A worker that contradicts one of these is wrong, not the source.
 
-| Fact | Where |
-|---|---|
-| `Varnode { space: SpaceId, offset: u64, size: u32, meta: Option<VarnodeMetadata> }`; `PartialEq`/`Hash` **ignore `meta`** | `r2il/src/varnode.rs:19,149-163` |
-| `SpaceId::{Ram, Register, Unique, Const, Custom(u32)}` (`Copy, Eq, Hash`, default `Ram`) | `r2il/src/space.rs:10-23` |
-| `R2ILBlock { addr, size, ops: Vec<R2ILOp>, switch_info, op_metadata: BTreeMap<usize, OpMetadata> }` | `r2il/src/opcode.rs:1190-1203` |
-| `R2ILOp::{inputs() -> Vec<&Varnode>, output() -> Option<&Varnode>, is_control_flow/_memory_read/_memory_write}` | `r2il/src/opcode.rs:499-804` |
-| **`ArchSpec` public fields** `name: String`, `addr_size: u32`, `spaces: Vec<AddressSpace>`, `registers: Vec<RegisterDef>`, `userops: Vec<UserOpDef>` | `r2il/src/serialize.rs:97-140` |
-| `RegisterDef { name: String, offset: u64, size: u32, parent: Option<String> }`; `UserOpDef { index: u32, name: String }`; `AddressSpace { id: SpaceId, name: String, … }` | `serialize.rs:42-51,77-82`; `space.rs:61-90` |
-| `SSAFunction`: `pub name`, `pub entry`; `cfg`/`domtree`/`blocks`/`block_order` **PRIVATE** — use `blocks()`, `block_addrs()`, `get_block()`, `predecessors()`, `successors()`, `cfg()`, `num_blocks()` | `function.rs:251-268, 946-1004` |
-| `SSAFunction::from_blocks_raw(&[R2ILBlock], Option<&ArchSpec>) -> Option<Self>` — raw, **no optimization**. `from_blocks_with_arch` = raw **then constructor-time SCCP** (can rewrite ops) | `function.rs:829, 738-753` |
-| `SsaArtifact::{from_blocks, raw, …}` → accessors `function/graph/facts/objects/memory/predicates/call_sites/mode/with_name`; `new` **private**; `Debug + Clone`; `Deref<Target = SSAFunction>` | `function.rs:78-234` |
-| `SsaGraph::from_function`; public `entry, block_order, blocks, insts, values, def_of, uses_of, block_by_addr, value_by_var, op_inst_by_site, op_site_by_inst`; `GraphInst{id, block, ordinal, inputs, output, payload}`; `InstPayload::{Phi{predecessors}, Op(SSAOp)}`; `GraphBlock{id, addr, size, predecessors, successors, insts}` | `graph.rs:30-72` |
-| `PreparedFunctionFacts::collect(&SSAFunction, &SsaGraph)` → `{objects, memory, predicates, call_sites}` | `semantic.rs:188-208` |
-| `MemoryUseFact{location, version}`, `MemoryDefFact{location, previous_version, next_version}`, `MemoryLocation{object: ObjectId, offset: i64, size: u32}`, `MemoryVersion{object, version: u32}` | `semantic.rs:73-111` |
-| `PredicateFact{id, block_addr, condition: ValueId, comparison: Option<CompareProvenance>, true_target: u64, false_target: u64}`; `CompareKind::{Equal,NotEqual,Less,SignedLess,LessEqual,SignedLessEqual}` | `semantic.rs:113-138` |
-| `CallSiteFact{id, at: InstId, target: ValueId, direct_target: Option<u64>, fallthrough, memory_effect}`; `ObjectKind::{StackSlot,FrameObject,Global{space:String,address},HeapAlloc,EscapedUnknown}` | `semantic.rs:172-186, 29-36` |
-| `InterprocFunctionInput<'a>{id, name, prepared: &'a SsaArtifact}`; `solve_interproc_summary_set(&[..], Option<&ArchSpec>, Option<Id>, &BTreeMap<..>, InterprocSolveConfig)` | `interproc.rs:232,451` |
-| **`SSAVar{name: String, version: u32, size: u32}` — NO `offset`, NO `SpaceId`** | `var.rs:10-17` |
-| `SSAOp` has **no `Multiequal`, no `Indirect`**; memory ops carry `space: String` | `op.rs:16-350` |
-| Function-level rename stringifies spaces as **`format!("{:?}", space)`** → `"Ram"`, `"Custom(7)"`; `varnode_to_name`: `Register→"rax"\|"reg:{x}"`, `Unique→"tmp:{x}"`, `Const→"const:{x}"`, `Ram→"ram:{x}"`, `Custom(id)→"space{id}:{x}"` | `rename.rs:456+`; `naming.rs:120-135` |
-| `rename_op` is **total, 1 SSAOp per R2ILOp**; `Multiequal → SSAOp::Phi`, `Indirect → SSAOp::Copy` | `rename.rs:433,1087,1101` |
-| Construction partitions `SSAOp::Phi` out of `ops` into `block.phis`, **zipping sources with `cfg.predecessors(addr)`** → fan-in truncates to the predecessor count | `function.rs:888-911` |
-| `CFG::from_blocks`: **one `R2ILBlock` = one CFG node**; terminator from a **reverse** op scan (last CF op wins); `Fallthrough{next: addr+size}` when none; branch/call targets need `Const`/`Ram` to be typed | `cfg.rs:252-274, 96-160` |
-| `PredicateFact` needs terminator `ConditionalBranch` **and** the block's **last** op `SSAOp::CBranch` | `semantic.rs:670-709` |
-| memory uses ← `{Load,LoadLinked,LoadGuarded,AtomicCAS,StoreConditional}` + calls; defs ← `{Store,StoreGuarded,StoreConditional,AtomicCAS}` + calls | `semantic.rs:397-471` |
-| `MemoryOrdering::{Relaxed,Acquire,Release,AcqRel,SeqCst,Unknown}` | `r2il/src/memory.rs:10-18` |
-| `Disassembler::from_sla(&[u8], &str, &str)` (**no `new`**), `lift`, `lift_block`, `set_userop_map`; `MIN_BYTES = 16`; `build_arch_spec(&[u8], &str, &str)`; `userop_map_for_arch(&str)` | `disasm.rs:149,261,314,301`; `sleigh.rs:106` |
-| `r2ssa` has a **hard, non-optional** dep on `r2sleigh-lift` (libsla native build) | `r2ssa/Cargo.toml` |
+| Fact                                                                                                                                                                                                                                                                                                                                  | Where                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `Varnode { space: SpaceId, offset: u64, size: u32, meta: Option<VarnodeMetadata> }`; `PartialEq`/`Hash` **ignore `meta`**                                                                                                                                                                                                             | `r2il/src/varnode.rs:19,149-163`             |
+| `SpaceId::{Ram, Register, Unique, Const, Custom(u32)}` (`Copy, Eq, Hash`, default `Ram`)                                                                                                                                                                                                                                              | `r2il/src/space.rs:10-23`                    |
+| `R2ILBlock { addr, size, ops: Vec<R2ILOp>, switch_info, op_metadata: BTreeMap<usize, OpMetadata> }`                                                                                                                                                                                                                                   | `r2il/src/opcode.rs:1190-1203`               |
+| `R2ILOp::{inputs() -> Vec<&Varnode>, output() -> Option<&Varnode>, is_control_flow/_memory_read/_memory_write}`                                                                                                                                                                                                                       | `r2il/src/opcode.rs:499-804`                 |
+| **`ArchSpec` public fields** `name: String`, `addr_size: u32`, `spaces: Vec<AddressSpace>`, `registers: Vec<RegisterDef>`, `userops: Vec<UserOpDef>`                                                                                                                                                                                  | `r2il/src/serialize.rs:97-140`               |
+| `RegisterDef { name: String, offset: u64, size: u32, parent: Option<String> }`; `UserOpDef { index: u32, name: String }`; `AddressSpace { id: SpaceId, name: String, … }`                                                                                                                                                             | `serialize.rs:42-51,77-82`; `space.rs:61-90` |
+| `SSAFunction`: `pub name`, `pub entry`; `cfg`/`domtree`/`blocks`/`block_order` **PRIVATE** — use `blocks()`, `block_addrs()`, `get_block()`, `predecessors()`, `successors()`, `cfg()`, `num_blocks()`                                                                                                                                | `function.rs:251-268, 946-1004`              |
+| `SSAFunction::from_blocks_raw(&[R2ILBlock], Option<&ArchSpec>) -> Option<Self>` — raw, **no optimization**. `from_blocks_with_arch` = raw **then constructor-time SCCP** (can rewrite ops)                                                                                                                                            | `function.rs:829, 738-753`                   |
+| `SsaArtifact::{from_blocks, raw, …}` → accessors `function/graph/facts/objects/memory/predicates/call_sites/mode/with_name`; `new` **private**; `Debug + Clone`; `Deref<Target = SSAFunction>`                                                                                                                                        | `function.rs:78-234`                         |
+| `SsaGraph::from_function`; public `entry, block_order, blocks, insts, values, def_of, uses_of, block_by_addr, value_by_var, op_inst_by_site, op_site_by_inst`; `GraphInst{id, block, ordinal, inputs, output, payload}`; `InstPayload::{Phi{predecessors}, Op(SSAOp)}`; `GraphBlock{id, addr, size, predecessors, successors, insts}` | `graph.rs:30-72`                             |
+| `PreparedFunctionFacts::collect(&SSAFunction, &SsaGraph)` → `{objects, memory, predicates, call_sites}`                                                                                                                                                                                                                               | `semantic.rs:188-208`                        |
+| `MemoryUseFact{location, version}`, `MemoryDefFact{location, previous_version, next_version}`, `MemoryLocation{object: ObjectId, offset: i64, size: u32}`, `MemoryVersion{object, version: u32}`                                                                                                                                      | `semantic.rs:73-111`                         |
+| `PredicateFact{id, block_addr, condition: ValueId, comparison: Option<CompareProvenance>, true_target: u64, false_target: u64}`; `CompareKind::{Equal,NotEqual,Less,SignedLess,LessEqual,SignedLessEqual}`                                                                                                                            | `semantic.rs:113-138`                        |
+| `CallSiteFact{id, at: InstId, target: ValueId, direct_target: Option<u64>, fallthrough, memory_effect}`; `ObjectKind::{StackSlot,FrameObject,Global{space:String,address},HeapAlloc,EscapedUnknown}`                                                                                                                                  | `semantic.rs:172-186, 29-36`                 |
+| `InterprocFunctionInput<'a>{id, name, prepared: &'a SsaArtifact}`; `solve_interproc_summary_set(&[..], Option<&ArchSpec>, Option<Id>, &BTreeMap<..>, InterprocSolveConfig)`                                                                                                                                                           | `interproc.rs:232,451`                       |
+| **`SSAVar{name: String, version: u32, size: u32}` — NO `offset`, NO `SpaceId`**                                                                                                                                                                                                                                                       | `var.rs:10-17`                               |
+| `SSAOp` has **no `Multiequal`, no `Indirect`**; memory ops carry `space: String`                                                                                                                                                                                                                                                      | `op.rs:16-350`                               |
+| Function-level rename stringifies spaces as **`format!("{:?}", space)`** → `"Ram"`, `"Custom(7)"`; `varnode_to_name`: `Register→"rax"\|"reg:{x}"`, `Unique→"tmp:{x}"`, `Const→"const:{x}"`, `Ram→"ram:{x}"`, `Custom(id)→"space{id}:{x}"`                                                                                             | `rename.rs:456+`; `naming.rs:120-135`        |
+| `rename_op` is **total, 1 SSAOp per R2ILOp**; `Multiequal → SSAOp::Phi`, `Indirect → SSAOp::Copy`                                                                                                                                                                                                                                     | `rename.rs:433,1087,1101`                    |
+| Construction partitions `SSAOp::Phi` out of `ops` into `block.phis`, **zipping sources with `cfg.predecessors(addr)`** → fan-in truncates to the predecessor count                                                                                                                                                                    | `function.rs:888-911`                        |
+| `CFG::from_blocks`: **one `R2ILBlock` = one CFG node**; terminator from a **reverse** op scan (last CF op wins); `Fallthrough{next: addr+size}` when none; branch/call targets need `Const`/`Ram` to be typed                                                                                                                         | `cfg.rs:252-274, 96-160`                     |
+| `PredicateFact` needs terminator `ConditionalBranch` **and** the block's **last** op `SSAOp::CBranch`                                                                                                                                                                                                                                 | `semantic.rs:670-709`                        |
+| memory uses ← `{Load,LoadLinked,LoadGuarded,AtomicCAS,StoreConditional}` + calls; defs ← `{Store,StoreGuarded,StoreConditional,AtomicCAS}` + calls                                                                                                                                                                                    | `semantic.rs:397-471`                        |
+| `MemoryOrdering::{Relaxed,Acquire,Release,AcqRel,SeqCst,Unknown}`                                                                                                                                                                                                                                                                     | `r2il/src/memory.rs:10-18`                   |
+| `Disassembler::from_sla(&[u8], &str, &str)` (**no `new`**), `lift`, `lift_block`, `set_userop_map`; `MIN_BYTES = 16`; `build_arch_spec(&[u8], &str, &str)`; `userop_map_for_arch(&str)`                                                                                                                                               | `disasm.rs:149,261,314,301`; `sleigh.rs:106` |
+| `r2ssa` has a **hard, non-optional** dep on `r2sleigh-lift` (libsla native build)                                                                                                                                                                                                                                                     | `r2ssa/Cargo.toml`                           |
 
 ### ⚠ The load-bearing consequence: the facet coordinate is NOT recoverable from SSA
 
@@ -81,30 +81,31 @@ a varnode's offset is inside the *display name* (`"reg:10"`, `"space7:1000"`) �
 strings is forbidden as a data path. Therefore:
 
 - **`ore::enumerate` takes BOTH the `FunctionBehavior` AND the source `&[R2ILBlock]`.** Operand
-  coordinates come from the **typed** `Varnode`s in the source ops, joined to SSA instructions by
-  the `(block_addr, op_idx)` key `SsaGraph::op_inst_by_site` provides — the same key §8 test 6 proves
-  round-trips.
+    coordinates come from the **typed** `Varnode`s in the source ops, joined to SSA instructions by
+    the `(block_addr, op_idx)` key `SsaGraph::op_inst_by_site` provides — the same key §8 test 6 proves
+    round-trips.
 - The join is **verified, not assumed**: at each site compare `OpTag::from_op(ssa_op)` against the
-  R2IL op's tag; a mismatch (the `Multiequal` index shift, or a `CallDefine` insertion) emits
-  `ResidualReason::OpSiteJoinMismatch`, never a silently mis-attributed coordinate.
+    R2IL op's tag; a mismatch (the `Multiequal` index shift, or a `CallDefine` insertion) emits
+    `ResidualReason::OpSiteJoinMismatch`, never a silently mis-attributed coordinate.
 - Rows with no source varnode (phi inputs, `CallDefine`) get `at: None` and become the **named**
-  residual `ResidualReason::NoFacetCoordinate`. Nothing is dropped.
+    residual `ResidualReason::NoFacetCoordinate`. Nothing is dropped.
 
 **Honesty notes that must appear as doc comments in the code, not only here:**
-1. `lift` does **not** buy "zero system deps by default": `r2ssa` drags `r2sleigh-lift` → `libsla` in
-   unconditionally; `lift` gates only this crate's **direct** disassembler/`sleigh-config` use.
-2. `Varnode.meta` and `R2ILBlock.op_metadata` **do not cross into SSA**; they stay addressable by the
-   same `(block_addr, op_idx)` key. That rejoin is the contract.
-3. `r2il::SwitchInfo` (struct) vs `r2ssa::SwitchInfo` (type alias) — alias on import.
-4. **Do NOT copy `#![expect(clippy::print_stderr, …)]` from `ruff_cpp_spo`'s examples.** That lint
-   comes from ruff's `[workspace.lints]`, which an **excluded** crate cannot inherit; the unfulfilled
-   expectation would itself fail `clippy -D warnings`.
 
----
+1. `lift` does **not** buy "zero system deps by default": `r2ssa` drags `r2sleigh-lift` → `libsla` in
+    unconditionally; `lift` gates only this crate's **direct** disassembler/`sleigh-config` use.
+1. `Varnode.meta` and `R2ILBlock.op_metadata` **do not cross into SSA**; they stay addressable by the
+    same `(block_addr, op_idx)` key. That rejoin is the contract.
+1. `r2il::SwitchInfo` (struct) vs `r2ssa::SwitchInfo` (type alias) — alias on import.
+1. **Do NOT copy `#![expect(clippy::print_stderr, …)]` from `ruff_cpp_spo`'s examples.** That lint
+    comes from ruff's `[workspace.lints]`, which an **excluded** crate cannot inherit; the unfulfilled
+    expectation would itself fail `clippy -D warnings`.
+
+______________________________________________________________________
 
 ## 3. File inventory — `crates/ruff_r2il/`
 
-```
+```text
 crates/ruff_r2il/
 ├── Cargo.toml
 ├── src/lib.rs                        # crate docs + module decls (W1, up front)
@@ -169,12 +170,12 @@ unreachable_pub = "warn"
 
 - **No `license` field** (`publish = false`); no licensing statement is encoded here or in a comment.
 - **No `[lints.clippy] pedantic`** — `JUDGMENT`: an excluded crate cannot inherit ruff's lint table,
-  and hand-copying it creates an unmeasured lint surface for workers forbidden to compile.
+    and hand-copying it creates an unmeasured lint surface for workers forbidden to compile.
 - **No `[dev-dependencies]`**, no serde, no gz: fixtures and artifacts use only `r2il` + `r2ssa`.
 - `crates/ruff_r2il/Cargo.lock` **is committed** (not gitignored; the excluded crate is its own
-  workspace root and an arm's numbers must be reproducible).
+    workspace root and an arm's numbers must be reproducible).
 
----
+______________________________________________________________________
 
 ## 4. `src/facet.rs` — the DRILL KEY (promoted; two roles, one shape)
 
@@ -265,24 +266,23 @@ attach rows to the wrong varnode family — the worst possible failure for a dri
 ### Tests, each two-sided
 
 1. **`fixed_spaces_round_trip_byte_for_byte`** (+ the four classid words must be **distinct**, so a
-   constant-returning impl fails).
-2. **`custom_space_within_budget_round_trips`** — table `{3,7,9}`; `Custom(7)`'s lo u16 ==
-   `CUSTOM_ORDINAL_BASE + 1` (sorted position).
-3. **`custom_space_outside_the_table_errors_and_never_truncates`** — plan item **O3**: `Custom(5)`
-   vs an empty table → `Err(UnknownCustomSpace{raw:5})`; then intern **both** `5` and `65541` (the
-   pair a `raw as u16` cast would collide) and assert distinct facets, each unprojecting to its own
-   raw id.
-4. **`too_many_custom_spaces_is_a_typed_overflow_not_a_wrap`** — budget+2 errors; exactly budget
-   succeeds. Both sides pinned.
-5. **`offsets_above_u32_max_survive_the_lo_hi_split`** — `0x1234_5678_9ABC_DEF0` round-trips;
-   anti-vacuity: `u32::from_le_bytes(f.0[4..8]) as u64 != offset`.
-6. **`meta_is_excluded_from_the_projection`** — same varnode with/without metadata → **identical 16
-   bytes**; doc comment names the upstream contract it mirrors.
-7. **`prefixes_are_ordered_coarse_to_fine_and_share_their_ancestors`** — `prefixes()[0].depth()==1
-   … [2].depth()==3`; two facets in the same space share `prefixes()[0]` but differ at `[1]` when
-   their offsets differ. Falsifies a prefix builder that ignores a component.
+    constant-returning impl fails).
+1. **`custom_space_within_budget_round_trips`** — table `{3,7,9}`; `Custom(7)`'s lo u16 ==
+    `CUSTOM_ORDINAL_BASE + 1` (sorted position).
+1. **`custom_space_outside_the_table_errors_and_never_truncates`** — plan item **O3**: `Custom(5)`
+    vs an empty table → `Err(UnknownCustomSpace{raw:5})`; then intern **both** `5` and `65541` (the
+    pair a `raw as u16` cast would collide) and assert distinct facets, each unprojecting to its own
+    raw id.
+1. **`too_many_custom_spaces_is_a_typed_overflow_not_a_wrap`** — budget+2 errors; exactly budget
+    succeeds. Both sides pinned.
+1. **`offsets_above_u32_max_survive_the_lo_hi_split`** — `0x1234_5678_9ABC_DEF0` round-trips;
+    anti-vacuity: `u32::from_le_bytes(f.0[4..8]) as u64 != offset`.
+1. **`meta_is_excluded_from_the_projection`** — same varnode with/without metadata → **identical 16
+    bytes**; doc comment names the upstream contract it mirrors.
+1. **`prefixes_are_ordered_coarse_to_fine_and_share_their_ancestors`** — `prefixes()[0].depth()==1 … [2].depth()==3`; two facets in the same space share `prefixes()[0]` but differ at `[1]` when
+    their offsets differ. Falsifies a prefix builder that ignores a component.
 
----
+______________________________________________________________________
 
 ## 5. `src/convention.rs` — longest-prefix-wins config tree (NEW)
 
@@ -368,26 +368,26 @@ impl R2ilConvention {
 ### Tests
 
 1. **`arch_registers_bootstrap_the_register_branch`** — build an `ArchSpec` with **N = 3**
-   `RegisterDef`s (e.g. `("rax",0,8)`, `("eax",0,4)`, `("rbx",8,8)` — note two share an offset and
-   differ only in size, which is exactly why the finest prefix carries size). Assert each of the 3
-   register varnodes resolves via `resolve()` to a row whose `name` is its own register name, and
-   that every row's `state == Unmeasured`. Anti-vacuity: assert the three resolved names are
-   **distinct** (a bootstrap that mapped everything to one row would otherwise pass).
-2. **`an_unknown_register_offset_falls_through_to_the_space_prefix`** — resolve
-   `Varnode::register(0xDEAD, 8)`: `resolve()` returns the coarse `Space{SPACE_REGISTER}` row and
-   `resolved_prefix()` reports `depth() == 1`, **not** `None` and **not** a depth-3 row. Two-sided
-   with test 1 (a known register must report `depth() == 3`).
-3. **`longest_prefix_wins_over_a_coarser_row`** — insert a `SpaceOffset` row and a
-   `SpaceOffsetSize` row at the same offset; the facet with the matching size resolves to the
-   finer row, a facet with a different size resolves to the coarser one. Falsifies a first-match
-   or coarsest-wins implementation.
-4. **`custom_space_overflow_fails_at_config_key_time`** — `from_arch` over an `ArchSpec` whose
-   custom spaces exceed the budget returns `Err(CustomOrdinalExhausted)`; a within-budget spec
-   succeeds. Pins the §4 promotion.
-5. **`toml_rendering_is_byte_stable_and_starts_every_row_unmeasured`** — render twice, compare;
-   assert every `state = "unmeasured"` and that `measure_dont_claim` is present.
+    `RegisterDef`s (e.g. `("rax",0,8)`, `("eax",0,4)`, `("rbx",8,8)` — note two share an offset and
+    differ only in size, which is exactly why the finest prefix carries size). Assert each of the 3
+    register varnodes resolves via `resolve()` to a row whose `name` is its own register name, and
+    that every row's `state == Unmeasured`. Anti-vacuity: assert the three resolved names are
+    **distinct** (a bootstrap that mapped everything to one row would otherwise pass).
+1. **`an_unknown_register_offset_falls_through_to_the_space_prefix`** — resolve
+    `Varnode::register(0xDEAD, 8)`: `resolve()` returns the coarse `Space{SPACE_REGISTER}` row and
+    `resolved_prefix()` reports `depth() == 1`, **not** `None` and **not** a depth-3 row. Two-sided
+    with test 1 (a known register must report `depth() == 3`).
+1. **`longest_prefix_wins_over_a_coarser_row`** — insert a `SpaceOffset` row and a
+    `SpaceOffsetSize` row at the same offset; the facet with the matching size resolves to the
+    finer row, a facet with a different size resolves to the coarser one. Falsifies a first-match
+    or coarsest-wins implementation.
+1. **`custom_space_overflow_fails_at_config_key_time`** — `from_arch` over an `ArchSpec` whose
+    custom spaces exceed the budget returns `Err(CustomOrdinalExhausted)`; a within-budget spec
+    succeeds. Pins the §4 promotion.
+1. **`toml_rendering_is_byte_stable_and_starts_every_row_unmeasured`** — render twice, compare;
+    assert every `state = "unmeasured"` and that `measure_dont_claim` is present.
 
----
+______________________________________________________________________
 
 ## 6. `src/ore.rs` — stage 2, the enumeration (NEW)
 
@@ -456,18 +456,17 @@ container touched is ordered — **no `HashMap` iteration anywhere**.
 ### Tests
 
 1. **`enumeration_is_deterministic`** — `enumerate` twice over the same behavior and over a
-   freshly re-ingested identical block list; both sequences compare equal element by element.
-   Falsified the moment `HashMap` order leaks in.
-2. **`operand_coordinates_come_from_the_typed_source_not_from_names`** — a fixture with
-   `Varnode::register(0x1234_5678_9ABC_DEF0 & 0xFFFF, 8)` and a `Custom(7)` operand: the emitted
-   `Operand` rows carry the exact `SpaceId` and `offset`, and **no** `OreFact` construction path
-   reads an `SSAVar::name`. Anti-vacuity: assert at least one operand has `space ==
-   SpaceId::Custom(7)` (unreachable from the SSA side without parsing).
-3. **`an_op_site_join_mismatch_is_enumerated_not_skipped`** — the `Multiequal` fixture (§8 test 8)
-   shifts source indices; assert at least one `OreFact::JoinFailure` is emitted with both tags
-   populated, and that the total ore row count still matches the independent expectation.
+    freshly re-ingested identical block list; both sequences compare equal element by element.
+    Falsified the moment `HashMap` order leaks in.
+1. **`operand_coordinates_come_from_the_typed_source_not_from_names`** — a fixture with
+    `Varnode::register(0x1234_5678_9ABC_DEF0 & 0xFFFF, 8)` and a `Custom(7)` operand: the emitted
+    `Operand` rows carry the exact `SpaceId` and `offset`, and **no** `OreFact` construction path
+    reads an `SSAVar::name`. Anti-vacuity: assert at least one operand has `space == SpaceId::Custom(7)` (unreachable from the SSA side without parsing).
+1. **`an_op_site_join_mismatch_is_enumerated_not_skipped`** — the `Multiequal` fixture (§8 test 8)
+    shifts source indices; assert at least one `OreFact::JoinFailure` is emitted with both tags
+    populated, and that the total ore row count still matches the independent expectation.
 
----
+______________________________________________________________________
 
 ## 7. `src/furnace.rs` — stage 3, the melt (NEW)
 
@@ -539,22 +538,21 @@ construction of the `Result` signature.
 ### Tests
 
 1. **`a_flat_fact_stays_flat`** — `assert_eq!(size_of::<FlatFact>(), <the pinned constant>)` and
-   `assert!(FlatFact: Copy)`. Adding a `Vec`/`String`/`Box` breaks both. This is the
-   never-a-nested-graph guard, mechanised.
-2. **`cardinality_is_rows_not_nesting`** — a `CallOther` with four inputs produces **1** `Op` row
-   and **4** `OperandIn` rows sharing its `FactId` via `prov.inst`; assert the counts exactly.
-3. **`melt_is_conserved_and_drops_nothing`** — over the §8 fixture: `harvested == classified +
-   residual`, `dropped == 0`, and `harvested` equals an independently recomputed expectation.
-   Anti-vacuity: `harvested >= 50`.
-4. **`the_convention_is_the_knob_not_the_code`** — with `minimal_pass_one()` every melted `Op`'s
-   opcode is one of the seven and `classified > 0`; then add exactly `OpTag::AtomicCAS` to the
-   convention and assert `classified` rises by **exactly** the AtomicCAS fact count and `residual`
-   falls by the same. Proves widening happens in data.
-5. **`block_anchored_rows_are_addressed_not_defaulted`** — every emitted `FlatFact` has an `at`
-   whose `space_discriminant()` and `offset()` are meaningful; no row carries the all-zero facet
-   unless its varnode genuinely is `Ram:0/size 0`. Falsifies a lazy `VarnodeFacet::default()`.
+    `assert!(FlatFact: Copy)`. Adding a `Vec`/`String`/`Box` breaks both. This is the
+    never-a-nested-graph guard, mechanised.
+1. **`cardinality_is_rows_not_nesting`** — a `CallOther` with four inputs produces **1** `Op` row
+    and **4** `OperandIn` rows sharing its `FactId` via `prov.inst`; assert the counts exactly.
+1. **`melt_is_conserved_and_drops_nothing`** — over the §8 fixture: `harvested == classified + residual`, `dropped == 0`, and `harvested` equals an independently recomputed expectation.
+    Anti-vacuity: `harvested >= 50`.
+1. **`the_convention_is_the_knob_not_the_code`** — with `minimal_pass_one()` every melted `Op`'s
+    opcode is one of the seven and `classified > 0`; then add exactly `OpTag::AtomicCAS` to the
+    convention and assert `classified` rises by **exactly** the AtomicCAS fact count and `residual`
+    falls by the same. Proves widening happens in data.
+1. **`block_anchored_rows_are_addressed_not_defaulted`** — every emitted `FlatFact` has an `at`
+    whose `space_discriminant()` and `offset()` are meaningful; no row carries the all-zero facet
+    unless its varnode genuinely is `Ram:0/size 0`. Falsifies a lazy `VarnodeFacet::default()`.
 
----
+______________________________________________________________________
 
 ## 8. `src/slag.rs` — stage 3b, the ADDRESSED residual ledger (NEW)
 
@@ -630,18 +628,18 @@ its measured before/after counts in the harvest ledger.
 ### Tests
 
 1. **`shape_id_groups_identical_shapes_across_addresses`** — two residuals with the same reason
-   payload but different `at`/`provenance` share a `shape_id`; a different payload
-   (`OpcodeNotInConvention{AtomicCAS}` vs `{CallOther}`) differs. Two-sided.
-2. **`residuals_carry_the_address_they_failed_at`** — every pushed residual except
-   `NoFacetCoordinate` has `at.is_some()`; `by_address()` groups two same-shape residuals at
-   different prefixes into **two** entries, and two at the same prefix into **one** with count 2.
-3. **`grouping_is_exact_and_deterministically_ordered`** — counts 3/1/2 group to exactly
-   `[3, 2, 1]` in that order, twice in a row; the total equals `len()`.
-4. **`there_is_no_catch_all_reason`** — `ResidualReason::ALL` has no duplicates, its length equals
-   the variant count exercised by an exhaustive `match` in the test, and no entry matches
-   `"other" | "opaque" | "unknown" | "misc"`. Falsified by a future catch-all.
+    payload but different `at`/`provenance` share a `shape_id`; a different payload
+    (`OpcodeNotInConvention{AtomicCAS}` vs `{CallOther}`) differs. Two-sided.
+1. **`residuals_carry_the_address_they_failed_at`** — every pushed residual except
+    `NoFacetCoordinate` has `at.is_some()`; `by_address()` groups two same-shape residuals at
+    different prefixes into **two** entries, and two at the same prefix into **one** with count 2.
+1. **`grouping_is_exact_and_deterministically_ordered`** — counts 3/1/2 group to exactly
+    `[3, 2, 1]` in that order, twice in a row; the total equals `len()`.
+1. **`there_is_no_catch_all_reason`** — `ResidualReason::ALL` has no duplicates, its length equals
+    the variant count exercised by an exhaustive `match` in the test, and no entry matches
+    `"other" | "opaque" | "unknown" | "misc"`. Falsified by a future catch-all.
 
----
+______________________________________________________________________
 
 ## 9. `src/behavior.rs` — stage 1, the ORE CARRIER
 
@@ -686,6 +684,7 @@ pub fn solve_summary(&mut self, id: InterprocFunctionId, arch: Option<&ArchSpec>
 ```
 
 `from_blocks_raw` body, spelled out:
+
 ```rust
 let artifact = SsaArtifact::raw(blocks, arch)?;
 let function = artifact.function();
@@ -709,7 +708,7 @@ non-empty. 2. **`empty_block_list_is_none_not_a_panic`** — `&[]` is `None`, a 
 `Some`. 3. **`op_site_round_trips_through_the_graph_provenance_map`** — for every `Op` inst,
 `inst_at(op_site(inst)?) == Some(inst)`; anti-vacuity: checked count `>= 3`.
 
----
+______________________________________________________________________
 
 ## 10. `tests/lossless_fixtures.rs`
 
@@ -720,22 +719,27 @@ Helpers `fn reg(off: u64, size: u32)`, `fn con(v: u64, size: u32)` over `Varnode
 ### `fn fixture_function() -> Vec<R2ILBlock>` — 4 blocks, 3-way merge
 
 **B0 @ `0x1000` size 8** → `ConditionalBranch{true: 0x1018, false: 0x1008}`
-```
+
+```text
 0 IntAdd  { dst: reg(0x00,8), a: reg(0x00,8), b: con(0x10,8) }
 1 IntSub  { dst: reg(0x58,8), a: reg(0x00,8), b: con(4,8) }
 2 IntLess { dst: reg(0x40,1), a: reg(0x00,8), b: con(0x100,8) }
 3 CBranch { target: con(0x1018,8), cond: reg(0x40,1) }        // MUST be the last op
 ```
+
 **B1 @ `0x1008` size 8** → `ConditionalBranch{true: 0x1018, false: 0x1010}`
-```
+
+```text
 0 Load { dst: reg(0x08,8), space: Ram, addr: reg(0x00,8) }
 1 Store { space: Ram, addr: reg(0x00,8), val: reg(0x08,8) }
 2 Copy { dst: reg(0x00,8), src: reg(0x08,8) }                 // 2nd def of reg:0
 3 IntSLess { dst: reg(0x44,1), a: reg(0x08,8), b: con(0,8) }
 4 CBranch { target: con(0x1018,8), cond: reg(0x44,1) }
 ```
+
 **B2 @ `0x1010` size 8** → `Fallthrough{next: 0x1018}` — **the stressor block**
-```
+
+```text
 0  AtomicCAS { dst: reg(0x00,8), space: Ram, addr: reg(0x20,8), expected: con(0,8),
                replacement: con(1,8), ordering: SeqCst }
 1  StoreConditional { result: Some(reg(0x28,1)), space: Ram, addr: reg(0x20,8),
@@ -754,13 +758,14 @@ Helpers `fn reg(off: u64, size: u32)`, `fn con(v: u64, size: u32)` over `Varnode
 9  Fence  { ordering: MemoryOrdering::Unknown }
 10 Copy   { dst: reg(0x00,8), src: reg(0x48,8) }                // 3rd def of reg:0
 ```
-B2 also carries **op metadata** at index 0 — `set_op_metadata(0, OpMetadata{memory_ordering:
-Some(SeqCst), atomic_kind: Some(AtomicKind::CompareExchange), ..Default::default()})` — and
+
+B2 also carries **op metadata** at index 0 — `set_op_metadata(0, OpMetadata{memory_ordering: Some(SeqCst), atomic_kind: Some(AtomicKind::CompareExchange), ..Default::default()})` — and
 **varnode metadata** on op 3's `dst` (`ScalarKind::UnsignedInt` + `PointerHint::PointerLike`).
 
 **B3 @ `0x1018` size 8** — merge, 3 predecessors, terminator `Return` (the reverse scan hits
 `Return` before `Call`; correct and intended)
-```
+
+```text
 0 Call   { target: con(0x2000,8) }
 1 Return { target: reg(0x00,8) }        // uses reg:0 → the merged phi is live
 ```
@@ -768,57 +773,52 @@ Some(SeqCst), atomic_kind: Some(AtomicKind::CompareExchange), ..Default::default
 ### Tests
 
 1. **`every_mandated_op_shape_survives_ingest_as_a_typed_ssa_op`** — `OpTag::from_op` over
-   `values().insts`, **set equality** with `{Phi, Copy, Load, Store, Fence, StoreConditional,
-   AtomicCAS, LoadGuarded, StoreGuarded, IntAdd, IntSub, IntLess, IntSLess, CBranch, Call, Return,
-   CallOther, Insert}` — a missing op fails AND an unexpected extra fails.
-2. **`op_order_within_a_block_is_preserved_in_ordinal_order`** — for B2 (no `Multiequal`, so the
-   1:1 rename rule holds): `ordinal` strictly increasing and the `OpTag` sequence equals the R2IL
-   source sequence element by element. Anti-vacuity: length `== 11`.
-3. **`facts_are_populated_and_counted_against_upstreams_own_classification`** —
-   `calls().by_id.len() == 1`, `direct_target == Some(0x2000)`; `predicates().predicates.len() == 2`
-   and the comparison-kind set equals `{Less, SignedLess}`; memory counts equal an expectation
-   computed **from upstream's own rule** (uses ← `{Load,LoadLinked,LoadGuarded,AtomicCAS,
-   StoreConditional}` + calls; defs ← `{Store,StoreGuarded,StoreConditional,AtomicCAS}` + calls);
-   `objects().global_objects` contains `address == 0x1234_5678_9ABC_DEF0`. Anti-vacuity:
-   `expected_uses >= 5`. Do **not** assert the `Global.space` string (Debug-formatted upstream) —
-   record the observed value in a doc comment as a stage-4 measurement.
-4. **`phi_fan_in_equals_the_predecessor_count_at_the_three_way_merge`** —
-   `control().predecessors(0x1018).len() == 3` (exact); ≥1 phi there; **every** phi has
-   `inputs.len() == 3` and `predecessors.len() == 3`.
-5. **`custom_space_and_every_memory_ordering_survive_into_typed_ssa_ops`** — `LoadGuarded` /
-   `StoreGuarded` share a non-empty space string; their `ordering` is `Acquire`/`AcqRel` (typed);
-   the set of `MemoryOrdering` values across all SSA ops equals
-   `{Relaxed, Acquire, Release, AcqRel, SeqCst, Unknown}` — exact set equality.
-6. **`op_metadata_rejoins_by_op_site_even_though_ssa_does_not_carry_it`** — `inst_at(0x1010, 0)` is
-   `Some(i)`; `op_site(i) == Some((0x1010, 0))`; that inst is the `AtomicCAS`; the source block's
-   `op_metadata(0)` equals the constructed value.
-7. **`varnode_metadata_is_advisory_and_does_not_change_ingest`** — fixture with and without the
-   `with_meta` → identical `(name, version, size)` value sequences and `insts.len()`.
-8. **`multiequal_ingest_becomes_a_phi_zipped_to_the_predecessor_count`** — own 2-block fixture:
-   B0 `@0x2000 sz 4` = `Branch{target: con(0x2004,8)}`; B1 `@0x2004 sz 4` = `Multiequal{dst:
-   reg(0x00,8), inputs: vec![reg(0x08,8), reg(0x10,8), reg(0x18,8)]}` then `Return{target:
-   reg(0x00,8)}`. Assert phi count `== 1`; `inputs.len() == control().predecessors(0x2004).len()`
-   (**state the rule, not the number**); no `Op`-payload inst in that block is phi-shaped.
-9. **`sixty_four_bit_offsets_are_not_truncated_on_ingest`** — the global object address is exactly
-   `0x1234_5678_9ABC_DEF0`, **and** no `SSAVar::name` equals `"ram:9abcdef0"` (the name a 32-bit
-   truncation would produce). Two-sided anti-truncation.
-10. **`stressors_land_in_slag_under_pass_one_and_are_named_and_addressed`** — ⭐ **the proof the
+    `values().insts`, **set equality** with `{Phi, Copy, Load, Store, Fence, StoreConditional, AtomicCAS, LoadGuarded, StoreGuarded, IntAdd, IntSub, IntLess, IntSLess, CBranch, Call, Return, CallOther, Insert}` — a missing op fails AND an unexpected extra fails.
+1. **`op_order_within_a_block_is_preserved_in_ordinal_order`** — for B2 (no `Multiequal`, so the
+    1:1 rename rule holds): `ordinal` strictly increasing and the `OpTag` sequence equals the R2IL
+    source sequence element by element. Anti-vacuity: length `== 11`.
+1. **`facts_are_populated_and_counted_against_upstreams_own_classification`** —
+    `calls().by_id.len() == 1`, `direct_target == Some(0x2000)`; `predicates().predicates.len() == 2`
+    and the comparison-kind set equals `{Less, SignedLess}`; memory counts equal an expectation
+    computed **from upstream's own rule** (uses ← `{Load,LoadLinked,LoadGuarded,AtomicCAS, StoreConditional}` + calls; defs ← `{Store,StoreGuarded,StoreConditional,AtomicCAS}` + calls);
+    `objects().global_objects` contains `address == 0x1234_5678_9ABC_DEF0`. Anti-vacuity:
+    `expected_uses >= 5`. Do **not** assert the `Global.space` string (Debug-formatted upstream) —
+    record the observed value in a doc comment as a stage-4 measurement.
+1. **`phi_fan_in_equals_the_predecessor_count_at_the_three_way_merge`** —
+    `control().predecessors(0x1018).len() == 3` (exact); ≥1 phi there; **every** phi has
+    `inputs.len() == 3` and `predecessors.len() == 3`.
+1. **`custom_space_and_every_memory_ordering_survive_into_typed_ssa_ops`** — `LoadGuarded` /
+    `StoreGuarded` share a non-empty space string; their `ordering` is `Acquire`/`AcqRel` (typed);
+    the set of `MemoryOrdering` values across all SSA ops equals
+    `{Relaxed, Acquire, Release, AcqRel, SeqCst, Unknown}` — exact set equality.
+1. **`op_metadata_rejoins_by_op_site_even_though_ssa_does_not_carry_it`** — `inst_at(0x1010, 0)` is
+    `Some(i)`; `op_site(i) == Some((0x1010, 0))`; that inst is the `AtomicCAS`; the source block's
+    `op_metadata(0)` equals the constructed value.
+1. **`varnode_metadata_is_advisory_and_does_not_change_ingest`** — fixture with and without the
+    `with_meta` → identical `(name, version, size)` value sequences and `insts.len()`.
+1. **`multiequal_ingest_becomes_a_phi_zipped_to_the_predecessor_count`** — own 2-block fixture:
+    B0 `@0x2000 sz 4` = `Branch{target: con(0x2004,8)}`; B1 `@0x2004 sz 4` = `Multiequal{dst: reg(0x00,8), inputs: vec![reg(0x08,8), reg(0x10,8), reg(0x18,8)]}` then `Return{target: reg(0x00,8)}`. Assert phi count `== 1`; `inputs.len() == control().predecessors(0x2004).len()`
+    (**state the rule, not the number**); no `Op`-payload inst in that block is phi-shaped.
+1. **`sixty_four_bit_offsets_are_not_truncated_on_ingest`** — the global object address is exactly
+    `0x1234_5678_9ABC_DEF0`, **and** no `SSAVar::name` equals `"ram:9abcdef0"` (the name a 32-bit
+    truncation would produce). Two-sided anti-truncation.
+1. **`stressors_land_in_slag_under_pass_one_and_are_named_and_addressed`** — ⭐ **the proof the
     loop works.** `furnace::smelt(&behavior, &blocks, &R2ilConvention::minimal_pass_one())`. Assert
     `dropped == 0`, `is_conserved()`, `residual > 0`; the ledger's reason set **contains**
     `OpcodeNotInConvention{AtomicCAS}`, `{CallOther}`, `{StoreGuarded}`, `{Insert}`,
     `CustomSpaceNotInConvention{raw: 7}` and `VariadicArity{arity: 4}` — each asserted individually
     so no single absorbing group can satisfy the test; and **every** such residual carries
     `at.is_some()` (the addressed-slag rule).
-11. **`widening_the_convention_moves_a_stressor_out_of_slag`** — the two-sided partner: add
+1. **`widening_the_convention_moves_a_stressor_out_of_slag`** — the two-sided partner: add
     `OpTag::AtomicCAS`; its residual rows disappear, `classified` rises by exactly that count and
     `residual` falls by the same. Proves the ledger tracks the convention, not noise.
-12. **`a_bootstrapped_convention_resolves_register_operands_that_pass_one_cannot`** — smelt once
+1. **`a_bootstrapped_convention_resolves_register_operands_that_pass_one_cannot`** — smelt once
     with `minimal_pass_one()` (no rows ⇒ register operands are `NoConventionRowAtAddress`) and once
     with `R2ilConvention::from_arch(&spec, seven)` over an `ArchSpec` naming `reg 0x00/8` and
     `reg 0x08/8`: those operand rows move from residual to classified, and an *unnamed* offset
     (`0x58`) still resolves — to the coarse `Space` row, at `depth() == 1`. Ties §5 to the melt.
 
----
+______________________________________________________________________
 
 ## 11. `examples/harvest_r2il.rs` (feature `lift`) — THE artifact set
 
@@ -832,14 +832,14 @@ Reasons: no serde dep; the plan forbids `R2IL→JSON→Ruff` and an ndjson ore i
 confusion; TSV/TOML diff cleanly. State in every header: **these artifacts are evidence, never a
 re-ingest path — nothing in ruff parses them back.**
 
-| file | content |
-|---|---|
-| `r2il-pass1.ore.tsv` | one row per `FlatFact`, columns per `#schema`, in `smelt` order, `at` rendered as 32 hex chars |
-| `r2il-pass1-census.md` | `by_fact_kind` + `by_opcode` tables (BTreeMap order ⇒ byte-stable) |
-| `r2il-pass1-slag.tsv` | `ResidualLedger::grouped()` — `shape_id`, `reason`, `count`, example facet — **plus** a `by_address` section (the proposer's work queue) |
-| `r2il-convention.toml` | `R2ilConvention::to_toml()` — the bootstrapped tree, every row `unmeasured` |
-| `PROVENANCE.md` | see below |
-| `TRIAGE-RESULT.md` | the pre-registered bar (stated first) + the measured outcome |
+| file                   | content                                                                                                                                  |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `r2il-pass1.ore.tsv`   | one row per `FlatFact`, columns per `#schema`, in `smelt` order, `at` rendered as 32 hex chars                                           |
+| `r2il-pass1-census.md` | `by_fact_kind` + `by_opcode` tables (BTreeMap order ⇒ byte-stable)                                                                       |
+| `r2il-pass1-slag.tsv`  | `ResidualLedger::grouped()` — `shape_id`, `reason`, `count`, example facet — **plus** a `by_address` section (the proposer's work queue) |
+| `r2il-convention.toml` | `R2ilConvention::to_toml()` — the bootstrapped tree, every row `unmeasured`                                                              |
+| `PROVENANCE.md`        | see below                                                                                                                                |
+| `TRIAGE-RESULT.md`     | the pre-registered bar (stated first) + the measured outcome                                                                             |
 
 `PROVENANCE.md` pins, so the next session does not re-derive: each corpus path with byte length and
 an **FNV-1a 64** of its bytes (labelled FNV, *not* called a sha — no hashing dep); `r2sleigh` commit
@@ -852,23 +852,23 @@ cargo run --manifest-path crates/ruff_r2il/Cargo.toml --features lift --example 
 
 ### The PRE-REGISTERED bar — stated in `TRIAGE-RESULT.md` BEFORE the first run
 
-MedCare-rs's `TRIAGE-RESULT.md` states "recoverable ≥85% PASS, <50% KILL" before running. The R2IL
+MedCare-rs's `TRIAGE-RESULT.md` states "recoverable ≥85% PASS, \<50% KILL" before running. The R2IL
 analog cannot be a rate over *all* facts — pass 1 classifies only seven opcodes by design, so a low
 overall rate is the intended result, not a failure. Three bars, each falsifiable:
 
 - **B1 — conservation (absolute).** `dropped == 0` and `harvested == classified + residual`. Any
-  violation **KILLS** the pass: the enumerator, not the corpus, is wrong. Not a percentage.
+    violation **KILLS** the pass: the enumerator, not the corpus, is wrong. Not a percentage.
 - **B2 — coverage of the declared seven.** Of ore facts whose parent opcode is one of
-  `{Copy, IntAdd, Load, Store, CBranch, Call, Return}`, **≥99% classify → PASS; <90% → KILL.**
-  Those seven are fully specified here; a shortfall means the classifier is wrong, not that the
-  corpus is hard. The 90–99% band is INVESTIGATE (expected causes: operand rows with no convention
-  row at their address, `CallSite` rows with no `direct_target` — both legitimate slag under a
-  parent that classified).
+    `{Copy, IntAdd, Load, Store, CBranch, Call, Return}`, **≥99% classify → PASS; \<90% → KILL.**
+    Those seven are fully specified here; a shortfall means the classifier is wrong, not that the
+    corpus is hard. The 90–99% band is INVESTIGATE (expected causes: operand rows with no convention
+    row at their address, `CallSite` rows with no `direct_target` — both legitimate slag under a
+    parent that classified).
 - **B3 — the slag is named and addressed, not lumped.** `residual > 0`, distinct `shape_id` count
-  **≥ 5**, `dominant_share() < 0.60`, and **every** residual except `NoFacetCoordinate` carries
-  `at.is_some()`. A ledger where one shape absorbs everything is a catch-all wearing a reason's
-  clothes; an unaddressed ledger cannot feed the proposer. `residual == 0` is a **KILL** too — it
-  means someone widened the ladder.
+    **≥ 5**, `dominant_share() < 0.60`, and **every** residual except `NoFacetCoordinate` carries
+    `at.is_some()`. A ledger where one shape absorbs everything is a catch-all wearing a reason's
+    clothes; an unaddressed ledger cannot feed the proposer. `residual == 0` is a **KILL** too — it
+    means someone widened the ladder.
 
 Also **pre-register a prediction that is NOT a bar** (so it can be wrong without moving a
 goalpost): on an x86-64 corpus `Copy/IntAdd/Load/Store` dominate, so pass 1 is expected to classify
@@ -877,7 +877,7 @@ roughly **60–80%** of all `Op` facts. Record the measured figure either way.
 Caps echoed in the header: `R2IL_HARVEST_MAX_FUNCS` (default 200),
 `R2IL_HARVEST_MAX_SECTION_BYTES` (default 262144).
 
----
+______________________________________________________________________
 
 ## 12. `examples/r2il_corpus_profile.rs` (feature `lift`) — §12 profile
 
@@ -921,12 +921,11 @@ conservation line — feeding open items **O1** and **O3**.
 
 **Labelling rule (non-negotiable in the output):** `STT_FUNC` boundaries are **exact**; the leader
 set is an approximation (indirect branches / jump tables unresolved), so every CFG-derived row
-prints under the heuristic heading and the header states `function_boundaries: symtab (exact) |
-leaders: intra-function const targets (approximate)`. A stripped binary prints
+prints under the heuristic heading and the header states `function_boundaries: symtab (exact) | leaders: intra-function const targets (approximate)`. A stripped binary prints
 `function-level stats: skipped (no symtab)` — never a silent omission. Caps
 `R2IL_PROFILE_MAX_FUNCS` (200) / `R2IL_PROFILE_MAX_SECTION_BYTES` (262144) are echoed.
 
----
+______________________________________________________________________
 
 ## 13. `src/vocab.rs` — stage 4 (DTO / codebook factoring)
 
@@ -970,35 +969,33 @@ pub struct VocabStats { pub unique_ssa_names: usize, pub unique_op_spaces: usize
 
 **Tests.** 1. **`vocab_table_is_order_independent`** — the same 5 names in two orders (one with
 duplicates) build equal tables; anti-vacuity: `len() == 5` and at least two ids differ.
-2. **`harvest_counts_every_userop_mention_but_interns_names_once`** — two `CallOther`s sharing
+2\. **`harvest_counts_every_userop_mention_but_interns_names_once`** — two `CallOther`s sharing
 `userop: 7` plus one with `9` → `unique_userops == 2`, `userop_mentions == 3` (both exact), reused
 name interned once. 3. *(recommended)* **`typed_custom_space_ids_are_the_oracle_for_the_string_set`**
 — `custom_space_ids_from_blocks == {7}`; the string-recovered set equals it **on this fixture**,
 with a doc comment recording that the equality is a measurement, not a guarantee.
 
----
+______________________________________________________________________
 
 ## 14. Worker split — DISJOINT files, Sonnet fleet
 
-| worker | owns (exclusively) | spec section |
-|---|---|---|
-| **W1** | `Cargo.toml`, `src/lib.rs`, `src/behavior.rs` | §3, §9 |
-| **W2** | `src/facet.rs` | §4 |
-| **W3** | `src/convention.rs` | §5 (consumes W2's types as spec'd) |
-| **W4** | `src/ore.rs` | §6 |
-| **W5** | `src/furnace.rs` | §7 |
-| **W6** | `src/slag.rs` | §8 |
-| **W7** | `src/vocab.rs` | §13 |
-| **W8** | `tests/lossless_fixtures.rs` | §10 |
-| **W9** | `examples/harvest_r2il.rs` | §11 |
-| **W10** | `examples/r2il_corpus_profile.rs` | §12 |
+| worker  | owns (exclusively)                            | spec section                       |
+| ------- | --------------------------------------------- | ---------------------------------- |
+| **W1**  | `Cargo.toml`, `src/lib.rs`, `src/behavior.rs` | §3, §9                             |
+| **W2**  | `src/facet.rs`                                | §4                                 |
+| **W3**  | `src/convention.rs`                           | §5 (consumes W2's types as spec'd) |
+| **W4**  | `src/ore.rs`                                  | §6                                 |
+| **W5**  | `src/furnace.rs`                              | §7                                 |
+| **W6**  | `src/slag.rs`                                 | §8                                 |
+| **W7**  | `src/vocab.rs`                                | §13                                |
+| **W8**  | `tests/lossless_fixtures.rs`                  | §10                                |
+| **W9**  | `examples/harvest_r2il.rs`                    | §11                                |
+| **W10** | `examples/r2il_corpus_profile.rs`             | §12                                |
 
-**W1 writes every module declaration up front** — `src/lib.rs` contains `pub mod behavior; pub mod
-convention; pub mod facet; pub mod furnace; pub mod ore; pub mod slag; pub mod vocab;` from its
+**W1 writes every module declaration up front** — `src/lib.rs` contains `pub mod behavior; pub mod convention; pub mod facet; pub mod furnace; pub mod ore; pub mod slag; pub mod vocab;` from its
 first commit, so no later worker ever edits a shared file. W2–W10 code against the APIs **as
 written in this spec**, never against another worker's output; if a signature here is wrong, STOP
-and report — do not improvise a different one. Dependency direction: `facet → convention →
-{ore, furnace}`, `furnace → slag`. All type shapes are spec'd here, so no worker blocks on another.
+and report — do not improvise a different one. Dependency direction: `facet → convention → {ore, furnace}`, `furnace → slag`. All type shapes are spec'd here, so no worker blocks on another.
 
 **Verbatim guardrail block — paste into EVERY worker brief:**
 
@@ -1007,22 +1004,25 @@ and report — do not improvise a different one. Dependency direction: `facet �
 > Edit ONLY your assigned files. Do not claim it compiles or that tests pass — you did not run it.
 
 **Orchestrator (Opus), after the fleet lands:**
-1. Add the exclusion to `/home/user/ruff/Cargo.toml`:
-   ```toml
-   [workspace]
-   members = ["crates/*"]
-   exclude = ["crates/ruff_r2il"]
-   resolver = "2"
-   ```
-   (`exclude` wins over the `crates/*` glob; the root `Cargo.lock` must stay untouched.)
-2. Run every gate in §15 centrally, once. Fix cross-file fallout itself — do not re-fan-out.
-3. Run the harvest example; commit the artifact set under `.claude/harvest/r2il/`, with
-   `TRIAGE-RESULT.md`'s bar section written **before** the run and the measured section after.
-4. Commit on `claude/ruff-r2il-lancegraph-3tdt8d` with the board update in the **same** commit:
-   plan open items **O1** and **O3** get measured values; the four honesty notes (§2) are recorded.
-   Push and open the PR.
 
----
+1. Add the exclusion to `/home/user/ruff/Cargo.toml`:
+
+    ```toml
+    [workspace]
+    members = ["crates/*"]
+    exclude = ["crates/ruff_r2il"]
+    resolver = "2"
+    ```
+
+    (`exclude` wins over the `crates/*` glob; the root `Cargo.lock` must stay untouched.)
+1. Run every gate in §15 centrally, once. Fix cross-file fallout itself — do not re-fan-out.
+1. Run the harvest example; commit the artifact set under `.claude/harvest/r2il/`, with
+    `TRIAGE-RESULT.md`'s bar section written **before** the run and the measured section after.
+1. Commit on `claude/ruff-r2il-lancegraph-3tdt8d` with the board update in the **same** commit:
+    plan open items **O1** and **O3** get measured values; the four honesty notes (§2) are recorded.
+    Push and open the PR.
+
+______________________________________________________________________
 
 ## 15. Gates and definition of done
 
@@ -1039,31 +1039,30 @@ cargo check -p ruff_graph                                          # ruff worksp
 cargo metadata --no-deps --format-version 1 | grep -c ruff_r2il    # must print 0
 git status --porcelain Cargo.lock                                  # must be EMPTY
 ```
+
 `cargo check` is not run separately — clippy compiles. The first `--features lift` build pays the
 libsla native compile (~43 s measured upstream); if the sandbox is offline add `--offline`.
 
-**Definition of done for PR 1**
+### Definition of done for PR 1
 
 1. `crates/ruff_r2il/` matches the §3 inventory; root `Cargo.toml` carries `exclude`; root
-   `Cargo.lock` unchanged; `crates/ruff_r2il/Cargo.lock` committed.
-2. All gates green, including the three isolation checks.
-3. Test names match §4–§10 and §13. For every guarded assertion (the stressor-slag proof, the
-   convention-widening partner, the register bootstrap + fall-through pair, the flat-row size
-   guard, facet overflow, the metadata exclusion, the phi zip, the anti-vacuity counts) the
-   orchestrator ran the **disable-the-guard** check and recorded that it went red.
-4. `.claude/harvest/r2il/` contains all six artifacts; `TRIAGE-RESULT.md` states the §11 bar
-   **before** the measured section; the conservation line `harvested N / classified X / residual Y
-   / dropped 0` is present with `dropped == 0`.
-5. **B1 holds absolutely.** B2 and B3 are reported PASS / INVESTIGATE / KILL by their own stated
-   thresholds — a KILL is recorded honestly and blocks PR 2, never argued away.
-6. The residual ledger contains **no** catch-all row, **every** residual (bar `NoFacetCoordinate`)
-   carries its facet address, and `residual` was reduced only by a recorded convention change with
-   before/after counts — never by widening a match arm.
-7. The doc framing is in the code, not only here: `ore.rs`'s header carries the operator one-liner
-   ("Varnode in the first stage is pointer chasing stacked god objects — hence the ore furnace
-   slag") plus **typed ≠ refined**; `furnace.rs` states the flat-rows constraint; `behavior.rs`
-   frames `FunctionBehavior` as the **ore carrier**, never a contract; `facet.rs` states both roles
-   (config key now, V3 persistence not committed); the four §2 honesty notes appear as doc comments.
-8. No new type duplicates an upstream one; no `serde_json`; no `Display`/`Debug` parsing on any data
-   path (`vocab::parse_custom_space_id` is measurement-only and says so in its doc comment).
-
+    `Cargo.lock` unchanged; `crates/ruff_r2il/Cargo.lock` committed.
+1. All gates green, including the three isolation checks.
+1. Test names match §4–§10 and §13. For every guarded assertion (the stressor-slag proof, the
+    convention-widening partner, the register bootstrap + fall-through pair, the flat-row size
+    guard, facet overflow, the metadata exclusion, the phi zip, the anti-vacuity counts) the
+    orchestrator ran the **disable-the-guard** check and recorded that it went red.
+1. `.claude/harvest/r2il/` contains all six artifacts; `TRIAGE-RESULT.md` states the §11 bar
+    **before** the measured section; the conservation line `harvested N / classified X / residual Y / dropped 0` is present with `dropped == 0`.
+1. **B1 holds absolutely.** B2 and B3 are reported PASS / INVESTIGATE / KILL by their own stated
+    thresholds — a KILL is recorded honestly and blocks PR 2, never argued away.
+1. The residual ledger contains **no** catch-all row, **every** residual (bar `NoFacetCoordinate`)
+    carries its facet address, and `residual` was reduced only by a recorded convention change with
+    before/after counts — never by widening a match arm.
+1. The doc framing is in the code, not only here: `ore.rs`'s header carries the operator one-liner
+    ("Varnode in the first stage is pointer chasing stacked god objects — hence the ore furnace
+    slag") plus **typed ≠ refined**; `furnace.rs` states the flat-rows constraint; `behavior.rs`
+    frames `FunctionBehavior` as the **ore carrier**, never a contract; `facet.rs` states both roles
+    (config key now, V3 persistence not committed); the four §2 honesty notes appear as doc comments.
+1. No new type duplicates an upstream one; no `serde_json`; no `Display`/`Debug` parsing on any data
+    path (`vocab::parse_custom_space_id` is measurement-only and says so in its doc comment).

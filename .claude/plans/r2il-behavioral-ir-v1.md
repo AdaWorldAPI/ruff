@@ -42,7 +42,7 @@
 
 ### r2sleigh (checkout `/home/user/r2sleigh` @ 60942f6)
 
-6. **`r2il` is cleanly standalone**: pure Rust, deps serde/postcard/thiserror,
+1. **`r2il` is cleanly standalone**: pure Rust, deps serde/postcard/thiserror,
    compiles in 8.25 s, everything re-exported at crate root. `R2ILOp` = one flat
    enum, 60+ variants, NAMED `Varnode` fields (`IntAdd{dst,a,b}`); variadic only
    where the semantics are variadic (`CallOther{output:Option, userop:u32,
@@ -50,7 +50,7 @@
    `ordering: MemoryOrdering`. `Varnode{space, offset:u64, size:u32,
    meta:Option<VarnodeMetadata>}` — meta excluded from Eq/Hash (advisory).
    `SpaceId{Ram,Register,Unique,Const,Custom(u32)}`.
-7. **`r2ssa` is directly consumable**: builds in 43 s INCLUDING the transitive
+2. **`r2ssa` is directly consumable**: builds in 43 s INCLUDING the transitive
    libsla-sys native compile (verified in-env, exit 0). Its function-level API
    (`SSAFunction::from_blocks(&[R2ILBlock], Option<&ArchSpec>)`) needs NO
    Disassembler; `Disassembler` appears ONLY in `block.rs` (legacy single-block
@@ -58,11 +58,11 @@
    `r2sleigh-lift` dep. Feature-gating it upstream is a genuinely generic
    improvement (any SSA-only consumer sheds the native dep) but is NOT required:
    **direct consumption already works** (§17 success outcome).
-8. **r2sleigh already grew the concern decomposition** (`r2ssa/src/semantic.rs`,
+3. **r2sleigh already grew the concern decomposition** (`r2ssa/src/semantic.rs`,
    `graph.rs`, `interproc.rs`). The correspondence, VERIFIED against source:
 
    | r2sleigh type | route |
-   |---|---|
+   | --- | --- |
    | `SSAFunction` + `BlockTerminator` + `CFGEdge` | CONTROL |
    | `SsaGraph` (`ValueId/InstId/BlockId(u32)`, `def_of`, `uses_of`, `op_inst_by_site`) | VALUES + DEF/USE + PROVENANCE |
    | `ObjectModel` (`StackSlot/FrameObject/Global/HeapAlloc/EscapedUnknown`) | OBJECTS / ALIAS |
@@ -76,41 +76,41 @@
    (`GraphInst{inputs:Vec<ValueId>, output:Option<ValueId>}`).
    **Consequence: Ruff does not invent a behavioral ontology. It names
    r2sleigh's own decomposition as routes.**
-9. **Known string-forest**: `SSAVar{name:String, version, size}` (documented
+4. **Known string-forest**: `SSAVar{name:String, version, size}` (documented
    upstream limitation) and `ObjectKind::Global{space:String,..}` — this is the
    DTO/codebook plane's work, Ruff-side.
-10. **Corpus mechanics**: no `.sla` in-repo; specs come from the registry crate
+5. **Corpus mechanics**: no `.sla` in-repo; specs come from the registry crate
     `sleigh-config` (features per arch, e2e uses `x86`). Compiled test binaries
     exist (`tests/e2e/stress_test`, `stress_test_opt`). `/home/user/ghidra` has
     `.slaspec` sources if ever needed.
 
 ### lance-graph V3
 
-11. **Physical ABI**: `NodeRow` 512 B = `NodeGuid`(16) + `EdgeBlock`(16) +
+1. **Physical ABI**: `NodeRow` 512 B = `NodeGuid`(16) + `EdgeBlock`(16) +
     value(480), const-asserted; `GUIDS_PER_NODE = 32` — "32 × 16-byte GUID
     slots", Tetris-across-slots doctrine (`canonical_node.rs:793-810`).
     `FacetCascade{facet_classid:u32, tiers:[FacetTier{lo:u8,hi:u8};6]}` = 16 B;
     `CascadeShape::{G6D2,G4D3,G3D4}`. Grammar dispatch = classid → ClassView
     (slot purity: labels/positions NEVER from payload). `ENVELOPE_LAYOUT_VERSION=2`.
-12. **The precedent**: `lance_graph_contract::network` sinks Tesseract's 27-class
+2. **The precedent**: `lance_graph_contract::network` sinks Tesseract's 27-class
     C++ `Network` hierarchy onto ONE FacetCascade per node —
     `facet_classid = compose_classid(NETWORK_LAYER=0x0804, ntype as u16)`
     (container concept on canon-high, subclass ordinal on custom-low, "container
     kinds, not content" mint discipline), `G6D2` payload, names/weight-blobs
     OUT-OF-LINE (Lance table keyed by classid+identity). Zero physical changes.
-13. **Overflow mechanisms that exist**: (a) Tetris-across-slots in-row; (b)
+3. **Overflow mechanisms that exist**: (a) Tetris-across-slots in-row; (b)
     out-of-line Lance-table escape (proven: network weights, 4M-vertex FMA
     mesh); (c) designed-not-built stream-window escape. A CFG-shaped
     "many small typed rows keyed to one parent" consumer is new WIRING over
     proven pattern (b), not a new primitive.
-14. **Codebook plane**: `ogar_codebook::{compose_classid, canonical_concept_id}`
+4. **Codebook plane**: `ogar_codebook::{compose_classid, canonical_concept_id}`
     — name→u16 vocabulary registry, compile-time-drift-checked
     (`network_layer_const_matches_codebook` pattern). classid capacity nowhere
     near exhausted.
-15. **Verdict: V3 is sufficient. No V4. The hypothesis stands un-falsified**
+5. **Verdict: V3 is sufficient. No V4. The hypothesis stands un-falsified**
     pending the corpus measurements (which gate only the per-route LAYOUT
     choices, not the physical grammar).
-16. **Honesty note**: network.rs's "byte-parity vs real Tesseract" is
+6. **Honesty note**: network.rs's "byte-parity vs real Tesseract" is
     designed-for (oracle named) but in-repo tests are synthetic round-trips
     against pre-registered values. R2IL routes should meet the same standard
     they claim — no overclaiming.
@@ -143,7 +143,7 @@ language-agnostic, data-as-config stages, each with an explicit residual
 ledger:
 
 | module | stage | slag mechanism |
-|---|---|---|
+| --- | --- | --- |
 | `concept_split.rs` | Phase 1 re-key (fix CONCEPT=CLASS) | `ResidualMethod` rows + reason; "the residual is not waste: it is the empirical boundary of the current convention" |
 | `surface_schema.rs` | Phase 3 config-as-schema (pull config-wearing-method-clothes OUT before action lifting) | concept/facet residue deferred to concept_split |
 | `recipe.rs` | recipe centroid classifier over fact-sets ONLY (no language tokens) | `Compensate`/`WriteRaise` = essential residue, hand-ported |
@@ -161,6 +161,7 @@ Two worked, measured transcodes establish what an intake arm MUST produce.
 Not prose — committed data.
 
 **MedCare-rs** (`AdaWorldAPI/MedCare` C#/WinForms → Rust):
+
 - `medcare-2.0-spo-triples.ndjson.gz` — 108,548 triples, per-predicate census
   in the README, provenance pinned (corpus `429b577`, harvester `562964f`,
   EXACT invocation flags saved so the next session doesn't re-derive them).
@@ -175,6 +176,7 @@ Not prose — committed data.
 - `compiled/medcare-actiondefs.json.gz`, `generated/do_adapters.rs`.
 
 **openproject-nexgen-rs** (Rails → Rust):
+
 - `2026-07-06-transpile-ledger.md` — reproducible chain
   (`ruff_ruby_spo::extract_app_with_schema → ogar_from_ruff::mint::compile_graph_ruby
   → ogar_render_askama::render_class_with_methods → committed generated Rust`),
@@ -189,6 +191,7 @@ Not prose — committed data.
 
 **Consequence for PR 1 — the arm's deliverable is an artifact set, not a
 struct.** `ruff_r2il` must emit, into `.claude/harvest/`:
+
 1. an **ore file** (typed, lossless, deterministic) + provenance block
    (corpus, r2sleigh commit, arch, EXACT invocation);
 2. a **census** (per-opcode/per-fact counts — the `108,548 triples by
@@ -311,7 +314,7 @@ backend 2 an *audit* layer rather than a cache — keep it.
 
 ## Architecture (ratified by operator feedback 2026-08-17)
 
-```
+```text
 Ruff
                      │
         ┌────────────┴─────────────┐
@@ -350,21 +353,22 @@ precedent) so bare `cargo check --workspace` in ruff stays sibling-free and
 (AdaWorldAPI fork, P0 fork rule). Feature `lift` (non-default, ruff_cpp_spo
 pattern) gates `r2sleigh-lift` + `sleigh-config/x86` for the profiler example.
 Contents:
-  - `behavior.rs`: `FunctionBehavior{identity, ssa, graph, facts, summary}` +
+
+- `behavior.rs`: `FunctionBehavior{identity, ssa, graph, facts, summary}` +
     named route accessors (control/values/objects/memory/predicates/calls) —
     a thin truthful assembly, zero copying, no parallel ontology.
-  - `vocab.rs`: deterministic vocabulary harvest (SSAVar names, userops, space
+- `vocab.rs`: deterministic vocabulary harvest (SSAVar names, userops, space
     categories) → interning table; measures the string-forest collapse.
-  - `facet.rs`: `VarnodeFacet` 16-byte projection EXPERIMENT (classid=space
+- `facet.rs`: `VarnodeFacet` 16-byte projection EXPERIMENT (classid=space
     class, a=offset lo32, b=offset hi32, c=size) + the `SpaceId::Custom(u32)`
     lossless falsifier (custom ids need codebook interning — measure the fit).
     Documented as a projection probe, not an address system.
-  - `tests/`: §14 lossless fixtures — every mandated op (Copy, IntAdd, Load,
+- `tests/`: §14 lossless fixtures — every mandated op (Copy, IntAdd, Load,
     Store, cmp, CBranch, Branch, Call, Return, AtomicCAS, StoreConditional,
     Load/StoreGuarded, CallOther >2 in, Multiequal >2, Insert, Custom space,
     64-bit offsets, ordering, optional outputs, metadata) through
     `FunctionBehavior::from_blocks` with typed-preservation asserts.
-  - `examples/r2il_corpus_profile.rs` (feature `lift`): §12 profile over real
+- `examples/r2il_corpus_profile.rs` (feature `lift`): §12 profile over real
     corpora (r2sleigh e2e binaries + in-container ELFs): opcode freq, arity
     histograms, %fitting dst+src0+src1, blocks/fn, ops/block, phi fan-in,
     bytes/op for candidate layouts, overflow frequency at 255-rank.
@@ -389,11 +393,13 @@ Generic, roadmap-aligned, Ruff-free. File upstream only with operator consent;
 direct consumption already succeeds without it.
 
 ## Stop conditions hit so far
+
 - §22.1: direct r2il/r2ssa consumption solves the upstream seam — YES (43 s).
 - §22.4: V3 represents R2IL via routes+overflow — YES per audit; corpus gates layout only.
 - §22.5: no V4; variable arity already routed upstream (SsaGraph descriptor shape).
 
 ## Open items
+
 - O1: corpus profile numbers (PR 1 gate for PR 2 layout).
 - O2: def-use persist-vs-derive benchmark (§13) — SsaGraph derives def_of/uses_of
   from SSAFunction cheaply; measure before persisting.
