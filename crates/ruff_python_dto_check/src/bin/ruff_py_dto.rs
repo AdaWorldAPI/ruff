@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Walk a Python repo root, emit per-family ndjson bundles under <out>.
+    /// Walk a Python repo root, emit per-family ndjson bundles under `<out>`.
     Harvest {
         /// Path to the JSON config file.
         #[arg(long)]
@@ -76,7 +76,7 @@ enum Command {
         #[arg(long, default_value = "ruff-py-dto-codegen")]
         out: PathBuf,
     },
-    /// Write the JSON Schema to <path> or stdout.
+    /// Write the JSON Schema to `<path>` or stdout.
     Schema {
         /// Output path (default: stdout).
         #[arg(long)]
