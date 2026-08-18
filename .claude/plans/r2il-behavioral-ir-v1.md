@@ -404,4 +404,23 @@ direct consumption already succeeds without it.
 - O3: `SpaceId::Custom(u32)` fit in the 16-byte varnode projection (fixture).
 - O4: function discovery for whole-ELF lifting (linear sweep vs CLI vs r2) —
     profiler may start at instruction/op-level stats + e2e binaries.
-- O5: classid mint request shape for lance-graph (PR 3 gate).
+- O5: classid mint request shape for lance-graph (PR 3 gate). **Input added
+    2026-08-18:** the oracle's attribute-gap census (O6) is a scope input here —
+    if `MemorySpace`/`MemoryOrdering` fire broadly on the corpus, the mint may
+    need more than the single `NETWORK_LAYER`-analog container concept this
+    plan currently expects (a second facet dimension for ordering/space
+    semantics). Anticipate it rather than discover it mid-flight.
+- O6: **attribute-gap census → schema-widening decision** (opened 2026-08-18 by
+    the round-trip oracle, `.claude/plans/r2il-roundtrip-oracle-spec-v1.md`
+    ratified v3; module `crates/ruff_r2il/src/oracle.rs`). Twelve `R2ILOp`
+    variants carry semantic state beyond the `inputs()`/`output()` varnode
+    projection the fact rows represent — `Load`/`Store` (space), `Fence` (+
+    zero varnodes at all), `LoadLinked`/`StoreConditional`/`AtomicCAS`/
+    `LoadGuarded`/`StoreGuarded` (space + ordering), `CallOther` (userop),
+    `Subpiece` (offset), `PtrAdd`/`PtrSub` (element_size). The oracle MEASURES
+    them as typed `AttributeGap` rows rather than silently passing them; the
+    census is the probe-first input for a future ADDITIVE widening (never a
+    `FlatFact` field — the 88-byte pin holds). **Sub-item O6a:** run
+    `examples/r2il_roundtrip_oracle.rs` over the §12 corpus and record the
+    census in `.claude/harvest/r2il/ORACLE-RESULT.md` — until then that doc
+    carries only the in-repo fixture numbers and says so.

@@ -45,9 +45,29 @@ Both are gitignored, so a regenerate run leaves the tree clean.
 | `r2il-pass1-slag.tsv` | the addressed residual ledger; the artifact a reviewer actually reads |
 | `r2il-pass1-census.md` | per-fact-kind and per-opcode counts |
 | `PROVENANCE.md` | corpus manifest (FNV-1a 64 per input), r2sleigh commit pin, caps, exact invocation |
+| `CORPUS-PROFILE-RESULT.md` | the §12 corpus profile (resolves O1: 100.00 % of 130193 ops fit `dst+src0+src1` inline) |
+| `ORACLE-RESULT.md` | the §14 round-trip verdict + the O6 attribute-gap census (see below) |
 
 Together under 32 KB. The Release assets are reproducible from these plus the
 pinned corpus; these are not reproducible from the Release.
+
+## The second example / artifact pair — the round-trip oracle
+
+`examples/r2il_roundtrip_oracle.rs` (feature `lift`) is a SEPARATE deliverable
+from `harvest_r2il.rs` above: it writes no files and prints its verdict to
+stdout, and the numbers are transcribed into `ORACLE-RESULT.md` by hand, the
+same way `CORPUS-PROFILE-RESULT.md` records the profiler.
+
+```sh
+cargo run --manifest-path crates/ruff_r2il/Cargo.toml --features lift --release \
+    --example r2il_roundtrip_oracle
+```
+
+Reads the same corpus as the profiler (`$R2IL_CORPUS`, CLI args, or the same
+four-binary fallback). Caps: `R2IL_ORACLE_MAX_SECTION_BYTES`,
+`R2IL_ORACLE_CHUNK_BLOCKS`, `R2IL_ORACLE_MAX_CHUNKS`. It prints BOTH
+conventions (permissive = mechanism proof, `minimal_pass_one` = shipped-default
+coverage) and never conflates them — cite whichever one a number came from.
 
 ## Regenerate
 
