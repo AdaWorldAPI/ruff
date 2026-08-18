@@ -450,6 +450,207 @@ impl OpTag {
             OpTag::Insert => "insert",
         }
     }
+
+    /// The exact inverse of [`Self::as_str`] — one arm per variant, so a
+    /// variant added to the enum without a matching arm here fails to
+    /// compile (mirrors [`Self::from_op`]'s own total-match discipline).
+    /// `None` for any string that isn't one of [`Self::as_str`]'s outputs —
+    /// never a best-effort guess.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "phi" => OpTag::Phi,
+            "copy" => OpTag::Copy,
+            "load" => OpTag::Load,
+            "store" => OpTag::Store,
+            "fence" => OpTag::Fence,
+            "load_linked" => OpTag::LoadLinked,
+            "store_conditional" => OpTag::StoreConditional,
+            "atomic_cas" => OpTag::AtomicCAS,
+            "load_guarded" => OpTag::LoadGuarded,
+            "store_guarded" => OpTag::StoreGuarded,
+            "int_add" => OpTag::IntAdd,
+            "int_sub" => OpTag::IntSub,
+            "int_mult" => OpTag::IntMult,
+            "int_div" => OpTag::IntDiv,
+            "int_sdiv" => OpTag::IntSDiv,
+            "int_rem" => OpTag::IntRem,
+            "int_srem" => OpTag::IntSRem,
+            "int_negate" => OpTag::IntNegate,
+            "int_carry" => OpTag::IntCarry,
+            "int_scarry" => OpTag::IntSCarry,
+            "int_sborrow" => OpTag::IntSBorrow,
+            "int_and" => OpTag::IntAnd,
+            "int_or" => OpTag::IntOr,
+            "int_xor" => OpTag::IntXor,
+            "int_not" => OpTag::IntNot,
+            "int_left" => OpTag::IntLeft,
+            "int_right" => OpTag::IntRight,
+            "int_sright" => OpTag::IntSRight,
+            "int_equal" => OpTag::IntEqual,
+            "int_not_equal" => OpTag::IntNotEqual,
+            "int_less" => OpTag::IntLess,
+            "int_sless" => OpTag::IntSLess,
+            "int_less_equal" => OpTag::IntLessEqual,
+            "int_sless_equal" => OpTag::IntSLessEqual,
+            "int_zext" => OpTag::IntZExt,
+            "int_sext" => OpTag::IntSExt,
+            "bool_not" => OpTag::BoolNot,
+            "bool_and" => OpTag::BoolAnd,
+            "bool_or" => OpTag::BoolOr,
+            "bool_xor" => OpTag::BoolXor,
+            "piece" => OpTag::Piece,
+            "subpiece" => OpTag::Subpiece,
+            "pop_count" => OpTag::PopCount,
+            "lzcount" => OpTag::Lzcount,
+            "branch" => OpTag::Branch,
+            "cbranch" => OpTag::CBranch,
+            "branch_ind" => OpTag::BranchInd,
+            "call" => OpTag::Call,
+            "call_ind" => OpTag::CallInd,
+            "call_define" => OpTag::CallDefine,
+            "return" => OpTag::Return,
+            "float_add" => OpTag::FloatAdd,
+            "float_sub" => OpTag::FloatSub,
+            "float_mult" => OpTag::FloatMult,
+            "float_div" => OpTag::FloatDiv,
+            "float_neg" => OpTag::FloatNeg,
+            "float_abs" => OpTag::FloatAbs,
+            "float_sqrt" => OpTag::FloatSqrt,
+            "float_ceil" => OpTag::FloatCeil,
+            "float_floor" => OpTag::FloatFloor,
+            "float_round" => OpTag::FloatRound,
+            "float_nan" => OpTag::FloatNaN,
+            "float_equal" => OpTag::FloatEqual,
+            "float_not_equal" => OpTag::FloatNotEqual,
+            "float_less" => OpTag::FloatLess,
+            "float_less_equal" => OpTag::FloatLessEqual,
+            "int2float" => OpTag::Int2Float,
+            "float2int" => OpTag::Float2Int,
+            "float_float" => OpTag::FloatFloat,
+            "trunc" => OpTag::Trunc,
+            "call_other" => OpTag::CallOther,
+            "nop" => OpTag::Nop,
+            "unimplemented" => OpTag::Unimplemented,
+            "cpu_id" => OpTag::CpuId,
+            "breakpoint" => OpTag::Breakpoint,
+            "ptr_add" => OpTag::PtrAdd,
+            "ptr_sub" => OpTag::PtrSub,
+            "segment_op" => OpTag::SegmentOp,
+            "new" => OpTag::New,
+            "cast" => OpTag::Cast,
+            "extract" => OpTag::Extract,
+            "insert" => OpTag::Insert,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod op_tag_str_tests {
+    use super::OpTag;
+
+    /// Two-sided: every variant round-trips through `as_str`/`parse`, AND
+    /// an unknown string is refused rather than silently mapped to some
+    /// default variant.
+    #[test]
+    fn as_str_and_from_str_round_trip_every_variant() {
+        let all = [
+            OpTag::Phi,
+            OpTag::Copy,
+            OpTag::Load,
+            OpTag::Store,
+            OpTag::Fence,
+            OpTag::LoadLinked,
+            OpTag::StoreConditional,
+            OpTag::AtomicCAS,
+            OpTag::LoadGuarded,
+            OpTag::StoreGuarded,
+            OpTag::IntAdd,
+            OpTag::IntSub,
+            OpTag::IntMult,
+            OpTag::IntDiv,
+            OpTag::IntSDiv,
+            OpTag::IntRem,
+            OpTag::IntSRem,
+            OpTag::IntNegate,
+            OpTag::IntCarry,
+            OpTag::IntSCarry,
+            OpTag::IntSBorrow,
+            OpTag::IntAnd,
+            OpTag::IntOr,
+            OpTag::IntXor,
+            OpTag::IntNot,
+            OpTag::IntLeft,
+            OpTag::IntRight,
+            OpTag::IntSRight,
+            OpTag::IntEqual,
+            OpTag::IntNotEqual,
+            OpTag::IntLess,
+            OpTag::IntSLess,
+            OpTag::IntLessEqual,
+            OpTag::IntSLessEqual,
+            OpTag::IntZExt,
+            OpTag::IntSExt,
+            OpTag::BoolNot,
+            OpTag::BoolAnd,
+            OpTag::BoolOr,
+            OpTag::BoolXor,
+            OpTag::Piece,
+            OpTag::Subpiece,
+            OpTag::PopCount,
+            OpTag::Lzcount,
+            OpTag::Branch,
+            OpTag::CBranch,
+            OpTag::BranchInd,
+            OpTag::Call,
+            OpTag::CallInd,
+            OpTag::CallDefine,
+            OpTag::Return,
+            OpTag::FloatAdd,
+            OpTag::FloatSub,
+            OpTag::FloatMult,
+            OpTag::FloatDiv,
+            OpTag::FloatNeg,
+            OpTag::FloatAbs,
+            OpTag::FloatSqrt,
+            OpTag::FloatCeil,
+            OpTag::FloatFloor,
+            OpTag::FloatRound,
+            OpTag::FloatNaN,
+            OpTag::FloatEqual,
+            OpTag::FloatNotEqual,
+            OpTag::FloatLess,
+            OpTag::FloatLessEqual,
+            OpTag::Int2Float,
+            OpTag::Float2Int,
+            OpTag::FloatFloat,
+            OpTag::Trunc,
+            OpTag::CallOther,
+            OpTag::Nop,
+            OpTag::Unimplemented,
+            OpTag::CpuId,
+            OpTag::Breakpoint,
+            OpTag::PtrAdd,
+            OpTag::PtrSub,
+            OpTag::SegmentOp,
+            OpTag::New,
+            OpTag::Cast,
+            OpTag::Extract,
+            OpTag::Insert,
+        ];
+        for tag in all {
+            let s = tag.as_str();
+            assert_eq!(OpTag::parse(s), Some(tag), "round trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn from_str_refuses_an_unknown_string() {
+        assert_eq!(OpTag::parse("not_a_real_opcode"), None);
+        // anti-vacuity: a near-miss (extra char) is ALSO refused, not fuzzy-matched
+        assert_eq!(OpTag::parse("int_addx"), None);
+    }
 }
 
 // ============================================================================================

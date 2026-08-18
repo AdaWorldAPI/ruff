@@ -39,14 +39,31 @@
 //! column position. [`OfflineSink`] writes three files per harvest — facts,
 //! residuals, and the report — under one directory, so a consumer can read
 //! whichever it needs without parsing the others.
+//!
+//! # v1 → v2 (this pass): residuals gained the payload the reader needs
+//!
+//! v1's residuals writer recorded `reason.as_str()` + the facet coordinate —
+//! honest about being *addressed*, but silently lossy for anything a reader
+//! would need to RECONSTRUCT a [`ResidualFact`]: the per-variant payload
+//! (e.g. which [`OpTag`] was unclassified), [`ResidualFact::at_prefix`], and
+//! [`ResidualFact::provenance`] were never written at all. v1 was never
+//! shipped with a reader, so this widens the schema (bumping
+//! `RESIDUALS_VERSION`) rather than living with the gap — additive per the
+//! rule above: every v1 column keeps its meaning, new columns append.
+//! [`read_facts`] and [`read_residuals`] close the "honesty note" the
+//! previous pass of this file left on [`OfflineSink::new`].
 
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::furnace::{Concern, FlatFact, HarvestReport};
-use crate::slag::ResidualLedger;
+use r2ssa::{BlockId, InstId, ValueId};
+
+use crate::facet::{FacetPrefix, VarnodeFacet};
+use crate::furnace::{Concern, FactId, FactKind, FlatFact, HarvestReport};
+use crate::ore::{FactProvenance, OpTag};
+use crate::slag::{ResidualFact, ResidualLedger, ResidualReason};
 
 /// Where refined truth (one `smelt` call's output) lands. Implemented by
 /// [`OfflineSink`] here; a lance-graph-side crate implements it for its own
@@ -81,13 +98,8 @@ impl OfflineSink {
     /// Does NOT create `dir` — call [`Self::ensure_dir`] first, or write into
     /// a directory the caller already knows exists. Kept a separate step so
     /// a sink can be constructed purely to compute the `dir`/`source` join
-    /// that [`read_report`] needs, without a filesystem side effect.
-    ///
-    /// **Honesty note:** only [`read_report`] exists so far — a facts/
-    /// residuals reader (reconstructing [`FlatFact`]/`ResidualLedger` rows
-    /// from the TSV, including `VarnodeFacet` from its three written
-    /// columns) is real remaining scope, not implemented here. Do not
-    /// assume a `read_facts`/`read_residuals` exists.
+    /// the [`read_report`]/[`read_facts`]/[`read_residuals`] readers need,
+    /// without a filesystem side effect.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -158,11 +170,11 @@ impl From<io::Error> for OfflineSinkError {
     }
 }
 
-const FACTS_VERSION: u32 = 1;
-const FACTS_SCHEMA: &str = "id\tspace_discriminant\toffset\tsize\tconcern\tkind\topcode\ta\tb\tblock_addr\top_idx\tinst_id";
+const FACTS_VERSION: u32 = 2;
+const FACTS_SCHEMA: &str = "id\tspace_discriminant\toffset\tsize\tconcern\tkind\topcode\ta\tb\tblock_addr\top_idx\tinst_id\tvalue_id";
 
-const RESIDUALS_VERSION: u32 = 1;
-const RESIDUALS_SCHEMA: &str = "reason\tspace_discriminant\toffset\tsize";
+const RESIDUALS_VERSION: u32 = 2;
+const RESIDUALS_SCHEMA: &str = "reason\treason_payload1\treason_payload2\tspace_discriminant\toffset\tsize\tprefix_kind\tprefix_discriminant\tprefix_offset\tprefix_size\tblock_addr\top_idx\tinst_id\tvalue_id";
 
 const REPORT_VERSION: u32 = 1;
 const REPORT_SCHEMA: &str = "harvested\tclassified\tresidual\tdropped";
@@ -185,7 +197,7 @@ impl RefinedTruthSink for OfflineSink {
         for fact in facts {
             writeln!(
                 w,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 fact.id.0,
                 fact.at.space_discriminant(),
                 fact.at.offset(),
@@ -195,13 +207,7 @@ impl RefinedTruthSink for OfflineSink {
                 fact.opcode.as_str(),
                 fact.a,
                 fact.b,
-                fact.prov
-                    .block
-                    .map_or_else(String::new, |b| b.0.to_string()),
-                fact.prov
-                    .op_site
-                    .map_or_else(String::new, |(addr, idx)| format!("{addr}:{idx}")),
-                fact.prov.inst.map_or_else(String::new, |i| i.0.to_string()),
+                provenance_cols(&fact.prov),
             )?;
         }
         w.flush()?;
@@ -210,19 +216,16 @@ impl RefinedTruthSink for OfflineSink {
         writeln!(w, "#version {RESIDUALS_VERSION}")?;
         writeln!(w, "#schema {RESIDUALS_SCHEMA}")?;
         for row in residuals.rows() {
+            let (p1, p2) = reason_payload_cols(&row.reason);
             writeln!(
                 w,
-                "{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 row.reason.as_str(),
-                row.at
-                    .map(|f| f.space_discriminant())
-                    .map_or_else(String::new, |d| d.to_string()),
-                row.at
-                    .map(|f| f.offset())
-                    .map_or_else(String::new, |o| o.to_string()),
-                row.at
-                    .map(|f| f.size())
-                    .map_or_else(String::new, |s| s.to_string()),
+                p1,
+                p2,
+                facet_cols(row.at),
+                prefix_cols(row.at_prefix),
+                provenance_cols(&row.provenance),
             )?;
         }
         w.flush()?;
@@ -241,6 +244,10 @@ impl RefinedTruthSink for OfflineSink {
     }
 }
 
+// ================================================================================================
+// Shared column codecs — used by both the facts and residuals writers/readers
+// ================================================================================================
+
 fn concern_str(c: Concern) -> &'static str {
     match c {
         Concern::Control => "control",
@@ -250,6 +257,332 @@ fn concern_str(c: Concern) -> &'static str {
         Concern::Predicates => "predicates",
         Concern::Calls => "calls",
     }
+}
+
+fn concern_from_str(s: &str) -> Option<Concern> {
+    Some(match s {
+        "control" => Concern::Control,
+        "values" => Concern::Values,
+        "objects" => Concern::Objects,
+        "memory" => Concern::Memory,
+        "predicates" => Concern::Predicates,
+        "calls" => Concern::Calls,
+        _ => return None,
+    })
+}
+
+fn fact_kind_from_str(s: &str) -> Option<FactKind> {
+    Some(match s {
+        "op" => FactKind::Op,
+        "operand_in" => FactKind::OperandIn,
+        "operand_out" => FactKind::OperandOut,
+        "edge" => FactKind::Edge,
+        "mem_use" => FactKind::MemUse,
+        "mem_def" => FactKind::MemDef,
+        "predicate" => FactKind::Predicate,
+        "call_site" => FactKind::CallSite,
+        _ => return None,
+    })
+}
+
+/// `block_addr\top_idx\tinst_id\tvalue_id` — four columns, one call site per
+/// [`FactProvenance`] anywhere it appears in either TSV. Kept as ONE function
+/// so the facts and residuals writers can never drift apart on this shape.
+fn provenance_cols(prov: &FactProvenance) -> String {
+    format!(
+        "{}\t{}\t{}\t{}",
+        prov.block.map_or_else(String::new, |b| b.0.to_string()),
+        prov.op_site
+            .map_or_else(String::new, |(addr, idx)| format!("{addr}:{idx}")),
+        prov.inst.map_or_else(String::new, |i| i.0.to_string()),
+        prov.value.map_or_else(String::new, |v| v.0.to_string()),
+    )
+}
+
+fn parse_provenance_cols<'a>(
+    cols: &mut impl Iterator<Item = &'a str>,
+) -> io::Result<FactProvenance> {
+    let block = next_opt(cols)?
+        .map(|s| s.parse().map(BlockId))
+        .transpose()
+        .map_err(|_| malformed("non-numeric block_addr"))?;
+    let op_site = next_opt(cols)?
+        .map(|s| {
+            let (addr, idx) = s
+                .split_once(':')
+                .ok_or_else(|| malformed("op_site missing ':' separator"))?;
+            let addr: u64 = addr
+                .parse()
+                .map_err(|_| malformed("non-numeric op_site addr"))?;
+            let idx: usize = idx
+                .parse()
+                .map_err(|_| malformed("non-numeric op_site idx"))?;
+            Ok::<(u64, usize), io::Error>((addr, idx))
+        })
+        .transpose()?;
+    let inst = next_opt(cols)?
+        .map(|s| s.parse().map(InstId))
+        .transpose()
+        .map_err(|_| malformed("non-numeric inst_id"))?;
+    let value = next_opt(cols)?
+        .map(|s| s.parse().map(ValueId))
+        .transpose()
+        .map_err(|_| malformed("non-numeric value_id"))?;
+    Ok(FactProvenance {
+        inst,
+        block,
+        op_site,
+        value,
+    })
+}
+
+/// `space_discriminant\toffset\tsize` for an `Option<VarnodeFacet>` — empty
+/// columns when `None` (the [`ResidualReason::NoFacetCoordinate`] case).
+fn facet_cols(at: Option<VarnodeFacet>) -> String {
+    format!(
+        "{}\t{}\t{}",
+        at.map(|f| f.space_discriminant())
+            .map_or_else(String::new, |d| d.to_string()),
+        at.map(|f| f.offset())
+            .map_or_else(String::new, |o| o.to_string()),
+        at.map(|f| f.size())
+            .map_or_else(String::new, |s| s.to_string()),
+    )
+}
+
+fn parse_facet_cols<'a>(
+    cols: &mut impl Iterator<Item = &'a str>,
+) -> io::Result<Option<VarnodeFacet>> {
+    let discriminant = next_opt(cols)?
+        .map(str::parse::<u16>)
+        .transpose()
+        .map_err(|_| malformed("non-numeric space_discriminant"))?;
+    let offset = next_opt(cols)?
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(|_| malformed("non-numeric offset"))?;
+    let size = next_opt(cols)?
+        .map(str::parse::<u32>)
+        .transpose()
+        .map_err(|_| malformed("non-numeric size"))?;
+    Ok(match (discriminant, offset, size) {
+        (Some(d), Some(o), Some(s)) => Some(facet_from_raw(d, o, s)),
+        (None, None, None) => None,
+        _ => return Err(malformed("facet columns partially present")),
+    })
+}
+
+/// Builds a [`VarnodeFacet`] directly from its three logical fields, using
+/// the EXACT byte layout `facet.rs` documents on the type itself (all
+/// little-endian: `0..4` classid = `(PROVISIONAL_R2IL_VARNODE << 16) |
+/// discriminant`, `4..8` offset lo, `8..12` offset hi, `12..16` size).
+/// [`VarnodeFacet`]'s only other constructors (`facet::project`/`unproject`)
+/// go through a real [`r2il::Varnode`] + [`crate::facet::CustomSpaceTable`],
+/// which a TSV reader does not have — this is the read-back-shaped inverse
+/// of [`VarnodeFacet::space_discriminant`]/`offset`/`size`, and belongs here
+/// rather than in `facet.rs` because it is a PERSISTENCE-layer concern (PR
+/// 2's own "Role 2" per that module's doc comment), not an address-scheme
+/// one.
+#[must_use]
+fn facet_from_raw(discriminant: u16, offset: u64, size: u32) -> VarnodeFacet {
+    let classid: u32 =
+        (u32::from(crate::facet::PROVISIONAL_R2IL_VARNODE) << 16) | u32::from(discriminant);
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&classid.to_le_bytes());
+    bytes[4..8].copy_from_slice(&(offset as u32).to_le_bytes());
+    bytes[8..12].copy_from_slice(&((offset >> 32) as u32).to_le_bytes());
+    bytes[12..16].copy_from_slice(&size.to_le_bytes());
+    VarnodeFacet(bytes)
+}
+
+/// `prefix_kind\tprefix_discriminant\tprefix_offset\tprefix_size` for an
+/// `Option<FacetPrefix>`. `prefix_kind` is `space`/`space_offset`/
+/// `space_offset_size`, empty for `None`; the other three columns are
+/// populated only as far as that variant carries them (e.g. `Space` leaves
+/// `prefix_offset`/`prefix_size` empty).
+fn prefix_cols(p: Option<FacetPrefix>) -> String {
+    match p {
+        None => "\t\t\t".to_string(),
+        Some(FacetPrefix::Space { discriminant }) => format!("space\t{discriminant}\t\t"),
+        Some(FacetPrefix::SpaceOffset {
+            discriminant,
+            offset,
+        }) => {
+            format!("space_offset\t{discriminant}\t{offset}\t")
+        }
+        Some(FacetPrefix::SpaceOffsetSize {
+            discriminant,
+            offset,
+            size,
+        }) => {
+            format!("space_offset_size\t{discriminant}\t{offset}\t{size}")
+        }
+    }
+}
+
+fn parse_prefix_cols<'a>(
+    cols: &mut impl Iterator<Item = &'a str>,
+) -> io::Result<Option<FacetPrefix>> {
+    let kind = next_opt(cols)?;
+    let discriminant = next_opt(cols)?;
+    let offset = next_opt(cols)?;
+    let size = next_opt(cols)?;
+    Ok(match kind {
+        None => None,
+        Some("space") => {
+            let discriminant = discriminant
+                .ok_or_else(|| malformed("prefix missing discriminant"))?
+                .parse()
+                .map_err(|_| malformed("non-numeric prefix discriminant"))?;
+            Some(FacetPrefix::Space { discriminant })
+        }
+        Some("space_offset") => {
+            let discriminant = discriminant
+                .ok_or_else(|| malformed("prefix missing discriminant"))?
+                .parse()
+                .map_err(|_| malformed("non-numeric prefix discriminant"))?;
+            let offset = offset
+                .ok_or_else(|| malformed("prefix missing offset"))?
+                .parse()
+                .map_err(|_| malformed("non-numeric prefix offset"))?;
+            Some(FacetPrefix::SpaceOffset {
+                discriminant,
+                offset,
+            })
+        }
+        Some("space_offset_size") => {
+            let discriminant = discriminant
+                .ok_or_else(|| malformed("prefix missing discriminant"))?
+                .parse()
+                .map_err(|_| malformed("non-numeric prefix discriminant"))?;
+            let offset = offset
+                .ok_or_else(|| malformed("prefix missing offset"))?
+                .parse()
+                .map_err(|_| malformed("non-numeric prefix offset"))?;
+            let size = size
+                .ok_or_else(|| malformed("prefix missing size"))?
+                .parse()
+                .map_err(|_| malformed("non-numeric prefix size"))?;
+            Some(FacetPrefix::SpaceOffsetSize {
+                discriminant,
+                offset,
+                size,
+            })
+        }
+        Some(other) => return Err(malformed_owned(format!("unknown prefix_kind {other:?}"))),
+    })
+}
+
+/// The two generic payload columns for one [`ResidualReason`], covering
+/// every variant's own payload shape (never a lossy summary):
+/// `OpTag`-carrying variants write the tag's `as_str()`; numeric variants
+/// write the number as text; the two-numeric variant
+/// ([`ResidualReason::PhiFanInExceedsPredecessors`]) uses both columns; the
+/// two-`OpTag` variant ([`ResidualReason::OpSiteJoinMismatch`]) uses both
+/// columns; payload-free variants write two empty columns.
+fn reason_payload_cols(r: &ResidualReason) -> (String, String) {
+    match r {
+        ResidualReason::OpcodeNotInConvention { opcode } => {
+            (opcode.as_str().to_string(), String::new())
+        }
+        ResidualReason::UserOpNotInConvention { userop } => (userop.to_string(), String::new()),
+        ResidualReason::CustomSpaceNotInConvention { raw } => (raw.to_string(), String::new()),
+        ResidualReason::FacetOverflowAtKey { raw } => (raw.to_string(), String::new()),
+        ResidualReason::VariadicArity { arity } => (arity.to_string(), String::new()),
+        ResidualReason::PhiFanInExceedsPredecessors {
+            inputs,
+            predecessors,
+        } => (inputs.to_string(), predecessors.to_string()),
+        ResidualReason::OpSiteJoinMismatch { expected, found } => {
+            (expected.as_str().to_string(), found.as_str().to_string())
+        }
+        ResidualReason::NoConventionRowAtAddress
+        | ResidualReason::MemoryObjectEscaped
+        | ResidualReason::IndirectTarget
+        | ResidualReason::NoFacetCoordinate => (String::new(), String::new()),
+    }
+}
+
+fn parse_reason(name: &str, p1: &str, p2: &str) -> io::Result<ResidualReason> {
+    let parse_opcode = |s: &str| -> io::Result<OpTag> {
+        OpTag::parse(s).ok_or_else(|| malformed_owned(format!("unknown opcode {s:?}")))
+    };
+    let parse_u32 = |s: &str| -> io::Result<u32> {
+        s.parse()
+            .map_err(|_| malformed("non-numeric reason payload"))
+    };
+    let parse_usize = |s: &str| -> io::Result<usize> {
+        s.parse()
+            .map_err(|_| malformed("non-numeric reason payload"))
+    };
+    Ok(match name {
+        "opcode_not_in_convention" => ResidualReason::OpcodeNotInConvention {
+            opcode: parse_opcode(p1)?,
+        },
+        "no_convention_row_at_address" => ResidualReason::NoConventionRowAtAddress,
+        "userop_not_in_convention" => ResidualReason::UserOpNotInConvention {
+            userop: parse_u32(p1)?,
+        },
+        "custom_space_not_in_convention" => ResidualReason::CustomSpaceNotInConvention {
+            raw: parse_u32(p1)?,
+        },
+        "facet_overflow_at_key" => ResidualReason::FacetOverflowAtKey {
+            raw: parse_u32(p1)?,
+        },
+        "variadic_arity" => ResidualReason::VariadicArity {
+            arity: parse_usize(p1)?,
+        },
+        "phi_fan_in_exceeds_predecessors" => ResidualReason::PhiFanInExceedsPredecessors {
+            inputs: parse_usize(p1)?,
+            predecessors: parse_usize(p2)?,
+        },
+        "memory_object_escaped" => ResidualReason::MemoryObjectEscaped,
+        "indirect_target" => ResidualReason::IndirectTarget,
+        "no_facet_coordinate" => ResidualReason::NoFacetCoordinate,
+        "op_site_join_mismatch" => ResidualReason::OpSiteJoinMismatch {
+            expected: parse_opcode(p1)?,
+            found: parse_opcode(p2)?,
+        },
+        other => {
+            return Err(malformed_owned(format!(
+                "unknown residual reason {other:?}"
+            )));
+        }
+    })
+}
+
+fn next_opt<'a>(cols: &mut impl Iterator<Item = &'a str>) -> io::Result<Option<&'a str>> {
+    let s = cols.next().ok_or_else(|| malformed("missing column"))?;
+    Ok((!s.is_empty()).then_some(s))
+}
+
+fn next_usize<'a>(cols: &mut impl Iterator<Item = &'a str>) -> io::Result<usize> {
+    cols.next()
+        .ok_or_else(|| malformed("missing column"))?
+        .parse()
+        .map_err(|_| malformed("non-numeric column"))
+}
+
+fn malformed(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+fn malformed_owned(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+// ================================================================================================
+// Readers
+// ================================================================================================
+
+fn read_header(lines: &mut impl Iterator<Item = io::Result<String>>) -> io::Result<()> {
+    lines
+        .next()
+        .ok_or_else(|| malformed("missing #version line"))??;
+    lines
+        .next()
+        .ok_or_else(|| malformed("missing #schema line"))??;
+    Ok(())
 }
 
 /// Read back a report written by [`OfflineSink::write_harvest`]. Round-trips
@@ -262,12 +595,7 @@ fn concern_str(c: Concern) -> &'static str {
 pub fn read_report(path: &Path) -> io::Result<HarvestReport> {
     let f = BufReader::new(File::open(path)?);
     let mut lines = f.lines();
-    let _version = lines
-        .next()
-        .ok_or_else(|| malformed("missing #version line"))??;
-    let _schema = lines
-        .next()
-        .ok_or_else(|| malformed("missing #schema line"))??;
+    read_header(&mut lines)?;
     let data = lines
         .next()
         .ok_or_else(|| malformed("missing data line"))??;
@@ -284,15 +612,112 @@ pub fn read_report(path: &Path) -> io::Result<HarvestReport> {
     })
 }
 
-fn next_usize<'a>(cols: &mut impl Iterator<Item = &'a str>) -> io::Result<usize> {
-    cols.next()
-        .ok_or_else(|| malformed("missing column"))?
-        .parse()
-        .map_err(|_| malformed("non-numeric column"))
+/// Read back the `Vec<FlatFact>` written by [`OfflineSink::write_harvest`].
+/// Byte-for-byte reconstruction of every field — including
+/// [`FactProvenance::value`], which v1 of this writer dropped (see the
+/// module docs' "v1 → v2" note).
+///
+/// # Errors
+/// I/O errors, or a malformed/missing schema line, an unknown `concern`/
+/// `kind`/`opcode` string, or a non-numeric column.
+pub fn read_facts(path: &Path) -> io::Result<Vec<FlatFact>> {
+    let f = BufReader::new(File::open(path)?);
+    let mut lines = f.lines();
+    read_header(&mut lines)?;
+    let mut out = Vec::new();
+    for line in lines {
+        let line = line?;
+        let mut cols = line.split('\t');
+        let id: u32 = cols
+            .next()
+            .ok_or_else(|| malformed("missing id"))?
+            .parse()
+            .map_err(|_| malformed("non-numeric id"))?;
+        let discriminant: u16 = cols
+            .next()
+            .ok_or_else(|| malformed("missing space_discriminant"))?
+            .parse()
+            .map_err(|_| malformed("non-numeric space_discriminant"))?;
+        let offset: u64 = cols
+            .next()
+            .ok_or_else(|| malformed("missing offset"))?
+            .parse()
+            .map_err(|_| malformed("non-numeric offset"))?;
+        let size: u32 = cols
+            .next()
+            .ok_or_else(|| malformed("missing size"))?
+            .parse()
+            .map_err(|_| malformed("non-numeric size"))?;
+        let concern = concern_from_str(cols.next().ok_or_else(|| malformed("missing concern"))?)
+            .ok_or_else(|| malformed("unknown concern"))?;
+        let kind = fact_kind_from_str(cols.next().ok_or_else(|| malformed("missing kind"))?)
+            .ok_or_else(|| malformed("unknown kind"))?;
+        let opcode = OpTag::parse(cols.next().ok_or_else(|| malformed("missing opcode"))?)
+            .ok_or_else(|| malformed("unknown opcode"))?;
+        let a: u64 = cols
+            .next()
+            .ok_or_else(|| malformed("missing a"))?
+            .parse()
+            .map_err(|_| malformed("non-numeric a"))?;
+        let b: u64 = cols
+            .next()
+            .ok_or_else(|| malformed("missing b"))?
+            .parse()
+            .map_err(|_| malformed("non-numeric b"))?;
+        let prov = parse_provenance_cols(&mut cols)?;
+        out.push(FlatFact {
+            id: FactId(id),
+            at: facet_from_raw(discriminant, offset, size),
+            concern,
+            kind,
+            opcode,
+            a,
+            b,
+            prov,
+        });
+    }
+    Ok(out)
 }
 
-fn malformed(msg: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg)
+/// Read back the residual rows written by [`OfflineSink::write_harvest`],
+/// as plain `Vec<ResidualFact>` — NOT re-wrapped in a [`ResidualLedger`],
+/// since [`ResidualLedger`] has no public "trust me, these shape ids are
+/// already correct" constructor and re-deriving `shape_id` from
+/// `reason.shape_id()` per row (rather than trusting the written value) is
+/// the honest reconstruction; a caller who wants a ledger re-pushes each row
+/// through [`ResidualLedger::push`], which computes `shape_id` itself.
+///
+/// # Errors
+/// I/O errors, a malformed/missing schema line, an unknown `reason`/
+/// `prefix_kind`/opcode-payload string, or a non-numeric column.
+pub fn read_residuals(path: &Path) -> io::Result<Vec<ResidualFact>> {
+    let f = BufReader::new(File::open(path)?);
+    let mut lines = f.lines();
+    read_header(&mut lines)?;
+    let mut out = Vec::new();
+    for line in lines {
+        let line = line?;
+        let mut cols = line.split('\t');
+        let reason_name = cols.next().ok_or_else(|| malformed("missing reason"))?;
+        let p1 = cols
+            .next()
+            .ok_or_else(|| malformed("missing reason_payload1"))?;
+        let p2 = cols
+            .next()
+            .ok_or_else(|| malformed("missing reason_payload2"))?;
+        let reason = parse_reason(reason_name, p1, p2)?;
+        let at = parse_facet_cols(&mut cols)?;
+        let at_prefix = parse_prefix_cols(&mut cols)?;
+        let provenance = parse_provenance_cols(&mut cols)?;
+        out.push(ResidualFact {
+            shape_id: reason.shape_id(),
+            reason,
+            at,
+            at_prefix,
+            provenance,
+        });
+    }
+    Ok(out)
 }
 
 /// Backend 3's credential plumbing — `S3Config::from_env` only. See the
@@ -351,8 +776,6 @@ impl S3Config {
 mod tests {
     use super::*;
     use crate::facet::{self, CustomSpaceTable};
-    use crate::furnace::{FactId, FactKind};
-    use crate::ore::{FactProvenance, OpTag};
     use r2il::Varnode;
 
     fn spaces() -> CustomSpaceTable {
@@ -371,6 +794,47 @@ mod tests {
             a: 7,
             b: 0,
             prov: FactProvenance {
+                inst: Some(InstId(3)),
+                block: Some(BlockId(9)),
+                op_site: Some((0x4010, 2)),
+                value: Some(ValueId(42)),
+            },
+        }
+    }
+
+    fn one_residual_with_payload() -> ResidualFact {
+        let reason = ResidualReason::OpSiteJoinMismatch {
+            expected: OpTag::IntAdd,
+            found: OpTag::Copy,
+        };
+        ResidualFact {
+            shape_id: reason.shape_id(),
+            reason,
+            at: {
+                let vn = Varnode::register(0x20, 4);
+                Some(facet::project(&vn, &spaces()).expect("register space never overflows"))
+            },
+            at_prefix: Some(FacetPrefix::SpaceOffset {
+                discriminant: 1,
+                offset: 0x20,
+            }),
+            provenance: FactProvenance {
+                inst: Some(InstId(5)),
+                block: Some(BlockId(1)),
+                op_site: Some((0x4020, 0)),
+                value: None,
+            },
+        }
+    }
+
+    fn one_residual_payload_free() -> ResidualFact {
+        let reason = ResidualReason::MemoryObjectEscaped;
+        ResidualFact {
+            shape_id: reason.shape_id(),
+            reason,
+            at: None,
+            at_prefix: None,
+            provenance: FactProvenance {
                 inst: None,
                 block: None,
                 op_site: None,
@@ -428,6 +892,108 @@ mod tests {
             read_back, report,
             "second write must not clobber the first source's file"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_facts_round_trips_every_field_including_value_id() {
+        let dir =
+            std::env::temp_dir().join(format!("ruff_r2il_sink_facts_test_{}", std::process::id()));
+        let mut sink = OfflineSink::new(&dir);
+        let fact = one_fact();
+        let ledger = ResidualLedger::new();
+        let report = HarvestReport::default();
+        sink.write_harvest("bin", std::slice::from_ref(&fact), &ledger, &report)
+            .expect("write must succeed");
+
+        let facts_path = sink.dir().join("bin.facts.tsv");
+        let read_back = read_facts(&facts_path).expect("read must succeed");
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(
+            read_back[0], fact,
+            "every field, including prov.value, must round-trip"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "ruff/clippy.toml's disallowed-methods list is directory-scoped, not \
+            Cargo-workspace-scoped, so it reaches this workspace-EXCLUDED crate even \
+            though its reasons say 'in ty crates' — ruff_r2il has no ty::System trait \
+            to route through; plain std::fs is correct here"
+    )]
+    fn read_facts_refuses_an_unknown_opcode_rather_than_guessing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruff_r2il_sink_bad_opcode_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir must succeed");
+        let path = dir.join("bad.facts.tsv");
+        std::fs::write(
+            &path,
+            "#version 2\n#schema id\tspace_discriminant\toffset\tsize\tconcern\tkind\topcode\ta\tb\tblock_addr\top_idx\tinst_id\tvalue_id\n\
+             0\t1\t16\t8\tvalues\toperand_in\tnot_a_real_opcode\t7\t0\t\t\t\t\n",
+        )
+        .expect("write must succeed");
+
+        let err = read_facts(&path).expect_err("an unknown opcode string must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_residuals_round_trips_a_two_opcode_payload_reason() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruff_r2il_sink_residuals_test_{}",
+            std::process::id()
+        ));
+        let mut sink = OfflineSink::new(&dir);
+        let facts: [FlatFact; 0] = [];
+        let mut ledger = ResidualLedger::new();
+        ledger.push(one_residual_with_payload());
+        let report = HarvestReport::default();
+        sink.write_harvest("bin", &facts, &ledger, &report)
+            .expect("write must succeed");
+
+        let residuals_path = sink.dir().join("bin.residuals.tsv");
+        let read_back = read_residuals(&residuals_path).expect("read must succeed");
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(
+            read_back[0],
+            one_residual_with_payload(),
+            "OpSiteJoinMismatch's two OpTag payload fields, at_prefix, and provenance must all round-trip"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_residuals_round_trips_a_payload_free_reason_with_no_facet() {
+        let dir = std::env::temp_dir().join(format!(
+            "ruff_r2il_sink_residuals_free_test_{}",
+            std::process::id()
+        ));
+        let mut sink = OfflineSink::new(&dir);
+        let facts: [FlatFact; 0] = [];
+        let mut ledger = ResidualLedger::new();
+        ledger.push(one_residual_payload_free());
+        let report = HarvestReport::default();
+        sink.write_harvest("bin", &facts, &ledger, &report)
+            .expect("write must succeed");
+
+        let residuals_path = sink.dir().join("bin.residuals.tsv");
+        let read_back = read_residuals(&residuals_path).expect("read must succeed");
+        assert_eq!(read_back.len(), 1);
+        // anti-vacuity: explicitly confirm the `at`/`at_prefix` None-ness
+        // round-tripped, not just that SOME row came back.
+        assert!(read_back[0].at.is_none());
+        assert!(read_back[0].at_prefix.is_none());
+        assert_eq!(read_back[0], one_residual_payload_free());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
