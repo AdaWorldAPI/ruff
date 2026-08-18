@@ -11,12 +11,12 @@
 //! This is the proven Python extraction logic re-expressed in Rust; it is NOT
 //! reinvented. The regex-driven Python functions become hand-rolled,
 //! panic-free string scans (matching the style of `jinja.rs`):
-//! - [`find_table_block`]   ← `find_table_block`
-//! - [`extract_loop`]       ← `extract_loop`
-//! - [`extract_headers`]    ← `extract_headers`
-//! - [`extract_body_cells`] ← `extract_body_cells` (+ `_find_outer_else`)
-//! - [`classify_cell`]      ← `classify_cell`
-//! - [`extract_empty_row`]  ← `extract_empty_row`
+//! - `find_table_block`   ← `find_table_block`
+//! - `extract_loop`       ← `extract_loop`
+//! - `extract_headers`    ← `extract_headers`
+//! - `extract_body_cells` ← `extract_body_cells` (+ `_find_outer_else`)
+//! - `classify_cell`      ← `classify_cell`
+//! - `extract_empty_row`  ← `extract_empty_row`
 
 use crate::codegen::jinja::Cell;
 

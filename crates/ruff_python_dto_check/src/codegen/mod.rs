@@ -1,7 +1,7 @@
 //! Target emitter: contract → target source (handler + view template).
 //!
 //! The emitter is **kind-generalized**: each [`HandlerKind`] resolves to a
-//! [`KindRecipe`] that describes the shape (signature, query, response) in
+//! `KindRecipe` that describes the shape (signature, query, response) in
 //! data, so the other 10 kinds slot in by adding a recipe entry — not new
 //! Rust per kind. `list_for_tenant` and `soft_delete` are implemented
 //! end-to-end (matching the woa-rs port-drafts oracle, with the corrected
