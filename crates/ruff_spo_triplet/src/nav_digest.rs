@@ -144,10 +144,10 @@ fn resolve_token(token: &str, config: &ExamConfig) -> Option<u16> {
 ///   (both ends) union every `selects_view` subject.
 /// - `[klickwege]` / `[views]` strip the namespace prefix from both sides.
 /// - `[concepts]` resolves each `surfaces_concept` object token via
-///   [`resolve_token`]; the screen is the namespace-stripped subject.
+///   `resolve_token`; the screen is the namespace-stripped subject.
 /// - `[screen surface]` only lists screens with `controls + handlers > 0`;
 ///   the screen is the namespace-stripped subject segment up to the first
-///   `.` (see [`screen_of`]).
+///   `.` (see `screen_of`).
 /// - `regions` / `[regions]` fold `docked_at` facts into the region frame:
 ///   the dock token is resolved through
 ///   [`crate::exam_config::ExamConfig::regions`] to a region name, falling
@@ -168,7 +168,7 @@ fn resolve_token(token: &str, config: &ExamConfig) -> Option<u16> {
 ///   Indentation is exactly two spaces.
 /// - `[menu-quad]` lowers the `(location, purpose, identity, action)` quad per
 ///   menu node into the existing classid ontology. `location` is the `part_of`
-///   rail walked as a radix-trie address ([`menu_address`]): the ancestor
+///   rail walked as a radix-trie address (`menu_address`): the ancestor
 ///   classid path, root-first, `0x<ID>` per resolved ancestor and the bare
 ///   screen name as fallback — **no stored ordinal**, the address IS the walk
 ///   (V3 LE-contract §3). `identity` is the node's own classid (`-` when

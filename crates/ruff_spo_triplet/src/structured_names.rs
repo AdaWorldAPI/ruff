@@ -26,7 +26,7 @@ pub struct NameGrammar {
     /// numeric token.
     pub marker: String,
     /// Names for each numeric tier, outermost first (e.g. `["form","section"]`).
-    /// Extra numeric tokens beyond this list get tier name "level<N>".
+    /// Extra numeric tokens beyond this list get tier name "`level<N>`".
     pub tier_names: Vec<String>,
 }
 

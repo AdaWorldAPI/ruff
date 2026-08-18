@@ -3,7 +3,7 @@
 //! This is the one genuinely-new brick between the `ruff_*_spo` SPO harvest and
 //! the lance-graph `(part_of:is_a)` GUID `SoA` (see lance-graph
 //! `.claude/knowledge/ast-as-partof-isa-address.md` — "The missing brick"). The
-//! carrier ([`lance_graph_contract::facet::FacetCascade`], shipped #613/#614) is
+//! carrier (`lance_graph_contract::facet::FacetCascade`, shipped #613/#614) is
 //! already there; this crate fills the *mint*.
 //!
 //! Given a corpus's two structural relations:
@@ -374,7 +374,7 @@ pub fn mint_with_classid(triples: &[Triple], classid_of: impl Fn(&str) -> u32) -
 /// Structural mints are unaffected (both maps are always non-empty there).
 ///
 /// Determinism + the 6-tier / 255-sibling caps are inherited unchanged from
-/// [`ranks`] (a node exceeding either is flagged in [`Mint`]'s `truncated`).
+/// `ranks` (a node exceeding either is flagged in [`Mint`]'s `truncated`).
 #[must_use]
 pub fn mint_from_parents<'a>(
     nodes: &BTreeSet<&'a str>,

@@ -149,7 +149,7 @@ pub fn walk_tu_with_diagnostics(
 ///
 /// This is the missing arm for C libraries: [`walk_tu`] harvests C++ *classes*;
 /// a C library (leptonica, zlib, …) is free functions on pointer buffers, so
-/// the AR/OO member body-arm ([`method_body_arm`]) captures nothing there — but
+/// the AR/OO member body-arm (`method_body_arm`) captures nothing there — but
 /// the call graph IS the transcode-driving structure (which functions to port,
 /// in what dispatch order). Numeric kernel BODIES remain the essential-15%
 /// hand-port (the doctrine); this mints the 85% structure that classifies + orders
@@ -326,10 +326,10 @@ fn find_overloaded_decl_ref(node: &Entity) -> Option<String> {
 /// directly inside a namespace or at global scope).
 ///
 /// Nested class-body enums are NOT collected here — they are covered by the
-/// extended [`build_class`], which pushes them onto the owning
+/// extended `build_class`, which pushes them onto the owning
 /// [`CppClass::declarations`] as `Declaration::Enum` alongside its fields and
 /// methods. This split mirrors [`walk_tu`] vs the class-body arm of
-/// [`build_class`]: a free-standing enum has no owning class to attach to, so
+/// `build_class`: a free-standing enum has no owning class to attach to, so
 /// it needs its own top-level collection.
 ///
 /// # Errors
@@ -411,7 +411,7 @@ fn build_enum(e: &Entity) -> Option<CppEnum> {
 /// The key is the `EntityKind` `Debug` name (e.g. `"Method"`, `"FieldDecl"`,
 /// `"FriendDecl"`); the value is how many times that kind appears as a direct
 /// member. The caller computes the *mapped fraction* — `BaseSpecifier` +
-/// `FieldDecl` + `Method` are exactly the kinds [`build_class`] turns into a
+/// `FieldDecl` + `Method` are exactly the kinds `build_class` turns into a
 /// [`Declaration`] today — versus the total, so a real-corpus walk shows which
 /// constructs the walker silently drops (the walker-follow-up backlog:
 /// `FriendDecl`, `StaticAssert`, templates, …) rather than asserting coverage.
@@ -434,7 +434,7 @@ pub fn class_body_cursor_histogram(
     Ok(hist)
 }
 
-/// The kinds [`build_class`] maps to a [`Declaration`] today — the "covered"
+/// The kinds `build_class` maps to a [`Declaration`] today — the "covered"
 /// set for the `CPP-SCHEMA-FIT` mapped-fraction. Kept beside the walker so the
 /// coverage probe and the actual extraction can never drift apart. The
 /// function-like kinds (`Method` / `Constructor` / `Destructor` /
