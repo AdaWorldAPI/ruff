@@ -16,15 +16,15 @@ Also **pre-register a prediction that is NOT a bar** (so it can be wrong without
 
 Functions harvested: 143
 
-Conservation line: harvested 54304 / classified 10729 / residual 43575 / dropped 0
+Conservation line: harvested 54304 / classified 17557 / residual 36747 / dropped 0
 
 **B1: PASS** — dropped == 0: true; harvested == classified + residual: true
 
-**B2: KILL** — 10700 classified / 19198 total ore facts under a seven-opcode parent = 55.73%.
+**B2: INVESTIGATE** — 17528 classified / 19198 total ore facts under a seven-opcode parent = 91.30%.
 
   Derivation note: `ResidualFact` does not carry its parent opcode directly, so the denominator's residual half is APPROXIMATED by summing residual reasons that can *only* fire on a row whose parent op is one of the seven (`no_convention_row_at_address`, `indirect_target`, `memory_object_escaped`, `op_site_join_mismatch`, `custom_space_not_in_convention`, `facet_overflow_at_key`) — reasons that can only fire on a non-seven or no-parent-op row (`opcode_not_in_convention`, `user_op_not_in_convention`, `phi_fan_in_exceeds_predecessors`, `variadic_arity`, `no_facet_coordinate`) are excluded. Labelled APPROXIMATION, not exact — see the module doc comment above `SEVEN_ELIGIBLE_RESIDUAL_REASONS`.
 
-**B3: PASS** — residual > 0: true (43575); distinct shape_id count: 44 (>=5: true); dominant_share: 0.181 (<0.60: true).
+**B3: PASS** — residual > 0: true (36747); distinct shape_id count: 43 (>=5: true); dominant_share: 0.215 (<0.60: true).
 
   Spot check: every grouped bucket except no_facet_coordinate reports an example facet address.
 

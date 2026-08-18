@@ -30,7 +30,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use r2il::{ArchSpec, SpaceId};
 
-use crate::facet::{CustomSpaceTable, FacetOverflow, FacetPrefix, SPACE_REGISTER, VarnodeFacet};
+use crate::facet::{
+    CustomSpaceTable, FacetOverflow, FacetPrefix, SPACE_CONST, SPACE_RAM, SPACE_REGISTER,
+    SPACE_UNIQUE, VarnodeFacet,
+};
 use crate::ore::OpTag;
 
 /// Mirrors openproject-nexgen-rs's `orm-ar-backprojection.toml`
@@ -115,10 +118,11 @@ impl R2ilConvention {
     /// * `arch.registers: Vec<RegisterDef{name, offset, size, parent}>` → one
     ///   `FacetPrefix::SpaceOffsetSize{ SPACE_REGISTER, offset, size }` row per register,
     ///   `name = Some(reg.name)`, `state = Unmeasured`;
-    /// * one coarse `FacetPrefix::Space{ SPACE_REGISTER }` fall-through row named after the
-    ///   register space (`arch.spaces`'s own `AddressSpace{id: SpaceId::Register, name}` entry
-    ///   when the architecture defines one, else the literal `"register"`), so an UNKNOWN
-    ///   register offset still resolves — to the space, not to nothing;
+    /// * one coarse `FacetPrefix::Space{ .. }` fall-through row per FIXED space (Register, Ram,
+    ///   Unique, Const), each named after that space's own `arch.spaces` entry when the
+    ///   architecture defines one, else a literal fallback, so an offset the corpus never named
+    ///   still resolves — to the space, not to nothing. Custom spaces get NO blanket
+    ///   fall-through: an unnamed `Custom(n)` must stay slag;
     /// * `arch.userops: Vec<UserOpDef{index, name}>` → the userop table;
     /// * `arch.spaces` (`AddressSpace{id: SpaceId::Custom(n), name}`) → [`CustomSpaceTable`].
     ///
@@ -131,26 +135,45 @@ impl R2ilConvention {
 
         let mut rows = BTreeMap::new();
 
-        // The coarse fall-through row for the whole register space — an offset the corpus
-        // never named still resolves to *something* rather than to nothing.
-        let register_space_name = arch
-            .spaces
-            .iter()
-            .find(|space| space.id == SpaceId::Register)
-            .map(|space| space.name.clone())
-            .unwrap_or_else(|| "register".to_string());
-        let register_space_prefix = FacetPrefix::Space {
-            discriminant: SPACE_REGISTER,
-        };
-        rows.insert(
-            register_space_prefix,
-            ConventionRow {
-                at: register_space_prefix,
-                name: Some(register_space_name),
-                note: None,
-                state: ValidationState::Unmeasured,
-            },
-        );
+        // A coarse fall-through row for EVERY fixed space — an offset the corpus never named
+        // still resolves to *something* rather than to nothing.
+        //
+        // MEASURED omission, fixed here: the first pass-1 harvest emitted a Register row and
+        // nothing else, so operands in Const / Unique / Ram could not resolve against ANY
+        // convention and every one of them became `no_convention_row_at_address` — 6828 rows,
+        // the single largest seven-eligible residual, and the reason bar B2 read 55.73% against
+        // a >=99% floor. That was a bootstrap gap, not evidence about the corpus: the very
+        // doctrine that gives Register a space-class fall-through applies identically to the
+        // other three. See `.claude/harvest/r2il/TRIAGE-RESULT.md` for the failing run, kept in
+        // history rather than overwritten.
+        //
+        // Custom spaces are deliberately NOT given a blanket fall-through: an unnamed
+        // `Custom(n)` is a genuine "the convention does not know this architecture's space"
+        // signal and must stay slag (`CustomSpaceNotInConvention`), which is exactly what the
+        // config-key falsifier in `facet.rs` pins.
+        for (discriminant, space_id, fallback_name) in [
+            (SPACE_REGISTER, SpaceId::Register, "register"),
+            (SPACE_RAM, SpaceId::Ram, "ram"),
+            (SPACE_UNIQUE, SpaceId::Unique, "unique"),
+            (SPACE_CONST, SpaceId::Const, "const"),
+        ] {
+            let space_name = arch
+                .spaces
+                .iter()
+                .find(|space| space.id == space_id)
+                .map(|space| space.name.clone())
+                .unwrap_or_else(|| fallback_name.to_string());
+            let at = FacetPrefix::Space { discriminant };
+            rows.insert(
+                at,
+                ConventionRow {
+                    at,
+                    name: Some(space_name),
+                    note: None,
+                    state: ValidationState::Unmeasured,
+                },
+            );
+        }
 
         // One finest-depth row per named register, read straight off `ArchSpec::registers`.
         for register in &arch.registers {
