@@ -52,6 +52,7 @@ mod odoo_quad;
 mod odoo_regions;
 mod odoo_views;
 mod parse;
+mod plain;
 mod templates;
 mod walk;
 
@@ -69,6 +70,7 @@ pub use odoo_regions::{
 pub use odoo_views::{
     OdooViewScanReport, extract_odoo_view_field_sets, extract_odoo_view_field_sets_with_report,
 };
+pub use plain::{extract_plain, extract_plain_from_source};
 pub use templates::{
     ViewFieldSet, ViewScanReport, ViewTarget, extract_template_field_sets,
     extract_template_field_sets_with_report,
