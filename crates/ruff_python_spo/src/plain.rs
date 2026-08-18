@@ -334,6 +334,24 @@ fn curie_prefix_of_literal(value: &Expr) -> Option<String> {
     (prefix_ok && rest_ok).then(|| prefix.to_string())
 }
 
+/// The detail for a [`PlainResidualReason::NonLiteralAssign`] row: for a
+/// call expression whose callee resolves to a terminal name, `"call:<name>"`
+/// (`field(default_factory=list)` -> `"call:field"`, `a.b.factory()` ->
+/// `"call:factory"`) so the drill signal can distinguish which factory
+/// functions dominate a corpus's non-literal assigns instead of lumping
+/// every call under one bucket; anything else falls back to
+/// [`expr_kind`] unchanged (a call whose own callee is itself a call,
+/// subscript, etc. stays the generic `"call"` — never guessed).
+fn non_literal_assign_detail(expr: &Expr) -> String {
+    if let Expr::Call(call) = expr
+        && let Some(callee) = base_name(&call.func)
+    {
+        format!("call:{callee}")
+    } else {
+        expr_kind(expr).to_string()
+    }
+}
+
 /// Compact kind tag for an expression, used as residual `detail`. The
 /// closed reason taxonomy lives in [`PlainResidualReason`]; this tag is
 /// free-text granularity underneath it, so the trailing arm is acceptable
@@ -437,7 +455,7 @@ fn walk_plain_class(
                         residuals.push(residual(
                             PlainResidualReason::NonLiteralAssign,
                             Some(name.to_string()),
-                            Some(expr_kind(&assign.value).to_string()),
+                            Some(non_literal_assign_detail(&assign.value)),
                         ));
                     }
                 } else {
@@ -821,6 +839,31 @@ class Sample(Base, Generic[T]):
         assert_eq!(nested.name.as_deref(), Some("Inner"));
         // And the ledger is EXACTLY these rows — nothing extra, no lumping.
         assert_eq!(rows.len(), 7);
+    }
+
+    #[test]
+    fn non_literal_assign_detail_names_the_call_and_falls_back_when_unresolvable() {
+        let src = r#"
+class Row:
+    a = field(default_factory=list)
+    b = some.module.factory()
+    c = get_default()()
+    d = (lambda: 1)()
+"#;
+        let (_, rows) = extract_plain_from_source_with_residuals(src, "mod");
+        let details: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.reason == PlainResidualReason::NonLiteralAssign)
+            .filter_map(|r| r.detail.as_deref())
+            .collect();
+        assert_eq!(details.len(), 4);
+        assert!(details.contains(&"call:field"));
+        assert!(details.contains(&"call:factory"));
+        // `get_default()()` — the callee is itself a call, not a
+        // Name/Attribute, so it stays the generic tag rather than guessing.
+        assert!(details.contains(&"call"));
+        // `(lambda: 1)()` — same: the callee is a lambda expression.
+        assert_eq!(details.iter().filter(|&&d| d == "call").count(), 2);
     }
 
     #[test]
