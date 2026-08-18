@@ -280,7 +280,7 @@ mod tests {
     use crate::ir::Function;
 
     /// Boundary-4 on the ALIAS branch: a convention row whose VALUE is
-    /// PascalCase cannot smuggle a case-divergent concept past the seam —
+    /// `PascalCase` cannot smuggle a case-divergent concept past the seam —
     /// `resolve_concept` folds the alias value through `concept_key`, so
     /// `SplitName::concept` is a fixed point on BOTH branches.
     #[test]
