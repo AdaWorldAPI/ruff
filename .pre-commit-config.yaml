@@ -1,5 +1,10 @@
 fail_fast: false
 
+# Paths the fixer hooks must not touch. The last three were added after a
+# repo-wide run mangled data: `typos` dropped a hex digit from a harvest
+# shape_id and rewrote the P-code tag `int_scarry`; `mdformat` collapsed the
+# YAML frontmatter of every `.claude/agents/*.md` card (no frontmatter
+# plugin is configured); `ruff-format` reformatted golden test INPUTS.
 exclude: |
   (?x)^(
     .github/workflows/release.yml|
@@ -16,7 +21,10 @@ exclude: |
     crates/ruff_python_formatter/tests/snapshots/.*|
     crates/ruff_python_resolver/resources/.*|
     crates/ruff_python_resolver/tests/snapshots/.*|
-    crates/ty_completion_eval/truth/.*
+    crates/ty_completion_eval/truth/.*|
+    vendor/.*|
+    .claude/.*|
+    crates/ruff_python_dto_check/tests/golden/.*
   )$
 
 repos:

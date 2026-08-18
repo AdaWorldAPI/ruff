@@ -385,7 +385,7 @@ impl OpTag {
             OpTag::IntSRem => "int_srem",
             OpTag::IntNegate => "int_negate",
             OpTag::IntCarry => "int_carry",
-            OpTag::IntSCarry => "int_scary",
+            OpTag::IntSCarry => "int_scarry",
             OpTag::IntSBorrow => "int_sborrow",
             OpTag::IntAnd => "int_and",
             OpTag::IntOr => "int_or",
