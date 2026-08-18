@@ -28,18 +28,18 @@ f.is_a_chain();      // == FacetCascade::lo_chain  (taxonomy  / typeHierarchy)
 ```
 
 - **Prefix-routable both ways.** Members of the same class share a leading
-  `part_of_chain` prefix; subtypes of the same base share a leading
-  `is_a_chain` prefix — so an LSP `documentSymbol` / `typeHierarchy` query is a
-  longest-common-prefix over the cache-resident key column.
+    `part_of_chain` prefix; subtypes of the same base share a leading
+    `is_a_chain` prefix — so an LSP `documentSymbol` / `typeHierarchy` query is a
+    longest-common-prefix over the cache-resident key column.
 - **Exact below the per-tier cap, not a PQ approximation.** Ranks are a
-  deterministic assignment (sorted sibling order) — roundtrip-lossless and
-  injective *as long as every sibling set is ≤ 255 and depth ≤ 6*. Iron-rule
-  clean per `I-VSA-IDENTITIES` (encodes identity positions, never bundles
-  content). The cap is real and measured — see the fence below.
+    deterministic assignment (sorted sibling order) — roundtrip-lossless and
+    injective *as long as every sibling set is ≤ 255 and depth ≤ 6*. Iron-rule
+    clean per `I-VSA-IDENTITIES` (encodes identity positions, never bundles
+    content). The cap is real and measured — see the fence below.
 - **`facet_classid`.** `mint` leaves it `0`; `mint_with_classid` takes a
-  resolver so a caller holding the OGAR codebook can stamp the canonical
-  class-id (e.g. `lance_graph_contract::canonical_concept_id`) **BBB-safely** —
-  this crate stays pure `std` + `ruff_spo_triplet`, never linking the codebook.
+    resolver so a caller holding the OGAR codebook can stamp the canonical
+    class-id (e.g. `lance_graph_contract::canonical_concept_id`) **BBB-safely** —
+    this crate stays pure `std` + `ruff_spo_triplet`, never linking the codebook.
 
 ## Honest fence — MEASURED on a real corpus, not assumed
 
@@ -50,7 +50,7 @@ not a lossless address (deeper levels are the registry/ref-escape's job).
 Earlier this doc claimed "for class graphs (depth ≈ 3–4) nothing truncates."
 **That was falsified against a real multi-thousand-node corpus** (a Roslyn
 harvest of a production C# codebase, run downstream via `ruff_csharp_spo`):
-the naive [`mint`] produced real collisions and truncations once two
+the naive \[`mint`\] produced real collisions and truncations once two
 structures crossed the 255-sibling cap — a **God-class** (a single class with
 hundreds of fields, the part_of axis) and a **flat is_a root** (a kind-
 discriminator type with thousands of direct children, the is_a axis). Coarse
@@ -61,7 +61,7 @@ the *coarse* prefix, which never saturates; only fine-grained identity
 The fix is not a bigger int — it is that a member's **kind** (e.g.
 Property/Function) belongs in its `facet_classid`, not in a 6-tier sibling
 rank under a mega-root. That is the same move the classid-gate proposes.
-[`mint_factored`] is the corrected minter: it builds is_a from
+\[`mint_factored`\] is the corrected minter: it builds is_a from
 `inherits_from` only (the kind-discriminator mega-root never enters the
 sibling rank) and gives part_of a base-255 positional path that cascades
 deeper instead of saturating — both failure modes go to zero on the same
