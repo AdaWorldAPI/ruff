@@ -34,7 +34,7 @@ We also support unions in type aliases:
 
 ```py
 from typing_extensions import Any, Never, Literal, LiteralString, Tuple, Annotated, Optional, Union, Callable, TypeVar
-from ty_extensions import Unknown
+from ty_extensions._internal import Unknown
 
 T = TypeVar("T")
 
@@ -429,6 +429,8 @@ MyType = type[T]
 IntAndType = tuple[int, T]
 Pair = tuple[T, T]
 Sum = tuple[T, U]
+# The homogeneous element type is `object`, but the exact tuple is still generic in `T`.
+ObjectAndList = tuple[object, list[T]]
 ListOrTuple = list[T] | tuple[T, ...]
 ListOrTupleLegacy = Union[list[T], tuple[T, ...]]
 MyCallable = Callable[P, T]
@@ -442,10 +444,11 @@ reveal_type(MyType)  # revealed: <special-form 'type[T@MyType]'>
 reveal_type(IntAndType)  # revealed: <class 'tuple[int, T@IntAndType]'>
 reveal_type(Pair)  # revealed: <class 'tuple[T@Pair, T@Pair]'>
 reveal_type(Sum)  # revealed: <class 'tuple[T@Sum, U@Sum]'>
+reveal_type(ObjectAndList)  # revealed: <class 'tuple[object, list[T@ObjectAndList]]'>
 reveal_type(ListOrTuple)  # revealed: <types.UnionType special-form 'list[T@ListOrTuple] | tuple[T@ListOrTuple, ...]'>
 # revealed: <types.UnionType special-form 'list[T@ListOrTupleLegacy] | tuple[T@ListOrTupleLegacy, ...]'>
 reveal_type(ListOrTupleLegacy)
-reveal_type(MyCallable)  # revealed: <typing.Callable special-form '(**P@MyCallable) -> T@MyCallable'>
+reveal_type(MyCallable)  # revealed: <Callable special-form '(**P@MyCallable) -> T@MyCallable'>
 reveal_type(AnnotatedType)  # revealed: <special-form 'typing.Annotated[T@AnnotatedType, <metadata>]'>
 reveal_type(TransparentAlias)  # revealed: TypeVar
 reveal_type(MyOptional)  # revealed: <types.UnionType special-form 'T@MyOptional | None'>
@@ -457,6 +460,7 @@ def _(
     int_and_str: IntAndType[str],
     pair_of_ints: Pair[int],
     int_and_bytes: Sum[int, bytes],
+    object_and_list: ObjectAndList[int],
     list_or_tuple: ListOrTuple[int],
     list_or_tuple_legacy: ListOrTupleLegacy[int],
     my_callable: MyCallable[[str, bytes], int],
@@ -471,6 +475,7 @@ def _(
     reveal_type(int_and_str)  # revealed: tuple[int, str]
     reveal_type(pair_of_ints)  # revealed: tuple[int, int]
     reveal_type(int_and_bytes)  # revealed: tuple[int, bytes]
+    reveal_type(object_and_list)  # revealed: tuple[object, list[int]]
     reveal_type(list_or_tuple)  # revealed: list[int] | tuple[int, ...]
     reveal_type(list_or_tuple_legacy)  # revealed: list[int] | tuple[int, ...]
     reveal_type(my_callable)  # revealed: (str, bytes, /) -> int
@@ -510,7 +515,7 @@ reveal_type(ListOfPairs)  # revealed: <class 'list[tuple[str, str]]'>
 reveal_type(ListOrTupleOfInts)  # revealed: <types.UnionType special-form 'list[int] | tuple[int, ...]'>
 reveal_type(AnnotatedInt)  # revealed: <special-form 'typing.Annotated[int, <metadata>]'>
 reveal_type(SubclassOfInt)  # revealed: <special-form 'type[int]'>
-reveal_type(CallableIntToStr)  # revealed: <typing.Callable special-form '(int, /) -> str'>
+reveal_type(CallableIntToStr)  # revealed: <Callable special-form '(int, /) -> str'>
 
 def _(
     ints_or_none: IntsOrNone,
@@ -608,7 +613,7 @@ def _(
 
 ```py
 from typing_extensions import Generic
-from ty_extensions import reveal_mro
+from ty_extensions._internal import reveal_mro
 
 class GenericBase(Generic[T]):
     pass
@@ -625,6 +630,73 @@ GenericBaseAlias = GenericBase[T]
 
 class Derived2(GenericBaseAlias[int]):
     pass
+```
+
+### Generic typed dictionaries in aliases
+
+First, define a generic typed dictionary whose field uses a legacy type variable:
+
+```py
+from typing import Generic, TypeVar, TypedDict
+
+T = TypeVar("T")
+
+class Item(TypedDict, Generic[T]):
+    value: T
+```
+
+An implicit union alias remains generic when its only type variable appears in the typed dictionary,
+and specialization preserves the dictionary's field type:
+
+```py
+OptionalItem = Item[T] | None
+
+def _(item: OptionalItem[int]):
+    reveal_type(item)  # revealed: Item[int] | None
+
+    if item is not None:
+        reveal_type(item["value"])  # revealed: int
+```
+
+Without an explicit type argument, the alias uses the type variable's default specialization:
+
+```py
+def _(item: OptionalItem):
+    reveal_type(item)  # revealed: Item[Unknown] | None
+```
+
+The type variable is also discovered when the typed dictionary is nested inside a container:
+
+```py
+Items = list[Item[T]]
+
+def _(items: Items[str]):
+    reveal_type(items)  # revealed: list[Item[str]]
+    reveal_type(items[0]["value"])  # revealed: str
+```
+
+### Type-variable order in generic typed-dictionary aliases
+
+Type variables that appear inside a typed dictionary are collected in the same order as variables in
+other union members:
+
+```py
+from typing import Generic, TypeVar, TypedDict
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+class Item(TypedDict, Generic[T]):
+    value: T
+
+TypedDictFirst = Item[T] | list[U]
+TypedDictLast = list[U] | Item[T]
+Repeated = Item[T] | list[T]
+
+def _(first: TypedDictFirst[int, str], last: TypedDictLast[str, int], repeated: Repeated[int]):
+    reveal_type(first)  # revealed: Item[int] | list[str]
+    reveal_type(last)  # revealed: list[str] | Item[int]
+    reveal_type(repeated)  # revealed: Item[int] | list[int]
 ```
 
 ### Imported aliases
@@ -657,6 +729,45 @@ def _(
     reveal_type(list_of_ints2)  # revealed: list[int]
     reveal_type(list_of_str)  # revealed: list[str]
     reveal_type(list_of_str_or_none)  # revealed: list[str] | None
+```
+
+### Imported tagged typed-dictionary aliases
+
+A stub can define a generic tagged union containing a typed dictionary and expose a concrete
+specialization through a function signature:
+
+`events.pyi`:
+
+```pyi
+from typing import Generic, Literal, TypeVar, TypedDict, Union
+
+T = TypeVar("T")
+
+class ObjectEvent(TypedDict, Generic[T]):
+    type: Literal["ADDED"]
+    object: T
+
+class BookmarkEvent(TypedDict):
+    type: Literal["BOOKMARK"]
+    object: object
+
+DecodedEvent = Union[ObjectEvent[T], BookmarkEvent, None]
+
+def get_event() -> DecodedEvent[int]: ...
+```
+
+After excluding the other union members, Python code sees the concrete typed-dictionary field type:
+
+`main.py`:
+
+```py
+from events import get_event
+
+event = get_event()
+if event is not None and event["type"] != "BOOKMARK":
+    reveal_type(event)  # revealed: ObjectEvent[int]
+    reveal_type(event["object"])  # revealed: int
+    event["object"].bit_length()
 ```
 
 ### In stringified annotations
@@ -794,6 +905,8 @@ def _(doubly_specialized: MyListOfInts[int]):
     reveal_type(doubly_specialized)  # revealed: Unknown
 ```
 
+### Incorrect number of type arguments
+
 Specializing a generic implicit type alias with an incorrect number of type arguments also results
 in an error:
 
@@ -819,7 +932,7 @@ def _(
 Trying to specialize a non-name node results in an error:
 
 ```py
-from ty_extensions import TypeOf
+from ty_extensions._internal import TypeOf
 
 IntOrStr = int | str
 
@@ -832,6 +945,8 @@ def _(
 ):
     reveal_type(specialized)  # revealed: Unknown
 ```
+
+### Union without a binding context
 
 Similarly, if you try to specialize a union type without a binding context, we emit an error:
 
@@ -872,7 +987,6 @@ error[not-subscriptable]: Cannot subscript non-generic type alias `ListOfInts2`
   |                     -----------^^^^^
   |                     |
   |                     Alias to `list[int]`, which is already specialized
-  |
 ```
 
 ```py
@@ -890,7 +1004,6 @@ error[not-subscriptable]: Cannot subscript non-generic type `<class 'tuple[int, 
   |             ---------^^^^^
   |             |
   |             Type is already specialized
-  |
 ```
 
 ```py
@@ -910,7 +1023,6 @@ error[not-subscriptable]: Cannot subscript non-generic type `<class 'A[int]'>`
    |              ---------^^^^^
    |              |
    |              Type is already specialized
-   |
 ```
 
 ### Multiple definitions
@@ -1253,7 +1365,7 @@ SubclassOfAny = type[Any]
 SubclassOfAOrB1 = type[A | B]
 SubclassOfAOrB2 = type[A] | type[B]
 SubclassOfAOrB3 = Union[type[A], type[B]]
-SubclassOfG = type[G]
+SubclassOfG = type[G]  # error: [missing-type-argument]
 SubclassOfGInt = type[G[int]]
 SubclassOfP = type[P]
 
@@ -1348,6 +1460,220 @@ def _(
     reveal_type(invalid_subclass_of_literal)  # revealed: <class 'int'>
 ```
 
+### Subscripted generic alias inside `type[…]`
+
+A generic alias can also be specialized inside a `type[…]` annotation.
+
+#### Valid specializations
+
+The PEP 613 spelling and `typing.Type[…]` take the same path:
+
+```py
+from typing import Generic, Type, TypeAlias, TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+class Pair(Generic[T, U]): ...
+
+PairAlias = Pair[T, U]
+PairAliasExplicit: TypeAlias = Pair[T, U]
+
+def implicit(x: type[PairAlias[int, str]]):
+    reveal_type(x)  # revealed: type[Pair[int, str]]
+
+def pep_613(x: type[PairAliasExplicit[int, str]]):
+    reveal_type(x)  # revealed: type[Pair[int, str]]
+
+def uppercase_type(x: Type[PairAlias[int, str]]):
+    reveal_type(x)  # revealed: type[Pair[int, str]]
+
+def partially_specialized(x: type[PairAlias[int, T]]):
+    reveal_type(x)  # revealed: type[Pair[int, T@partially_specialized]]
+```
+
+#### Incorrect type-argument counts
+
+A generic alias specialized inside `type[…]` must receive the correct number of type arguments:
+
+```py
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+class Pair(Generic[T, U]): ...
+
+PairAlias = Pair[T, U]
+
+def _(
+    # error: [invalid-type-arguments] "No type argument provided for required type variable `U`"
+    too_few: type[PairAlias[int]],
+    # error: [invalid-type-arguments] "Too many type arguments: expected 2, got 3"
+    too_many: type[PairAlias[int, str, bool]],
+):
+    reveal_type(too_few)  # revealed: type[Pair[Unknown, Unknown]]
+    reveal_type(too_many)  # revealed: type[Pair[Unknown, Unknown]]
+```
+
+#### Type-variable bounds
+
+Specializing an alias inside `type[…]` enforces the upper bound of its type variable:
+
+```py
+from typing import Generic, TypeVar
+
+Bounded = TypeVar("Bounded", bound=int)
+
+class BoundedBox(Generic[Bounded]): ...
+
+BoundedAlias = BoundedBox[Bounded]
+
+def _(
+    # error: [invalid-type-arguments] "Type `str` is not assignable to upper bound `int` of type variable `Bounded@BoundedAlias`"
+    violated_bound: type[BoundedAlias[str]],
+):
+    reveal_type(violated_bound)  # revealed: type[BoundedBox[Unknown]]
+```
+
+#### Type-variable constraints
+
+Specializing an alias inside `type[…]` also enforces constraints on its type variable:
+
+```py
+from typing import Generic, TypeVar
+
+Constrained = TypeVar("Constrained", int, str)
+
+class ConstrainedBox(Generic[Constrained]): ...
+
+ConstrainedAlias = ConstrainedBox[Constrained]
+
+def _(
+    # error: [invalid-type-arguments] "Type `bytes` does not satisfy constraints `int`, `str` of type variable `Constrained@ConstrainedAlias`"
+    violated_constraint: type[ConstrainedAlias[bytes]],
+):
+    reveal_type(violated_constraint)  # revealed: type[ConstrainedBox[Unknown]]
+```
+
+#### Bounds on union-valued aliases
+
+The upper bound of a type variable is enforced even when its alias resolves to a union:
+
+```py
+from typing import TypeVar
+
+Bounded = TypeVar("Bounded", bound=int)
+BoundedUnionAlias = list[Bounded] | set[Bounded]
+
+def _(
+    # error: [invalid-type-arguments] "Type `str` is not assignable to upper bound `int` of type variable `Bounded@BoundedUnionAlias`"
+    union_violated_bound: type[BoundedUnionAlias[str]],
+):
+    reveal_type(union_violated_bound)  # revealed: type[list[Unknown] | set[Unknown]]
+```
+
+#### Invalid nested subscripts
+
+Subscripting an already-subscripted alias inside `type[…]` is invalid, just as it is outside it:
+
+```py
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+class Pair(Generic[T, U]): ...
+
+PairAlias = Pair[T, U]
+
+def _(
+    # error: [invalid-type-form] "Only simple names and dotted names can be subscripted in parameter annotations"
+    double_subscript: type[PairAlias[T, U][int, str]],
+):
+    reveal_type(double_subscript)  # revealed: type[Unknown]
+```
+
+#### Assignments to class-backed aliases
+
+An object assigned to a specialized alias inside `type[…]` must match the class it represents:
+
+```py
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+class Pair(Generic[T, U]): ...
+
+PairAlias = Pair[T, U]
+
+# error: [invalid-assignment] "Object of type `<class 'int'>` is not assignable to `type[Pair[int, str]]`"
+assigned: type[PairAlias[int, str]] = int
+```
+
+#### Assignments to union-valued aliases
+
+An object assigned to a union-valued alias inside `type[…]` must match one of the union elements:
+
+```py
+from typing import TypeVar
+
+T = TypeVar("T")
+UnionAlias = list[T] | set[T]
+
+# error: [invalid-assignment] "Object of type `<class 'str'>` is not assignable to `type[list[int] | set[int]]`"
+assigned_union: type[UnionAlias[int]] = str
+```
+
+#### Other alias representations
+
+An alias does not have to be backed by a class. Stringified, transparent, `Annotated` and
+union-valued aliases all specialize inside `type[…]` the same way they do outside it:
+
+```py
+from __future__ import annotations
+
+from typing import Annotated, TypeAlias, TypeVar
+
+T = TypeVar("T")
+
+StringAlias: TypeAlias = "list[T]"
+TransparentAlias: TypeAlias = T
+AnnotatedAlias = Annotated[list[T], "metadata"]
+UnionAlias = list[T] | set[T]
+
+def _(
+    string: type[StringAlias[int]],
+    transparent: type[TransparentAlias[int]],
+    annotated: type[AnnotatedAlias[int]],
+    union: type[UnionAlias[int]],
+):
+    reveal_type(string)  # revealed: type[list[int]]
+    reveal_type(transparent)  # revealed: type[int]
+    reveal_type(annotated)  # revealed: type[list[int]]
+    reveal_type(union)  # revealed: type[list[int] | set[int]]
+```
+
+#### Callable aliases
+
+A callable is not a class object, so specializing a `Callable` alias inside `type[…]` is rejected,
+just as a directly spelled callable is:
+
+```py
+from typing import Callable, TypeVar
+
+T = TypeVar("T")
+
+CallableAlias = Callable[[T], T]
+
+def _(
+    # error: [invalid-type-form] "The argument to `type[]` must be a class object type"
+    callable_: type[CallableAlias[int]],
+):
+    reveal_type(callable_)  # revealed: type[Unknown]
+```
+
 ### `Type[…]`
 
 The same also works for `typing.Type[…]`:
@@ -1369,7 +1695,7 @@ SubclassOfAny = Type[Any]
 SubclassOfAOrB1 = Type[A | B]
 SubclassOfAOrB2 = Type[A] | Type[B]
 SubclassOfAOrB3 = Union[Type[A], Type[B]]
-SubclassOfG = Type[G]
+SubclassOfG = Type[G]  # error: [missing-type-argument]
 SubclassOfGInt = Type[G[int]]
 SubclassOfP = Type[P]
 
@@ -1606,9 +1932,9 @@ CallableNoArgs = Callable[[], None]
 BasicCallable = Callable[[int, str], bytes]
 GradualCallable = Callable[..., str]
 
-reveal_type(CallableNoArgs)  # revealed: <typing.Callable special-form '() -> None'>
-reveal_type(BasicCallable)  # revealed: <typing.Callable special-form '(int, str, /) -> bytes'>
-reveal_type(GradualCallable)  # revealed: <typing.Callable special-form '(...) -> str'>
+reveal_type(CallableNoArgs)  # revealed: <Callable special-form '() -> None'>
+reveal_type(BasicCallable)  # revealed: <Callable special-form '(int, str, /) -> bytes'>
+reveal_type(GradualCallable)  # revealed: <Callable special-form '(...) -> str'>
 
 def _(
     callable_no_args: CallableNoArgs,
@@ -1634,14 +1960,14 @@ def _(takes_callable: TakesCallable, returns_callable: ReturnsCallable):
 Invalid uses result in diagnostics:
 
 ```py
-# error: [invalid-type-form] "Special form `typing.Callable` expected exactly two arguments (parameter types and return type)"
+# error: [invalid-type-form] "Special form `Callable` expected exactly two arguments (parameter types and return type)"
 InvalidCallable1 = Callable[[int]]
 
 # error: [invalid-type-form] "The first argument to `Callable` must be either a list of types, ParamSpec, Concatenate, or `...`"
 InvalidCallable2 = Callable[int, str]
 
-reveal_type(InvalidCallable1)  # revealed: <typing.Callable special-form '(...) -> Unknown'>
-reveal_type(InvalidCallable2)  # revealed: <typing.Callable special-form '(...) -> Unknown'>
+reveal_type(InvalidCallable1)  # revealed: <Callable special-form '(...) -> Unknown'>
+reveal_type(InvalidCallable2)  # revealed: <Callable special-form '(...) -> Unknown'>
 
 def _(invalid_callable1: InvalidCallable1, invalid_callable2: InvalidCallable2):
     reveal_type(invalid_callable1)  # revealed: (...) -> Unknown
@@ -1754,6 +2080,26 @@ def _(
     reveal_type(recursive_dict4)  # revealed: dict[Divergent, int]
 ```
 
+### Recursive typed-dictionary fields in generic aliases
+
+A recursive field on a non-generic typed dictionary does not make an unrelated enclosing generic
+alias recursive:
+
+```py
+from typing import TypeVar, TypedDict
+
+T = TypeVar("T")
+RecursiveList = list["RecursiveList | None"]
+
+class Payload(TypedDict):
+    value: RecursiveList
+
+ListOrPayload = list[T] | Payload
+
+def _(value: ListOrPayload[int]):
+    reveal_type(value)  # revealed: list[int] | Payload
+```
+
 ### Self-referential generic implicit type aliases
 
 ```py
@@ -1776,7 +2122,8 @@ def _(
 
 ```py
 from typing import TypeVar, Union
-from ty_extensions import Bottom, Top, is_subtype_of, static_assert
+from ty_extensions import Bottom, Top, static_assert
+from ty_extensions._internal import is_subtype_of
 
 T = TypeVar("T")
 K = TypeVar("K")

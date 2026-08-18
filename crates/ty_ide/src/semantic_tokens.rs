@@ -28,7 +28,6 @@
 
 use crate::Db;
 use bitflags::bitflags;
-use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_python_ast::visitor::source_order::{
     SourceOrderVisitor, TraversalSignal, walk_arguments, walk_expr,
@@ -40,9 +39,11 @@ use ruff_python_ast::{
 };
 use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 use std::ops::Deref;
+use ty_python_core::ProgramFile;
 use ty_python_core::definition::{Definition, DefinitionKind, ParameterDefinitionNodeKind};
 use ty_python_semantic::{
-    HasType, SemanticModel,
+    HasType, ImportAliasResolution, ResolvedDefinition, SemanticModel, definitions_for_attribute,
+    definitions_for_imported_symbol,
     types::ide_support::{
         CallArgumentForm, call_argument_forms, definition_for_name,
         static_member_type_for_attribute,
@@ -167,7 +168,7 @@ pub struct SemanticTokens {
 
 impl SemanticTokens {
     /// Create a new `SemanticTokens` instance.
-    pub fn new(tokens: Vec<SemanticToken>) -> Self {
+    fn new(tokens: Vec<SemanticToken>) -> Self {
         Self { tokens }
     }
 }
@@ -182,8 +183,12 @@ impl Deref for SemanticTokens {
 
 /// Generates semantic tokens for a Python file within the specified range.
 /// Pass None to get tokens for the entire file.
-pub fn semantic_tokens(db: &dyn Db, file: File, range: Option<TextRange>) -> SemanticTokens {
-    let parsed = parsed_module(db, file).load(db);
+pub fn semantic_tokens(
+    db: &dyn Db,
+    file: ProgramFile<'_>,
+    range: Option<TextRange>,
+) -> SemanticTokens {
+    let parsed = parsed_module(db, file.python_file(db)).load(db);
     let model = SemanticModel::new(db, file);
 
     let mut visitor = SemanticTokenVisitor::new(&model, range);
@@ -298,7 +303,11 @@ impl<'db> SemanticTokenVisitor<'db> {
     ) -> Option<(SemanticTokenType, SemanticTokenModifier)> {
         let mut modifiers = SemanticTokenModifier::empty();
         let db = self.model.db();
-        let model = SemanticModel::new(db, definition.file(db));
+        let model = SemanticModel::new(db, definition.program_file(db));
+
+        if model.is_type_alias_definition(definition) {
+            return Some((SemanticTokenType::Class, modifiers));
+        }
 
         match definition.kind(db) {
             DefinitionKind::Function(_) => {
@@ -314,7 +323,7 @@ impl<'db> SemanticTokenVisitor<'db> {
                 Some((SemanticTokenType::TypeParameter, modifiers))
             }
             DefinitionKind::Parameter(ParameterDefinitionNodeKind::Parameter(parameter)) => {
-                let parsed = parsed_module(db, definition.file(db));
+                let parsed = parsed_module(db, definition.python_file(db));
                 let ty = parameter.node(&parsed.load(db)).inferred_type(&model);
 
                 if let Some(ty) = ty {
@@ -342,7 +351,6 @@ impl<'db> SemanticTokenVisitor<'db> {
                 Some((SemanticTokenType::Parameter, modifiers))
             }
             DefinitionKind::Parameter(_) => Some((SemanticTokenType::Parameter, modifiers)),
-            DefinitionKind::TypeAlias(_) => Some((SemanticTokenType::TypeParameter, modifiers)),
             DefinitionKind::Import(_)
             | DefinitionKind::ImportFrom(_)
             | DefinitionKind::StarImport(_) => {
@@ -351,22 +359,21 @@ impl<'db> SemanticTokenVisitor<'db> {
                 // (e.g., imported classes as Class, imported functions as Function, etc.)
                 None
             }
-            _ => {
+            kind => {
                 // For other definition kinds (assignments, etc.), apply constant naming convention
                 if Self::is_constant_name(name_str) {
                     modifiers |= SemanticTokenModifier::READONLY;
                 }
 
-                let parsed = parsed_module(db, definition.file(db));
-                let parsed = parsed.load(db);
-                let value = match definition.kind(db) {
-                    DefinitionKind::Assignment(assignment) => Some(assignment.value(&parsed)),
+                let value_ty = match kind {
+                    DefinitionKind::Assignment(assignment) => {
+                        let parsed = parsed_module(db, definition.python_file(db)).load(db);
+                        assignment.value(&parsed).inferred_type(&model)
+                    }
                     _ => None,
                 };
 
-                if let Some(value) = value
-                    && let Some(value_ty) = value.inferred_type(&model)
-                {
+                if let Some(value_ty) = value_ty {
                     if matches!(value_ty, Type::KnownInstance(KnownInstanceType::TypeVar(_))) {
                         modifiers.remove(SemanticTokenModifier::READONLY);
                         return Some((SemanticTokenType::TypeParameter, modifiers));
@@ -383,6 +390,25 @@ impl<'db> SemanticTokenVisitor<'db> {
                 Some((SemanticTokenType::Variable, modifiers))
             }
         }
+    }
+
+    fn classify_type_alias_from_resolved_definitions(
+        &self,
+        definitions: &[ResolvedDefinition<'db>],
+    ) -> Option<(SemanticTokenType, SemanticTokenModifier)> {
+        if definitions.is_empty() {
+            return None;
+        }
+
+        if !definitions.iter().all(|resolved| {
+            resolved
+                .definition()
+                .is_some_and(|definition| self.model.is_type_alias_definition(definition))
+        }) {
+            return None;
+        }
+
+        Some((SemanticTokenType::Class, SemanticTokenModifier::empty()))
     }
 
     fn classify_from_type_and_name_str(
@@ -514,6 +540,9 @@ impl<'db> SemanticTokenVisitor<'db> {
                     // Method bound to an instance
                     token_type.add(SemanticTokenType::Method);
                 }
+                Type::Callable(callable) if callable.is_method_like(db) => {
+                    token_type.add(SemanticTokenType::Method);
+                }
                 Type::ModuleLiteral(_) => {
                     // Module accessed as an attribute (e.g., from os import path)
                     token_type.add(SemanticTokenType::Namespace);
@@ -567,6 +596,21 @@ impl<'db> SemanticTokenVisitor<'db> {
             }
         } else {
             SemanticTokenType::Parameter
+        }
+    }
+
+    fn classify_function_definition(&self, func: &ast::StmtFunctionDef) -> SemanticTokenType {
+        if !self.in_class_scope {
+            return SemanticTokenType::Function;
+        }
+
+        if matches!(
+            func.inferred_type(self.model),
+            Some(Type::PropertyInstance(_))
+        ) {
+            SemanticTokenType::Property
+        } else {
+            SemanticTokenType::Method
         }
     }
 
@@ -688,11 +732,7 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                 // Function name
                 self.add_token(
                     func.name.range(),
-                    if self.in_class_scope {
-                        SemanticTokenType::Method
-                    } else {
-                        SemanticTokenType::Function
-                    },
+                    self.classify_function_definition(func),
                     if func.is_async {
                         SemanticTokenModifier::DEFINITION | SemanticTokenModifier::ASYNC
                     } else {
@@ -793,11 +833,21 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                     self.add_dotted_name_tokens(module, SemanticTokenType::Namespace);
                 }
                 for alias in &import.names {
-                    // Get the type of the imported name
-                    let ty = alias.inferred_type(self.model).unwrap_or(Type::unknown());
-                    if let Some((token_type, modifiers)) =
-                        self.classify_from_alias_type(ty, &alias.name)
-                    {
+                    let classification = self
+                        .classify_type_alias_from_resolved_definitions(
+                            &definitions_for_imported_symbol(
+                                self.model,
+                                import,
+                                alias.name.as_str(),
+                                ImportAliasResolution::ResolveAliases,
+                            ),
+                        )
+                        .or_else(|| {
+                            let ty = alias.inferred_type(self.model).unwrap_or(Type::unknown());
+                            self.classify_from_alias_type(ty, &alias.name)
+                        });
+
+                    if let Some((token_type, modifiers)) = classification {
                         // Add token for the imported name (Y in "from X import Y" or "from X import Y as Z")
                         self.add_token(&alias.name, token_type, modifiers);
 
@@ -848,10 +898,7 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                 if let Some(value) = &assignment.value {
                     // PEP 613 alias values are type forms even though they appear as annotated
                     // assignments rather than dedicated `type` statements.
-                    if matches!(
-                        assignment.annotation.inferred_type(self.model),
-                        Some(Type::SpecialForm(SpecialFormType::TypeAlias))
-                    ) {
+                    if self.model.is_type_alias_annotation(&assignment.annotation) {
                         self.visit_annotation(value);
                     } else {
                         self.visit_expr(value);
@@ -937,11 +984,18 @@ impl SourceOrderVisitor<'_> for SemanticTokenVisitor<'_> {
                 self.visit_expr(&attr.value);
 
                 // Then add token for the attribute name (e.g., 'path' in 'os.path')
-                let ty = static_member_type_for_attribute(self.model, attr)
-                    .unwrap_or_else(|| expr.inferred_type(self.model).unwrap_or(Type::unknown()));
-                if let Some((token_type, modifiers)) =
-                    self.classify_from_type_for_attribute(ty, &attr.attr)
-                {
+                let classification = self
+                    .classify_type_alias_from_resolved_definitions(&definitions_for_attribute(
+                        self.model, attr,
+                    ))
+                    .or_else(|| {
+                        let ty = static_member_type_for_attribute(self.model, attr).unwrap_or_else(
+                            || expr.inferred_type(self.model).unwrap_or(Type::unknown()),
+                        );
+                        self.classify_from_type_for_attribute(ty, &attr.attr)
+                    });
+
+                if let Some((token_type, modifiers)) = classification {
                     self.add_token(&attr.attr, token_type, modifiers);
                 }
             }
@@ -1233,7 +1287,7 @@ mod tests {
 
     use insta::assert_snapshot;
     use ruff_db::{
-        files::system_path_to_file,
+        files::{File, system_path_to_file},
         system::{DbWithWritableSystem, SystemPath, SystemPathBuf},
     };
     use ty_project::ProjectMetadata;
@@ -1760,7 +1814,7 @@ result = check(None)
         "int" @ 123..126: Class
         "float" @ 129..134: Class
         "h" @ 139..140: Variable [definition]
-        "U" @ 142..143: TypeParameter
+        "U" @ 142..143: Class
         "#);
     }
 
@@ -2084,7 +2138,7 @@ t = MyClass.prop          # prop should be property on the class itself
         "self" @ 108..112: SelfParameter [definition]
         "\"hello\"" @ 130..137: String
         "property" @ 144..152: Decorator
-        "prop" @ 161..165: Method [definition]
+        "prop" @ 161..165: Property [definition]
         "self" @ 166..170: SelfParameter [definition]
         "self" @ 188..192: SelfParameter
         "CONSTANT" @ 193..201: Variable [readonly]
@@ -2115,6 +2169,99 @@ t = MyClass.prop          # prop should be property on the class itself
     }
 
     #[test]
+    fn decorated_method_attribute_classification() {
+        let test = SemanticTokenTest::new(
+            r#"
+from collections.abc import Callable
+from typing import Self
+
+def decorate[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    return function
+
+class C:
+    callback: Callable[[], None] = lambda: None
+
+    @decorate
+    def instance_method(self) -> Self:
+        return self
+
+    def plain_method(self) -> Self:
+        return self
+
+    @classmethod
+    @decorate
+    def class_method(cls) -> None: ...
+
+    @staticmethod
+    @decorate
+    def static_method() -> None: ...
+
+c = C()
+c.instance_method().plain_method().instance_method()
+c.class_method()
+c.static_method()
+c.callback()
+"#,
+        );
+
+        let tokens = test.highlight_file();
+
+        assert_snapshot!(test.to_snapshot(&tokens), @r#"
+        "collections" @ 6..17: Namespace
+        "abc" @ 18..21: Namespace
+        "Callable" @ 29..37: Variable
+        "typing" @ 43..49: Namespace
+        "Self" @ 57..61: Variable
+        "decorate" @ 67..75: Function [definition]
+        "P" @ 78..79: TypeParameter [definition]
+        "R" @ 81..82: TypeParameter [definition]
+        "function" @ 84..92: Parameter [definition]
+        "Callable" @ 94..102: Variable
+        "P" @ 103..104: TypeParameter
+        "R" @ 106..107: TypeParameter
+        "Callable" @ 113..121: Variable
+        "P" @ 122..123: TypeParameter
+        "R" @ 125..126: TypeParameter
+        "function" @ 140..148: Parameter
+        "C" @ 156..157: Class [definition]
+        "callback" @ 163..171: Variable [definition]
+        "Callable" @ 173..181: Variable
+        "None" @ 186..190: BuiltinConstant
+        "None" @ 202..206: BuiltinConstant
+        "decorate" @ 213..221: Decorator
+        "instance_method" @ 230..245: Method [definition]
+        "self" @ 246..250: SelfParameter [definition]
+        "Self" @ 255..259: Variable
+        "self" @ 276..280: SelfParameter
+        "plain_method" @ 290..302: Method [definition]
+        "self" @ 303..307: SelfParameter [definition]
+        "Self" @ 312..316: Variable
+        "self" @ 333..337: SelfParameter
+        "classmethod" @ 344..355: Decorator
+        "decorate" @ 361..369: Decorator
+        "class_method" @ 378..390: Method [definition]
+        "cls" @ 391..394: SelfParameter [definition]
+        "None" @ 399..403: BuiltinConstant
+        "staticmethod" @ 415..427: Decorator
+        "decorate" @ 433..441: Decorator
+        "static_method" @ 450..463: Method [definition]
+        "None" @ 469..473: BuiltinConstant
+        "c" @ 480..481: Variable [definition]
+        "C" @ 484..485: Class
+        "c" @ 488..489: Variable
+        "instance_method" @ 490..505: Method
+        "plain_method" @ 508..520: Method
+        "instance_method" @ 523..538: Method
+        "c" @ 541..542: Variable
+        "class_method" @ 543..555: Method
+        "c" @ 558..559: Variable
+        "static_method" @ 560..573: Method
+        "c" @ 576..577: Variable
+        "callback" @ 578..586: Variable
+        "#);
+    }
+
+    #[test]
     fn property_with_return_annotation() {
         let test = SemanticTokenTest::new(
             "
@@ -2134,7 +2281,7 @@ x = Foo.prop
         assert_snapshot!(test.to_snapshot(&tokens), @r#"
         "Foo" @ 7..10: Class [definition]
         "property" @ 17..25: Decorator
-        "prop" @ 34..38: Method [definition]
+        "prop" @ 34..38: Property [definition]
         "self" @ 39..43: SelfParameter [definition]
         "int" @ 48..51: Class
         "4" @ 68..69: Number
@@ -2179,19 +2326,19 @@ b = cfg.read_write
         assert_snapshot!(test.to_snapshot(&tokens), @r#"
         "Config" @ 7..13: Class [definition]
         "property" @ 20..28: Decorator
-        "read_only" @ 37..46: Method [definition]
+        "read_only" @ 37..46: Property [definition]
         "self" @ 47..51: SelfParameter [definition]
         "str" @ 56..59: Class
         "'value'" @ 76..83: String
         "property" @ 90..98: Decorator
-        "read_write" @ 107..117: Method [definition]
+        "read_write" @ 107..117: Property [definition]
         "self" @ 118..122: SelfParameter [definition]
         "int" @ 127..130: Class
         "self" @ 147..151: SelfParameter
         "_x" @ 152..154: Variable
         "read_write" @ 161..171: Method
         "setter" @ 172..178: Method
-        "read_write" @ 187..197: Method [definition]
+        "read_write" @ 187..197: Property [definition]
         "self" @ 198..202: SelfParameter [definition]
         "value" @ 204..209: Parameter [definition]
         "int" @ 211..214: Class
@@ -2232,7 +2379,7 @@ def f(obj: WithProperty | WithAttribute):
         assert_snapshot!(test.to_snapshot(&tokens), @r#"
         "WithProperty" @ 7..19: Class [definition]
         "property" @ 26..34: Decorator
-        "value" @ 43..48: Method [definition]
+        "value" @ 43..48: Property [definition]
         "self" @ 49..53: SelfParameter [definition]
         "int" @ 58..61: Class
         "1" @ 78..79: Number
@@ -2280,20 +2427,20 @@ x = obj.value
         "random" @ 20..26: Method
         "ReadOnly" @ 34..42: Class [definition]
         "property" @ 49..57: Decorator
-        "value" @ 66..71: Method [definition]
+        "value" @ 66..71: Property [definition]
         "self" @ 72..76: SelfParameter [definition]
         "int" @ 81..84: Class
         "1" @ 101..102: Number
         "ReadWrite" @ 110..119: Class [definition]
         "property" @ 126..134: Decorator
-        "value" @ 143..148: Method [definition]
+        "value" @ 143..148: Property [definition]
         "self" @ 149..153: SelfParameter [definition]
         "int" @ 158..161: Class
         "self" @ 178..182: SelfParameter
         "_value" @ 183..189: Variable
         "value" @ 196..201: Method
         "setter" @ 202..208: Method
-        "value" @ 217..222: Method [definition]
+        "value" @ 217..222: Property [definition]
         "self" @ 223..227: SelfParameter [definition]
         "new_value" @ 229..238: Parameter [definition]
         "int" @ 240..243: Class
@@ -2390,7 +2537,7 @@ x = foobar_cls.prop                              # prop should be property
         "self" @ 73..77: SelfParameter [definition]
         "\"hello\"" @ 95..102: String
         "property" @ 109..117: Decorator
-        "prop" @ 126..130: Method [definition]
+        "prop" @ 126..130: Property [definition]
         "self" @ 131..135: SelfParameter [definition]
         "str" @ 140..143: Class
         "\"hello\"" @ 160..167: String
@@ -2405,7 +2552,7 @@ x = foobar_cls.prop                              # prop should be property
         "int" @ 235..238: Class
         "42" @ 255..257: Number
         "property" @ 264..272: Decorator
-        "prop" @ 281..285: Method [definition]
+        "prop" @ 281..285: Property [definition]
         "self" @ 286..290: SelfParameter [definition]
         "int" @ 295..298: Class
         "self" @ 315..319: SelfParameter
@@ -2485,7 +2632,7 @@ q = Baz.prop        # prop should be property on the class as well
         "int" @ 155..158: Class
         "42" @ 179..181: Number
         "property" @ 192..200: Decorator
-        "prop" @ 213..217: Method [definition]
+        "prop" @ 213..217: Property [definition]
         "self" @ 218..222: SelfParameter [definition]
         "int" @ 227..230: Class
         "42" @ 251..253: Number
@@ -2496,7 +2643,7 @@ q = Baz.prop        # prop should be property on the class as well
         "str" @ 320..323: Class
         "\"hello\"" @ 344..351: String
         "property" @ 362..370: Decorator
-        "prop" @ 383..387: Method [definition]
+        "prop" @ 383..387: Property [definition]
         "self" @ 388..392: SelfParameter [definition]
         "str" @ 397..400: Class
         "\"hello\"" @ 421..428: String
@@ -2567,7 +2714,7 @@ q = Baz.prop
         "int" @ 107..110: Class
         "42" @ 131..133: Number
         "property" @ 144..152: Decorator
-        "prop" @ 165..169: Method [definition]
+        "prop" @ 165..169: Property [definition]
         "self" @ 170..174: SelfParameter [definition]
         "int" @ 179..182: Class
         "42" @ 203..205: Number
@@ -2575,7 +2722,7 @@ q = Baz.prop
         "self" @ 237..241: SelfParameter [definition]
         "\"hello\"" @ 263..270: String
         "property" @ 281..289: Decorator
-        "method" @ 302..308: Method [definition]
+        "method" @ 302..308: Property [definition]
         "self" @ 309..313: SelfParameter [definition]
         "str" @ 318..321: Class
         "\"hello\"" @ 342..349: String
@@ -2725,6 +2872,72 @@ LegacyStyle: TypeAlias = IO[str]
                 .expect("semantic token for `IO` type-form use");
             assert_eq!(token.token_type, SemanticTokenType::Class);
         }
+    }
+
+    #[test]
+    fn type_alias_classified_consistently() {
+        let test = SemanticTokenTest::new(
+            "
+from typing import TypeAlias
+
+type NewAlias = int
+OldAlias: TypeAlias = int
+def f(x: NewAlias, y: OldAlias): ...
+
+marker = TypeAlias
+",
+        );
+
+        let tokens = test.highlight_file();
+
+        assert_snapshot!(test.to_snapshot(&tokens), @r#"
+        "typing" @ 6..12: Namespace
+        "TypeAlias" @ 20..29: Variable
+        "NewAlias" @ 36..44: Class [definition]
+        "int" @ 47..50: Class
+        "OldAlias" @ 51..59: Class [definition]
+        "TypeAlias" @ 61..70: Variable
+        "int" @ 73..76: Class
+        "f" @ 81..82: Function [definition]
+        "x" @ 83..84: Parameter [definition]
+        "NewAlias" @ 86..94: Class
+        "y" @ 96..97: Parameter [definition]
+        "OldAlias" @ 99..107: Class
+        "marker" @ 115..121: Variable [definition]
+        "TypeAlias" @ 124..133: Variable
+        "#);
+    }
+
+    #[test]
+    fn imported_type_aliases_classified_consistently() {
+        let mut test = SemanticTokenTest::new(
+            "
+from aliases import OldAlias
+import aliases
+
+aliases.OldAlias
+",
+        );
+        test.db
+            .write_file(
+                SystemPath::new("src/aliases.py"),
+                "
+from typing import TypeAlias
+
+OldAlias: TypeAlias = int | str
+",
+            )
+            .expect("writing to the memory file system should succeed");
+
+        let tokens = test.highlight_file();
+
+        assert_snapshot!(test.to_snapshot(&tokens), @r#"
+        "aliases" @ 6..13: Namespace
+        "OldAlias" @ 21..29: Class
+        "aliases" @ 37..44: Namespace
+        "aliases" @ 46..53: Namespace
+        "OldAlias" @ 54..62: Class
+        "#);
     }
 
     #[test]
@@ -4443,6 +4656,16 @@ def f():
     }
 
     #[test]
+    fn private_builtin_helpers_do_not_receive_semantic_tokens() {
+        // Private helpers excluded from implicit builtin lookup must remain unresolved for IDE
+        // highlighting instead of receiving tokens from their typeshed definitions.
+        let test = SemanticTokenTest::new("_T_co\n_P\n");
+
+        let tokens = test.highlight_file();
+        assert_snapshot!(test.to_snapshot(&tokens), @"");
+    }
+
+    #[test]
     fn unresolved_attributes_do_not_receive_semantic_tokens() {
         let test = SemanticTokenTest::new(
             r#"
@@ -4475,19 +4698,15 @@ from pathlib import Missing as Alias
         assert_snapshot!(test.to_snapshot(&tokens), @r#""pathlib" @ 6..13: Namespace"#);
     }
 
-    pub(super) struct SemanticTokenTest {
-        pub(super) db: ty_project::TestDb,
+    struct SemanticTokenTest {
+        db: ty_project::TestDb,
         file: File,
     }
 
     impl SemanticTokenTest {
         fn new(source: &str) -> Self {
-            let mut db = ty_project::TestDb::new(ProjectMetadata::new(
-                "test".into(),
-                SystemPathBuf::from("/"),
-            ));
-
-            db.init_program().unwrap();
+            let mut db =
+                ty_project::TestDb::new(ProjectMetadata::new("test", SystemPathBuf::from("/")));
 
             let path = SystemPath::new("src/main.py");
             db.write_file(path, ruff_python_trivia::textwrap::dedent(source))
@@ -4500,12 +4719,28 @@ from pathlib import Missing as Alias
 
         /// Get semantic tokens for the entire file
         fn highlight_file(&self) -> SemanticTokens {
-            semantic_tokens(&self.db, self.file, None)
+            semantic_tokens(
+                &self.db,
+                ProgramFile::new(
+                    &self.db,
+                    self.file,
+                    self.db.program_environment().program(&self.db),
+                ),
+                None,
+            )
         }
 
         /// Get semantic tokens for a specific range in the file
         fn highlight_range(&self, range: TextRange) -> SemanticTokens {
-            semantic_tokens(&self.db, self.file, Some(range))
+            semantic_tokens(
+                &self.db,
+                ProgramFile::new(
+                    &self.db,
+                    self.file,
+                    self.db.program_environment().program(&self.db),
+                ),
+                Some(range),
+            )
         }
 
         /// Helper function to convert semantic tokens to a snapshot-friendly text format

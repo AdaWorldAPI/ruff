@@ -43,6 +43,8 @@ def open_new_tab(url: str) -> bool:
     If not possible, then the behavior becomes equivalent to open_new().
     """
 
+def register_standard_browsers() -> None: ...
+
 class BaseBrowser:
     """Parent class for all browsers. Do not use directly."""
 
@@ -116,36 +118,20 @@ if sys.platform == "win32":
 
 if sys.platform == "darwin":
     if sys.version_info < (3, 13):
-        if sys.version_info >= (3, 11):
-            @deprecated("Deprecated since Python 3.11; removed in Python 3.13.")
-            class MacOSX(BaseBrowser):
-                """Launcher class for Aqua browsers on Mac OS X
+        @deprecated("Deprecated; removed in Python 3.13.")
+        class MacOSX(BaseBrowser):
+            """Launcher class for Aqua browsers on Mac OS X
 
-                Optionally specify a browser name on instantiation.  Note that this
-                will not work for Aqua browsers if the user has moved the application
-                package after installation.
+            Optionally specify a browser name on instantiation.  Note that this
+            will not work for Aqua browsers if the user has moved the application
+            package after installation.
 
-                If no browser is specified, the default browser, as specified in the
-                Internet System Preferences panel, will be used.
-                """
+            If no browser is specified, the default browser, as specified in the
+            Internet System Preferences panel, will be used.
+            """
 
-                def __init__(self, name: str) -> None: ...
-                def open(self, url: str, new: int = 0, autoraise: bool = True) -> bool: ...
-
-        else:
-            class MacOSX(BaseBrowser):
-                """Launcher class for Aqua browsers on Mac OS X
-
-                Optionally specify a browser name on instantiation.  Note that this
-                will not work for Aqua browsers if the user has moved the application
-                package after installation.
-
-                If no browser is specified, the default browser, as specified in the
-                Internet System Preferences panel, will be used.
-                """
-
-                def __init__(self, name: str) -> None: ...
-                def open(self, url: str, new: int = 0, autoraise: bool = True) -> bool: ...
+            def __init__(self, name: str) -> None: ...
+            def open(self, url: str, new: int = 0, autoraise: bool = True) -> bool: ...
 
     class MacOSXOSAScript(BaseBrowser):  # In runtime this class does not have `name` and `basename`
         if sys.version_info >= (3, 11):

@@ -22,6 +22,45 @@ def _(x: Annotated[tuple[str, int], bytes]):
     reveal_type(x)  # revealed: tuple[str, int]
 ```
 
+## Inside `type[...]`
+
+`Annotated` can wrap a class or specialized generic class inside `type[...]` without changing the
+resulting class object type.
+
+```py
+from typing_extensions import Annotated
+
+def _(
+    simple: type[Annotated[int, "metadata"]],
+    generic: type[Annotated[list[str], "metadata"]],
+):
+    reveal_type(simple)  # revealed: type[int]
+    reveal_type(generic)  # revealed: type[list[str]]
+```
+
+This also works for unions of classes and nested `Annotated` forms.
+
+```py
+def _(
+    union: type[Annotated[int | str, "metadata"]],
+    nested: type[Annotated[Annotated[int, "inner"], "outer"]],
+):
+    reveal_type(union)  # revealed: type[int | str]
+    reveal_type(nested)  # revealed: type[int]
+```
+
+Wrapping a non-class type in `Annotated` does not make it a valid argument to `type[...]`.
+
+```py
+from typing import Callable
+
+def _(
+    # error: [invalid-type-form] "The argument to `type[]` must be a class object type"
+    invalid: type[Annotated[Callable[[], int], "metadata"]],
+):
+    reveal_type(invalid)  # revealed: type[Unknown]
+```
+
 ## Parameterization
 
 It is invalid to parameterize `Annotated` with less than two arguments.
@@ -73,8 +112,8 @@ def _(x: Annotated[(int,)]):
 Inheriting from `Annotated[T, ...]` is equivalent to inheriting from `T` itself.
 
 ```py
-from typing_extensions import Annotated
-from ty_extensions import reveal_mro
+from typing_extensions import Annotated, Any
+from ty_extensions._internal import reveal_mro
 
 class C(Annotated[int, "foo"]): ...
 
@@ -90,13 +129,18 @@ class E(Annotated[list["E"], "metadata"]): ...
 
 # error: [revealed-type] "Revealed MRO: (<class 'E'>, <class 'list[E]'>, <class 'MutableSequence[E]'>, <class 'Sequence[E]'>, <class 'Reversible[E]'>, <class 'Collection[E]'>, <class 'Iterable[E]'>, <class 'Container[Any]'>, typing.Protocol, typing.Generic, <class 'object'>)"
 reveal_mro(E)
+
+class F(Annotated[Any, "metadata"]): ...
+
+# revealed: (<class 'F'>, Any, <class 'object'>)
+reveal_mro(F)
 ```
 
 ### Not parameterized
 
 ```py
 from typing_extensions import Annotated
-from ty_extensions import reveal_mro
+from ty_extensions._internal import reveal_mro
 
 # At runtime, this is an error.
 # error: [invalid-base]

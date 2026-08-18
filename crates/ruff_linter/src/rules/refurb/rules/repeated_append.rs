@@ -360,11 +360,11 @@ fn make_suggestion(group: &AppendGroup, generator: Generator) -> String {
         func: Box::new(attr.into()),
         arguments: ast::Arguments {
             args: Box::from([tuple.into()]),
-            keywords: Box::from([]),
+            keywords: std::iter::empty().collect(),
             range: TextRange::default(),
             node_index: ruff_python_ast::AtomicNodeIndex::NONE,
         },
-        range: TextRange::default(),
+        range_start: ruff_text_size::TextSize::default(),
         node_index: ruff_python_ast::AtomicNodeIndex::NONE,
     };
     // And finally, turn it into a statement.

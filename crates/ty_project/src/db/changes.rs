@@ -1,17 +1,14 @@
 use crate::db::{Db, ProjectDatabase};
-use crate::metadata::options::ProjectOptionsOverrides;
 use crate::watch::{ChangeEvent, CreatedKind, DeletedKind};
 use crate::{ProjectMetadata, ProjectReloadResult};
 use std::collections::BTreeSet;
 
-use crate::walk::ProjectFilesWalker;
+use crate::walk::{ProjectFilesWalker, create_walker_builder};
 use ruff_db::Db as _;
-use ruff_db::file_revision::FileRevision;
-use ruff_db::files::{File, FileRootKind, Files};
-use ruff_db::system::{SystemPath, SystemPathBuf, deduplicate_nested_paths};
+use ruff_db::files::{File, Files, system_path_to_file};
+use ruff_db::system::{SystemPath, SystemPathBuf};
 use rustc_hash::FxHashSet;
-use salsa::Setter;
-use ty_python_core::program::{FallibleStrategy, Program};
+use ty_python_core::program::FallibleStrategy;
 
 /// Represents the result of applying changes to the project database.
 pub struct ChangeResult {
@@ -32,18 +29,12 @@ impl ChangeResult {
 }
 
 impl ProjectDatabase {
-    #[tracing::instrument(level = "debug", skip(self, changes, project_options_overrides))]
-    pub fn apply_changes(
-        &mut self,
-        changes: &[ChangeEvent],
-        project_options_overrides: Option<&ProjectOptionsOverrides>,
-    ) -> ChangeResult {
+    #[tracing::instrument(level = "debug", skip(self, changes))]
+    pub fn apply_changes(&mut self, changes: &[ChangeEvent]) -> ChangeResult {
         let project = self.project();
         let project_root = project.root(self).to_path_buf();
-        let config_file_override =
-            project_options_overrides.and_then(|options| options.config_file_override.clone());
-        let extra_configuration_paths = project.metadata(self).extra_configuration_paths().to_vec();
-        let program = Program::get(self);
+        let configuration_paths = ConfigurationPaths::from_metadata(project.metadata(self));
+        let program = self.project().program(self);
         let custom_stdlib_versions_path = program
             .custom_stdlib_search_path(self)
             .map(|path| path.join("VERSIONS"));
@@ -63,17 +54,21 @@ impl ProjectDatabase {
         let mut removed_paths = BTreeSet::default();
         let mut reload_project = false;
         let mut reload_project_files = false;
+        // TODO: This should be removed once the incremental checker is ported
+        // over to the `ignore` crate, since the `ignore` crate will respect
+        // the settings provided in `create_walker`. ---AG
+        let respect_ignore_files = project.settings(self).src().respect_ignore_files;
+        let ignore_walk_roots =
+            respect_ignore_files.then(|| project.included_paths_or_root(self).to_vec());
+        let mut ignore_files = ignore_walk_roots.as_deref().and_then(|walk_roots| {
+            Some(create_walker_builder(self, walk_roots)?.incremental_matcher())
+        });
 
         for change in changes {
             tracing::debug!("Handling file watcher change event: {:?}", change);
 
             if let Some(path) = change.system_path() {
-                if is_project_configuration_path(
-                    path,
-                    &project_root,
-                    config_file_override.as_ref(),
-                    &extra_configuration_paths,
-                ) {
+                if configuration_paths.is_configuration(path, &project_root) {
                     File::sync_path(self, path);
                     reload_project = true;
 
@@ -94,7 +89,11 @@ impl ProjectDatabase {
                                 "Reloading project files for changed ignore file at or above included path"
                             );
                             reload_project_files = true;
-                        } else if project.is_directory_included(self, directory) {
+                        } else if project.is_directory_included(self, directory)
+                            && ignore_files.as_mut().is_none_or(|ignore_files| {
+                                !ignore_files.is_ignored(directory, true)
+                            })
+                        {
                             tracing::debug!(
                                 ignore_file = %path,
                                 directory = %directory,
@@ -110,7 +109,7 @@ impl ProjectDatabase {
                             tracing::debug!(
                                 ignore_file = %path,
                                 directory = %directory,
-                                "Ignoring changed ignore file because it doesn't affect project paths"
+                                "Ignoring changed ignore file because it doesn't affect indexed project paths"
                             );
                         }
                     }
@@ -127,35 +126,6 @@ impl ProjectDatabase {
                 ChangeEvent::Changed { path, kind: _ } | ChangeEvent::Opened(path) => {
                     if synced_files.insert(path.to_path_buf()) {
                         File::sync_path_only(self, path);
-                        if let Some(root) = self.files().root(self, path) {
-                            match root.kind_at_time_of_creation(self) {
-                                // When a file inside the root of
-                                // the project is changed, we don't
-                                // want to mark the entire root as
-                                // having changed too. In theory it
-                                // might make sense to, but at time
-                                // of writing, the file root revision
-                                // on a project is used to invalidate
-                                // the submodule files found within a
-                                // directory. If we bumped the revision
-                                // on every change within a project,
-                                // then this caching technique would be
-                                // effectively useless.
-                                //
-                                // It's plausible we should explore
-                                // a more robust cache invalidation
-                                // strategy that models more directly
-                                // what we care about. For example, by
-                                // keeping track of directories and
-                                // their direct children explicitly,
-                                // and then keying the submodule cache
-                                // off of that instead. ---AG
-                                FileRootKind::Project => {}
-                                FileRootKind::LibrarySearchPath => {
-                                    root.set_revision(self).to(FileRevision::now());
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -171,24 +141,34 @@ impl ProjectDatabase {
                         }
                     }
 
-                    // Unlike other files, it's not only important to update the status of existing
-                    // and known `File`s (`sync_recursively`), it's also important to discover new files
-                    // that were added in the project's root (or any of the paths included for checking).
-                    //
-                    // This is important because `Project::check` iterates over all included files.
-                    // The code below walks the `added_paths` and adds all files that
-                    // should be included in the project. We can skip this check for
-                    // paths that aren't part of the project or shouldn't be included
-                    // when checking the project.
-                    if self.system().is_file(path) {
-                        if project.is_file_included(self, path) {
-                            // Add the parent directory because `walkdir`
-                            // always visits explicitly passed files even if
-                            // they match an exclude filter.
-                            added_paths.insert(path.parent().unwrap().to_path_buf());
+                    // A created file can be indexed directly unless project indexing needs the
+                    // walker to apply ignore-file semantics. The ignore check below skips that
+                    // walk when the path is ignored.
+                    if !project.file_set(self).is_lazy() {
+                        if self.system().is_file(path) {
+                            if !project
+                                .is_file_included(self, path)
+                                .should_index_file(self.system(), path)
+                            {
+                                continue;
+                            }
+
+                            if ignore_files
+                                .as_mut()
+                                .is_none_or(|ignore_files| !ignore_files.is_ignored(path, false))
+                                && let Ok(file) = system_path_to_file(self, path)
+                            {
+                                project.add_file(self, file);
+                            }
+                        } else if project.is_directory_included(self, path)
+                            && ignore_files
+                                .as_mut()
+                                .is_none_or(|ignore_files| !ignore_files.is_ignored(path, true))
+                        {
+                            // Unlike a new file, a new directory needs walking to discover
+                            // project files that exist below it.
+                            added_paths.insert(path.clone());
                         }
-                    } else if project.is_directory_included(self, path) {
-                        added_paths.insert(path.clone());
                     }
                 }
 
@@ -221,14 +201,10 @@ impl ProjectDatabase {
                             result.custom_stdlib_changed = true;
                         }
 
-                        if directory_may_contain_project_configuration(
-                            path,
-                            &project_root,
-                            config_file_override.as_ref(),
-                            &extra_configuration_paths,
-                        ) {
+                        if configuration_paths.may_contain_configuration(path, &project_root) {
                             tracing::debug!(
-                                "Reload project because a configuration file may have been deleted."
+                                "Reload project because a configuration file \
+                                may have been deleted."
                             );
                             reload_project = true;
                         }
@@ -256,73 +232,60 @@ impl ProjectDatabase {
             }
         }
 
-        Files::sync_all_recursive(self, deduplicate_nested_paths(sync_recursively));
+        Files::sync_all_recursive(self, sync_recursively);
 
         if reload_project {
-            // The active project root may have been deleted. Start rediscovery from
-            // the closest existing ancestor so ty can fall back to an enclosing project.
-            let rediscovery_path = project_root
-                .ancestors()
-                .find(|path| self.system().is_directory(path))
-                .unwrap_or(&project_root);
-            let new_project_metadata = match config_file_override {
-                Some(config_file) => {
-                    ProjectMetadata::from_config_file(config_file, &project_root, self.system())
-                }
-                None => ProjectMetadata::discover(rediscovery_path, self.system()),
-            };
+            let new_project_metadata = project.metadata(self).rediscover(self.system());
             match new_project_metadata {
                 Ok(mut metadata) => {
                     if let Err(error) = metadata.apply_configuration_files(self.system()) {
+                        let error = anyhow::Error::new(error);
                         tracing::error!(
-                            "Failed to apply configuration files, continuing without applying them: {error}"
+                            "Failed to apply configuration files, \
+                            continuing without applying them: {error:#}"
                         );
                     }
 
-                    if let Some(overrides) = project_options_overrides {
-                        metadata.apply_overrides(overrides);
-                    }
+                    metadata.try_add_project_root(self);
+                    let merged_options = metadata.to_merged_options();
 
-                    let program_settings_diagnostics = match metadata.to_program_settings(
+                    let program_settings_diagnostics = match merged_options.to_program_settings(
                         self.system(),
                         self.vendored(),
                         &FallibleStrategy,
                     ) {
                         Ok((program_settings, diagnostics)) => {
-                            let program = Program::get(self);
-                            program.update_from_settings(self, program_settings);
+                            project.update_program(self, program_settings);
                             diagnostics
                         }
                         Err(error) => {
                             tracing::error!(
-                                "Failed to convert metadata to program settings, continuing without applying them: {error}"
+                                "Failed to convert metadata to program settings, \
+                                continuing without applying them: {error}"
                             );
                             Vec::new()
                         }
                     };
 
-                    let (settings, settings_diagnostics) = match metadata.options().to_settings(
-                        self,
-                        metadata.root(),
-                        &FallibleStrategy,
-                    ) {
-                        Ok((settings, diagnostics)) => (Some(settings), diagnostics),
-                        Err(error) => {
-                            tracing::warn!(
-                                "Keeping old project configuration because loading the new settings failed with: {error}"
-                            );
-                            (None, vec![error.into_diagnostic()])
-                        }
-                    };
+                    let (settings, mut settings_diagnostics) =
+                        match merged_options.to_settings(self, &FallibleStrategy) {
+                            Ok((settings, diagnostics)) => (Some(settings), diagnostics),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Keeping old project configuration because loading the new \
+                                     settings failed with: {error}"
+                                );
+                                (None, vec![error.into_diagnostic()])
+                            }
+                        };
+                    settings_diagnostics.extend(
+                        program_settings_diagnostics
+                            .into_iter()
+                            .map(|diagnostic| diagnostic.into_diagnostic(self)),
+                    );
 
                     tracing::debug!("Reloading project after structural change");
-                    match project.reload(
-                        self,
-                        metadata,
-                        settings,
-                        settings_diagnostics,
-                        program_settings_diagnostics,
-                    ) {
+                    match project.reload(self, metadata, settings, settings_diagnostics) {
                         ProjectReloadResult::Unchanged => {}
                         ProjectReloadResult::Changed { files_changed } => {
                             result.project_changed = true;
@@ -335,8 +298,9 @@ impl ProjectDatabase {
                     }
                 }
                 Err(error) => {
+                    let error = anyhow::Error::new(error);
                     tracing::error!(
-                        "Failed to load project, keeping old project configuration: {error}"
+                        "Failed to load project, keeping old project configuration: {error:#}"
                     );
                     if reload_project_files {
                         project.reload_files(self);
@@ -354,26 +318,26 @@ impl ProjectDatabase {
         }
 
         if result.custom_stdlib_changed {
-            match project.metadata(self).to_program_settings(
+            let metadata = project.metadata(self);
+            let merged_options = metadata.to_merged_options();
+            match merged_options.to_program_settings(
                 self.system(),
                 self.vendored(),
                 &FallibleStrategy,
             ) {
                 Ok((program_settings, program_settings_diagnostics)) => {
-                    program.update_from_settings(self, program_settings);
-                    let settings_diagnostics = match project.metadata(self).options().to_settings(
-                        self,
-                        project.metadata(self).root(),
-                        &FallibleStrategy,
-                    ) {
-                        Ok((_, diagnostics)) => diagnostics,
-                        Err(error) => vec![error.into_diagnostic()],
-                    };
-                    project.update_settings_diagnostics(
-                        self,
-                        settings_diagnostics,
-                        program_settings_diagnostics,
+                    let mut settings_diagnostics =
+                        match merged_options.to_settings(self, &FallibleStrategy) {
+                            Ok((_, diagnostics)) => diagnostics,
+                            Err(error) => vec![error.into_diagnostic()],
+                        };
+                    project.update_program(self, program_settings);
+                    settings_diagnostics.extend(
+                        program_settings_diagnostics
+                            .into_iter()
+                            .map(|diagnostic| diagnostic.into_diagnostic(self)),
                     );
+                    project.update_settings_diagnostics(self, settings_diagnostics);
                 }
                 Err(error) => {
                     tracing::error!("Failed to resolve program settings: {error}");
@@ -381,12 +345,11 @@ impl ProjectDatabase {
             }
         }
 
-        project.remove_files_under(self, deduplicate_nested_paths(removed_paths));
+        project.remove_files_under(self, removed_paths);
 
-        let diagnostics = if !project.file_set(self).is_lazy()
-            && let Some(walker) = ProjectFilesWalker::incremental(self, added_paths)
-        {
+        let diagnostics = if !project.file_set(self).is_lazy() {
             // Use directory walking to discover newly added files.
+            let walker = ProjectFilesWalker::incremental(added_paths);
             let (files, diagnostics) = walker.collect_vec(self);
 
             for file in files {
@@ -409,54 +372,53 @@ impl ProjectDatabase {
     }
 }
 
-fn is_project_configuration_path(
-    path: &SystemPath,
-    project_root: &SystemPath,
-    config_file_override: Option<&SystemPathBuf>,
-    extra_configuration_paths: &[SystemPathBuf],
-) -> bool {
-    if extra_configuration_paths
-        .iter()
-        .any(|config_path| config_path.as_path() == path)
-    {
-        return true;
-    }
-
-    if let Some(config_path) = config_file_override {
-        config_path.as_path() == path
-    } else {
-        path.parent()
-            .is_some_and(|parent| project_root.starts_with(parent))
-            && is_project_config_file(path)
-    }
+struct ConfigurationPaths {
+    normal_discovery: bool,
+    extra: Box<[SystemPathBuf]>,
 }
 
-fn directory_may_contain_project_configuration(
-    directory: &SystemPath,
-    project_root: &SystemPath,
-    config_file_override: Option<&SystemPathBuf>,
-    extra_configuration_paths: &[SystemPathBuf],
-) -> bool {
-    if extra_configuration_paths
-        .iter()
-        .any(|config_path| config_path.starts_with(directory))
-    {
-        return true;
+impl ConfigurationPaths {
+    fn from_metadata(metadata: &ProjectMetadata) -> Self {
+        Self {
+            normal_discovery: metadata.config_file_override().is_none(),
+            extra: metadata
+                .extra_configuration_paths()
+                .map(SystemPath::to_path_buf)
+                .collect(),
+        }
     }
 
-    if let Some(config_path) = config_file_override {
-        config_path.starts_with(directory)
-    } else {
+    fn is_configuration(&self, path: &SystemPath, project_root: &SystemPath) -> bool {
+        if self
+            .extra
+            .iter()
+            .any(|config_path| config_path.as_path() == path)
+        {
+            return true;
+        }
+
+        self.normal_discovery
+            && path
+                .parent()
+                .is_some_and(|parent| project_root.starts_with(parent))
+            && matches!(path.file_name(), Some("ty.toml" | "pyproject.toml"))
+    }
+
+    fn may_contain_configuration(&self, directory: &SystemPath, project_root: &SystemPath) -> bool {
+        if self
+            .extra
+            .iter()
+            .any(|config_path| config_path.starts_with(directory))
+        {
+            return true;
+        }
+
         // Deleting the project root or one of its ancestors can change rediscovery:
         // ty may need to fall back to an enclosing configuration.
-        project_root.starts_with(directory)
+        self.normal_discovery && project_root.starts_with(directory)
     }
 }
 
 fn is_ignore_file(path: &SystemPath) -> bool {
     matches!(path.file_name(), Some(".gitignore" | ".ignore"))
-}
-
-fn is_project_config_file(path: &SystemPath) -> bool {
-    matches!(path.file_name(), Some("ty.toml" | "pyproject.toml"))
 }

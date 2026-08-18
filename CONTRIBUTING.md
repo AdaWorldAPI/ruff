@@ -44,6 +44,20 @@ We **require all use of AI in contributions to follow our
 
 If your contribution does not follow the policy, it will be closed.
 
+### Local skills for Codex or Claude
+
+This repository includes local agent skills for ty development under `.agents/skills`.
+
+Contributors using Codex for development should find that Codex auto-discovers the skills and uses
+them automatically when necessary. Claude Code users may be prompted to install the
+`ty-skills@ruff-agent-skills` local plugin. If the skills are not installed automatically, install
+them manually from the repository root by running these slash commands inside Claude Code:
+
+```text
+/plugin marketplace add ./.agents
+/plugin install ty-skills@ruff-agent-skills
+```
+
 ## The Basics
 
 ### Prerequisites
@@ -64,8 +78,7 @@ You can optionally install hooks to automatically run the validation checks
 when making a commit:
 
 ```shell
-uv tool install prek
-prek install
+uv run --only-group dev --locked prek install
 ```
 
 We recommend [nextest](https://nexte.st/) to run Ruff's test suite (via `cargo nextest run`),
@@ -92,7 +105,7 @@ and that it passes both the lint and test validation checks:
 ```shell
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # Rust linting
 RUFF_UPDATE_SCHEMA=1 cargo test  # Rust testing and updating ruff.schema.json
-uvx prek run -a  # Rust and Python formatting, Markdown and Python linting, etc.
+uv run --only-group dev --locked prek run --all-files  # Rust and Python formatting, Markdown and Python linting, etc.
 ```
 
 These checks will run on GitHub Actions when you open your pull request, but running them locally
@@ -156,6 +169,34 @@ At the time of writing, the repository includes the following crates:
 - `crates/ruff_python_parser`: library crate containing the Python parser.
 - `crates/ruff_wasm`: library crate for exposing Ruff as a WebAssembly module. Powers the
     [Ruff Playground](https://play.ruff.rs/).
+
+#### Adding a new crate
+
+When adding a workspace crate under `crates/`, first decide whether it should be published to
+crates.io as part of Ruff's releases:
+
+- Test, benchmark, development, and other non-release crates must set `publish = false` in their
+    `Cargo.toml`.
+- Publishable crates should inherit the workspace package metadata and follow Ruff's [crate
+    versioning policy](https://docs.astral.sh/ruff/versioning/#crate-versioning). If the crate is
+    listed under `[workspace.dependencies]`, specify both its path and matching version.
+
+For a publishable crate, generate its README and verify that the workspace can still be packaged:
+
+```shell
+uv run --script scripts/generate-crate-readmes.py
+cargo publish --workspace --dry-run
+```
+
+Before merging a publishable crate, ask a crates.io owner to bootstrap it by running:
+
+```shell
+CARGO_REGISTRY_TOKEN=<token> uv run --no-config --script scripts/setup-crates-io-publish.py
+```
+
+The bootstrap script reserves the crate name, configures the release workflow as its trusted
+publisher, requires trusted publishing for future versions, and adds the crate to `.known-crates`.
+Commit the generated README and `.known-crates` update with the new crate.
 
 ### Example: Adding a new lint rule
 
@@ -234,9 +275,9 @@ preserving the original rule name.
 
 To test rules, Ruff uses the mdtest framework, initially developed for ty. Mdtests are written as
 Markdown files with Python code and TOML configuration blocks alongside prose
-descriptions. Generally, there will be one file per linter (e.g. `flake8-bandit.md` for the `S`
-rules) with top-level headings for each rule (e.g. `S704` for `unsafe-markup-use`). Within these
-top-level sections, you can define additional sections to group related tests and their settings
+descriptions. Generally, there will be one directory per linter (e.g. `flake8-bandit` for the `S`
+rules) with nested files for each rule (e.g. `unsafe-markup-use.md` for `S704`). Within these
+files, you can define additional Markdown sections to group related tests and their settings
 together.
 
 You can see [the ty_test
@@ -252,7 +293,7 @@ For example, a minimal mdtest for `module-import-not-at-top-of-file` (`E402`) wo
 like this:
 
 ````markdown
-<!-- crates/ruff_linter/resources/mdtest/pycodestyle.md -->
+<!-- crates/ruff_linter/resources/mdtest/pycodestyle/module-import-not-at-top-of-file.md -->
 
 # `module-import-not-at-top-of-file` (`E402`)
 
@@ -522,13 +563,8 @@ Commit each step of this process separately for easier review.
     1. Run `uv run --only-dev --no-sync scripts/update_schemastore.py --proto <https|ssh>`
     1. Once run successfully, you should follow the link in the output to create a PR.
 
-1. If needed, update the [`ruff-lsp`](https://github.com/astral-sh/ruff-lsp) and
-    [`ruff-vscode`](https://github.com/astral-sh/ruff-vscode) repositories and follow
-    the release instructions in those repositories. `ruff-lsp` should always be updated
-    before `ruff-vscode`.
-
-    This step is generally not required for a patch release, but should always be done
-    for a minor release.
+1. Update the [`ruff-vscode`](https://github.com/astral-sh/ruff-vscode) repository by following
+    the [release instructions](https://github.com/astral-sh/ruff-vscode/blob/main/CONTRIBUTING.md#release) there.
 
 ## Ecosystem CI
 

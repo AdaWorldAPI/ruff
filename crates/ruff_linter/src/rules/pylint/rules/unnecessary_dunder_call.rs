@@ -214,20 +214,23 @@ pub(crate) fn unnecessary_dunder_call(checker: &Checker, call: &ast::ExprCall) {
     if let Some((mut fixed, precedence)) = fixed {
         let dunder = DunderReplacement::from_method(attr);
 
-        // We never need to wrap builtin functions in extra parens
-        // since function calls have high precedence
-        let wrap_in_paren = (!matches!(dunder, Some(DunderReplacement::Builtin(_,_))))
-        // If parent expression has higher precedence then the new replacement,
+        // If the parent expression has higher precedence then the new replacement,
         // it would associate with either the left operand (e.g. naive change from `a * b.__add__(c)`
         // becomes `a * b + c` which is incorrect) or the right operand (e.g. naive change from
         // `a.__add__(b).attr` becomes `a + b.attr` which is also incorrect).
         // This rule doesn't apply to function calls despite them having higher
         // precedence than any of our replacement, since they already wrap around
-        // our expression e.g. `print(a.__add__(3))` -> `print(a + 3)`
+        // our expression e.g. `print(a.__add__(3))` -> `print(a + 3)`.
+        //
+        // Note that we never need to wrap *builtin* functions in extra parens
+        // since function calls have high precedence
+        let wrap_in_paren = (!matches!(dunder, Some(DunderReplacement::Builtin(_, _))))
             && checker
                 .semantic()
                 .current_expression_parent()
-                .is_some_and(|parent| !parent.is_call_expr() && OperatorPrecedence::from_expr(parent) > precedence);
+                .is_some_and(|parent| {
+                    !parent.is_call_expr() && OperatorPrecedence::from_expr(parent) > precedence
+                });
 
         if wrap_in_paren {
             fixed = format!("({fixed})");
@@ -352,6 +355,11 @@ impl DunderReplacement {
                 "Use `<<=` operator",
                 OperatorPrecedence::Assign,
             )),
+            "__imatmul__" => Some(Self::Operator(
+                "@=",
+                "Use `@=` operator",
+                OperatorPrecedence::Assign,
+            )),
             "__imod__" => Some(Self::Operator(
                 "%=",
                 "Use `%=` operator",
@@ -417,6 +425,11 @@ impl DunderReplacement {
                 "Use `*` operator",
                 OperatorPrecedence::MulDivRemain,
             )),
+            "__matmul__" => Some(Self::Operator(
+                "@",
+                "Use `@` operator",
+                OperatorPrecedence::MulDivRemain,
+            )),
             "__ne__" => Some(Self::Operator(
                 "!=",
                 "Use `!=` operator",
@@ -467,6 +480,11 @@ impl DunderReplacement {
                 "<<",
                 "Use `<<` operator",
                 OperatorPrecedence::LeftRightShift,
+            )),
+            "__rmatmul__" => Some(Self::ROperator(
+                "@",
+                "Use `@` operator",
+                OperatorPrecedence::MulDivRemain,
             )),
             "__rmod__" => Some(Self::ROperator(
                 "%",
@@ -531,6 +549,7 @@ impl DunderReplacement {
             "__delattr__" => Some(Self::MessageOnly("Use `del` statement")),
             "__delitem__" => Some(Self::MessageOnly("Use `del` statement")),
             "__divmod__" => Some(Self::MessageOnly("Use `divmod()` builtin")),
+            "__floor__" => Some(Self::MessageOnly("Use `math.floor()` function")),
             "__format__" => Some(Self::MessageOnly(
                 "Use `format` builtin, format string method, or f-string",
             )),
@@ -545,6 +564,7 @@ impl DunderReplacement {
             "__init__" => Some(Self::MessageOnly("Instantiate class directly")),
             "__instancecheck__" => Some(Self::MessageOnly("Use `isinstance()` builtin")),
             "__invert__" => Some(Self::MessageOnly("Use `~` operator")),
+            "__length_hint__" => Some(Self::MessageOnly("Use `operator.length_hint()` function")),
             "__neg__" => Some(Self::MessageOnly("Multiply by -1 instead")),
             "__pos__" => Some(Self::MessageOnly("Multiply by +1 instead")),
             "__pow__" => Some(Self::MessageOnly("Use ** operator or `pow()` builtin")),
@@ -554,7 +574,7 @@ impl DunderReplacement {
                 "Mutate attribute directly or use setattr built-in function",
             )),
             "__setitem__" => Some(Self::MessageOnly("Use subscript assignment")),
-            "__truncate__" => Some(Self::MessageOnly("Use `math.trunc()` function")),
+            "__trunc__" => Some(Self::MessageOnly("Use `math.trunc()` function")),
 
             _ => None,
         }

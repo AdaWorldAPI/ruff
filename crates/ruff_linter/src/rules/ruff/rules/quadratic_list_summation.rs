@@ -39,7 +39,16 @@ use crate::{AlwaysFixableViolation, Edit, Fix};
 /// joined = sum(lists, [])
 /// ```
 ///
-/// Use instead:
+/// On Python 3.14 and earlier, use instead:
+/// ```python
+/// import functools
+/// import operator
+///
+/// lists = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+/// joined = functools.reduce(operator.iadd, lists, [])
+/// ```
+///
+/// On Python 3.15 and later, use instead:
 /// ```python
 /// lists = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
 /// joined = [*sublist for sublist in lists]
@@ -104,7 +113,7 @@ pub(crate) fn quadratic_list_summation(checker: &Checker, call: &ast::ExprCall) 
     let ast::ExprCall {
         func,
         arguments,
-        range,
+        range_start: _,
         node_index: _,
     } = call;
 
@@ -123,7 +132,8 @@ pub(crate) fn quadratic_list_summation(checker: &Checker, call: &ast::ExprCall) 
     }
 
     let fix_style = QuadraticListSummationFixStyle::from_target_version(checker.target_version());
-    let mut diagnostic = checker.report_diagnostic(QuadraticListSummation { fix_style }, *range);
+    let mut diagnostic =
+        checker.report_diagnostic(QuadraticListSummation { fix_style }, call.range());
     diagnostic.try_set_fix(|| convert_to_fix(iterable, call, checker, fix_style));
 }
 

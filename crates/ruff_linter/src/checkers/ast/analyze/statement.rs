@@ -64,6 +64,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.is_rule_enabled(Rule::DjangoNonLeadingReceiverDecorator) {
                 flake8_django::rules::non_leading_receiver_decorator(checker, decorator_list);
             }
+            if checker.is_rule_enabled(Rule::IncorrectDecoratorOrder) {
+                ruff::rules::incorrect_decorator_order(checker, decorator_list);
+            }
             if checker.is_rule_enabled(Rule::FastApiRedundantResponseModel) {
                 fastapi::rules::fastapi_redundant_response_model(checker, function_def);
             }
@@ -149,7 +152,7 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                 flake8_pyi::rules::bad_exit_annotation(checker, function_def);
             }
             if checker.is_rule_enabled(Rule::RedundantNumericUnion) {
-                flake8_pyi::rules::redundant_numeric_union(checker, parameters);
+                flake8_pyi::rules::redundant_numeric_union(checker, function_def);
             }
             if checker.is_rule_enabled(Rule::Pep484StylePositionalOnlyParameter) {
                 flake8_pyi::rules::pep_484_positional_parameter(checker, function_def);
@@ -176,6 +179,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                     pyupgrade::rules::lru_cache_with_maxsize_none(checker, decorator_list);
                 }
             }
+            if checker.is_rule_enabled(Rule::DeprecatedAbcDecorator) {
+                pyupgrade::rules::deprecated_abc_decorator(checker, decorator_list);
+            }
             if checker.is_rule_enabled(Rule::CachedInstanceMethod) {
                 flake8_bugbear::rules::cached_instance_method(checker, function_def);
             }
@@ -184,6 +190,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             }
             if checker.is_rule_enabled(Rule::ReturnInGenerator) {
                 flake8_bugbear::rules::return_in_generator(checker, function_def);
+            }
+            if checker.is_rule_enabled(Rule::FallibleContextManager) {
+                ruff::rules::fallible_context_manager(checker, function_def);
             }
             if checker.any_rule_enabled(&[
                 Rule::UnnecessaryReturnNone,
@@ -359,6 +368,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             }
             if checker.is_rule_enabled(Rule::PropertyWithoutReturn) {
                 ruff::rules::property_without_return(checker, function_def);
+            }
+            if checker.is_rule_enabled(Rule::PytestFixtureAutouse) {
+                ruff::rules::pytest_fixture_autouse(checker, decorator_list);
             }
         }
         Stmt::Return(_) => {
@@ -1230,6 +1242,9 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.is_rule_enabled(Rule::NeedlessElse) {
                 ruff::rules::needless_else(checker, while_stmt.into());
             }
+            if checker.is_rule_enabled(Rule::WhileOne) {
+                pyupgrade::rules::while_one(checker, while_stmt);
+            }
         }
         Stmt::For(
             for_stmt @ ast::StmtFor {
@@ -1335,8 +1350,7 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
             if checker.is_rule_enabled(Rule::TooManyStatementsInTryClause) {
                 pylint::rules::too_many_try_statements(
                     checker,
-                    stmt,
-                    body,
+                    try_stmt,
                     checker.settings().pylint.max_statements_in_try,
                 );
             }
@@ -1344,7 +1358,7 @@ pub(crate) fn statement(stmt: &Stmt, checker: &mut Checker) {
                 flake8_bugbear::rules::jump_statement_in_finally(checker, finalbody);
             }
             if checker.is_rule_enabled(Rule::ContinueInFinally) {
-                if checker.target_version() <= PythonVersion::PY38 {
+                if checker.target_version() < PythonVersion::PY38 {
                     pylint::rules::continue_in_finally(checker, finalbody);
                 }
             }

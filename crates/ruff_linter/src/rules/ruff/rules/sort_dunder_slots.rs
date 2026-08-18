@@ -242,8 +242,7 @@ impl<'a> StringLiteralDisplay<'a> {
                 for key in dict.iter_keys() {
                     // This is somewhat unfortunate,
                     // *but* using a dict for __slots__ is very rare
-                    let key = key?;
-                    narrowed_keys.push(key.to_owned());
+                    narrowed_keys.push(key?.to_owned());
                 }
                 // If `None` was present in the keys, it indicates a "** splat", .e.g
                 // `__slots__ = {"foo": "bar", **other_dict}`
