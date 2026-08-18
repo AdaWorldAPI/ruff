@@ -32,7 +32,7 @@ pub struct ExamConfig {
     pub codebook: Vec<(String, u16)>,
     /// Concepts that MUST bind for the exam to pass.
     pub expect: Vec<String>,
-    /// `(dock token, region name)` rows binding a WinForms `Dock` value to
+    /// `(dock token, region name)` rows binding a `WinForms` `Dock` value to
     /// a canonical region name (the six-region layout frame: `top_bar` /
     /// `left_nav` / `right_panel` / `bottom_bar` / `center` / `popup`,
     /// canonically — but region names are free strings supplied by config;

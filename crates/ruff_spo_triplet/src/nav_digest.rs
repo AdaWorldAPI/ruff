@@ -1,4 +1,4 @@
-//! The Klickwege structure-parity oracle (transcode doctrine: "MySQL = value
+//! The Klickwege structure-parity oracle (transcode doctrine: "`MySQL` = value
 //! parity, Klickwege = structure parity").
 //!
 //! [`build_nav_digest`] folds the UI-navigation plane of a harvest — the
@@ -19,6 +19,10 @@ use std::fmt::Write;
 use crate::exam_config::ExamConfig;
 use crate::region::RegionSubject;
 use crate::triple::Triple;
+
+/// `(screen, region) -> [(dock/popup token, dock order)]` groupings used
+/// while assembling the `[regions]` digest section.
+type RegionEntries = BTreeMap<(String, String), Vec<(String, Option<u32>)>>;
 
 /// Strip a triple's namespace prefix (`"ns:"`), returning the local part.
 /// An IRI with no `:` passes through unchanged.
@@ -297,8 +301,7 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
     }
 
     // Group docked controls (+ popup targets) by resolved region.
-    let mut region_entries: BTreeMap<(String, String), Vec<(String, Option<u32>)>> =
-        BTreeMap::new();
+    let mut region_entries: RegionEntries = BTreeMap::new();
     for ((screen, control), token) in &dock_of {
         let region = config
             .regions

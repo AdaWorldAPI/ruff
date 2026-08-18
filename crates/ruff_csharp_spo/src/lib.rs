@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(triples[0].s, "csharp:Widget.SetDefaults");
     }
 
-    /// The UI-navigation arm — the WinForms `navigates_to` Klickweg edge
+    /// The UI-navigation arm — the `WinForms` `navigates_to` Klickweg edge
     /// (`EmitNavArm`). Subject is the CLASS that navigates, object is the target
     /// screen class. Shaped exactly as the harvester emits it (verified by
     /// running the real harvester over `harvester/fixtures/nav_shapes.cs`):
@@ -134,7 +134,7 @@ mod tests {
     /// idiom (`HostControl` field-instantiates `ChildControl`, no `.Show()`),
     /// one via NAMESPACE-QUALIFIED hosting (`new Nested.QualifiedChild(..)` —
     /// LastSegment-normalized to the bare screen node), and one `selects_view`
-    /// ribbon fact. The `SaveFileDialog` CommonDialog and the non-screen
+    /// ribbon fact. The `SaveFileDialog` `CommonDialog` and the non-screen
     /// `StringBuilder` are both excluded. A clean load is the standing proof
     /// the nav arm stays inside the closed vocabulary.
     #[test]
@@ -193,7 +193,7 @@ mod tests {
     /// `surfaces_concept` / `handles_event` / `contains_control`
     /// (`EmitUiConfigArm` + the `--room-aliases` config binding). One line
     /// per predicate, shaped exactly as `harvester/Program.cs` emits it
-    /// (verified against a real WinForms corpus: screen-classified types,
+    /// (verified against a real `WinForms` corpus: screen-classified types,
     /// Designer `+=` wiring, `Controls.Add` containment, directory→concept
     /// alias rows). The Klickweg EDGES ride the nav-arm test above; this
     /// pins the room-map half. A clean load is the standing proof the

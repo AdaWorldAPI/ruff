@@ -16,7 +16,7 @@
 //! the DO-arm candidate pool *before* recipe classification runs, or the
 //! enum/template plumbing pollutes the capability surface with fake
 //! "actions" that are really config reads. This ties directly into
-//! param-enum fidelity — the walk_enums harvest (`ruff_cpp_spo`,
+//! param-enum fidelity — the `walk_enums` harvest (`ruff_cpp_spo`,
 //! "Future-synergy-2") is what makes the *typed* enum/template space this
 //! module only classifies the *surface* of; concept and facet residue
 //! resolution (`["cipher", "typ"]` → the concrete `Cipher::typ` enum arm)
@@ -178,7 +178,7 @@ mod tests {
         }
     }
 
-    /// `get_combo_cipher_typ` — verb `get`, surface `combo` (EnumSource),
+    /// `get_combo_cipher_typ` — verb `get`, surface `combo` (`EnumSource`),
     /// residue `["cipher", "typ"]`.
     #[test]
     fn get_combo_names_enum_source_with_concept_facet_residue() {
@@ -191,7 +191,7 @@ mod tests {
     /// `add_option_widget_template` — BOTH `option` and `template` are
     /// present as surface tokens. The LAST match in name order wins: the
     /// trailing table-kind token names the actual storage ("a TEMPLATE
-    /// of options"), so `add_option_*_template` is a TemplateSource —
+    /// of options"), so `add_option_*_template` is a `TemplateSource` —
     /// never an enum source (codex P2 on PR #72). Every matched surface
     /// token leaves the residue: only the concept material remains.
     #[test]

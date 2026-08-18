@@ -1,4 +1,4 @@
-//! The Klickwege structure-parity oracle (transcode doctrine: "MySQL = value
+//! The Klickwege structure-parity oracle (transcode doctrine: "`MySQL` = value
 //! parity, Klickwege = structure parity"). Prints a deterministic digest of
 //! the UI-navigation plane harvested from a corpus — screens, navigation
 //! edges (`navigates_to`), tab/view selections (`selects_view`), concept
@@ -33,7 +33,8 @@
 
 #![expect(
     clippy::print_stdout,
-    reason = "the whole point of this example is to print the nav digest"
+    clippy::print_stderr,
+    reason = "the whole point of this example is to print the nav digest (and a usage error to stderr on bad args)"
 )]
 
 use ruff_spo_triplet::{build_nav_digest, from_ndjson, parse};

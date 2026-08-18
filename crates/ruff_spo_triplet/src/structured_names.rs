@@ -12,7 +12,7 @@
 //! caller-supplied [`NameGrammar`]. The grammar is deliberately
 //! **data-as-config**: no corpus tokens live in this file, only the
 //! tokenizer and the tier-walk. The parsed [`StructuredName`] feeds
-//! [`part_of_edges`], which is the natural input to the FacetCascade
+//! [`part_of_edges`], which is the natural input to the `FacetCascade`
 //! `part_of` forest — each tier becomes a parent node, and the subject
 //! is `part_of` the innermost one.
 
@@ -25,7 +25,7 @@ pub struct NameGrammar {
     /// Empty string = no marker required, the path starts at the first
     /// numeric token.
     pub marker: String,
-    /// Names for each numeric tier, outermost first (e.g. ["form","section"]).
+    /// Names for each numeric tier, outermost first (e.g. `["form","section"]`).
     /// Extra numeric tokens beyond this list get tier name "level<N>".
     pub tier_names: Vec<String>,
 }
@@ -39,7 +39,7 @@ pub struct StructuredName {
     /// The numbered path, outermost first: [("form",2),("section",3)].
     pub tiers: Vec<Tier>,
     /// The remaining non-numeric tokens after the path (lowercased) —
-    /// concept/qualifier residue for the concept_split pass to resolve.
+    /// concept/qualifier residue for the `concept_split` pass to resolve.
     pub residue: Vec<String>,
 }
 
@@ -164,7 +164,10 @@ pub fn part_of_edges(subject: &str, ns: &str, parsed: &StructuredName) -> Vec<(S
         if !path.is_empty() {
             path.push('/');
         }
-        path.push_str(&format!("{tier_name}_{n}"));
+        {
+            use std::fmt::Write as _;
+            let _ = write!(path, "{tier_name}_{n}");
+        }
         nodes.push(format!("{ns}:{path}"));
     }
 
