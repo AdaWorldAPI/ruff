@@ -439,9 +439,22 @@ jobs:
           version: "0.11.14"
           enable-cache: "true"
       - name: "Run tests"
+        shell: bash
         run: |
-          cargo nextest run --all-features --profile ci
-          cargo test --all-features --doc
+          # `ruff_cpp_spo` (fork-only, not present upstream) gates its libclang
+          # walker behind the `libclang` feature, which `--all-features` turns
+          # on here. The `clang` crate dlopens libclang at runtime, and on
+          # windows-latest that currently crashes with 0xc0000005 (Invalid
+          # access to memory location) rather than failing the test cleanly.
+          # Exclude the crate's tests on Windows only — macos-latest runs them
+          # fine — instead of dropping `--all-features` workspace-wide.
+          if [[ "${{ matrix.platform }}" == *windows* ]]; then
+            cargo nextest run --all-features --profile ci -E 'not package(ruff_cpp_spo)'
+            cargo test --all-features --doc --workspace --exclude ruff_cpp_spo
+          else
+            cargo nextest run --all-features --profile ci
+            cargo test --all-features --doc
+          fi
 
   cargo-test-wasm:
     name: "cargo test (wasm)"
