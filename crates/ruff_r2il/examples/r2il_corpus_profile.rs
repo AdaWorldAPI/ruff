@@ -24,6 +24,17 @@
 //! `is_control_flow()`, `is_memory_read()`, `is_memory_write()`, and a typed `match` on the op's
 //! own variant for the atomic check) — never from `Display`/`Debug` formatting of an op.
 
+// The workspace `clippy.toml` disallows `std::env::var` with the reason "Use System::env_var
+// instead **in ty crates**" — that policy exists so ty reads configuration through its `System`
+// abstraction for testability. This is not a ty crate: `ruff_r2il` is workspace-EXCLUDED and does
+// not depend on `ty`, so `System` is unreachable here. The two reads below are the documented
+// `R2IL_CORPUS` / `R2IL_PROFILE_*` overrides this example advertises in its own module docs.
+// Suppressed narrowly and visibly (`expect`, per the repo's "prefer expect over allow" rule).
+#![expect(
+    clippy::disallowed_methods,
+    reason = "not a ty crate: `System` is unavailable to this workspace-excluded crate; these are the example's documented env overrides"
+)]
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;

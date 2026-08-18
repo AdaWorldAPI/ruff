@@ -47,7 +47,6 @@ ruff_python_parser = { version = "0.0.17", path = "crates/ruff_python_parser" }
 ruff_python_semantic = { version = "0.0.17", path = "crates/ruff_python_semantic" }
 ruff_python_stdlib = { version = "0.0.17", path = "crates/ruff_python_stdlib" }
 ruff_python_trivia = { version = "0.0.17", path = "crates/ruff_python_trivia" }
-ruff_ruby_spo = { path = "crates/ruff_ruby_spo" }
 ruff_server = { version = "0.0.17", path = "crates/ruff_server" }
 ruff_source_file = { version = "0.0.17", path = "crates/ruff_source_file" }
 ruff_spo_triplet = { path = "crates/ruff_spo_triplet" }
