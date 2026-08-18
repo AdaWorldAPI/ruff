@@ -236,3 +236,7 @@ cython_debug/
 # Regenerate with `--example harvest_r2il`; see .claude/harvest/r2il/README.md.
 .claude/harvest/r2il/r2il-pass1.ore.tsv*
 .claude/harvest/r2il/r2il-convention.toml*
+
+# Agent-tool worktree isolation scratch (background subagents' live checkouts,
+# registered via `git worktree` — never repo content, never commit).
+.claude/worktrees/
