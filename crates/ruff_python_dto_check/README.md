@@ -55,7 +55,7 @@ for the full config schema.
 
 ## Output layout
 
-```
+```text
 out/
 ├── bundles/
 │   ├── <family>.ndjson     — one JSON object per line, one per matched function
@@ -82,9 +82,9 @@ Current implementation:
 - One matcher kind: `function_with_decorator`
 - Flask-style route detection via `@<expr>.route(...)` in the default profile
 - Config-driven emit fields (`def.name`, `def.params`, `def.body.source`,
-  `decorator.args[0]`, `decorator.kwargs.<name>`, etc.)
+    `decorator.args[0]`, `decorator.kwargs.<name>`, etc.)
 - Per-family observation block with set-algebra comparisons and percentile
-  distributions (no advisory English strings — pure content encoding)
+    distributions (no advisory English strings — pure content encoding)
 - Preflight subcommand with decorator histogram + framework fingerprint
 
 Out of scope for this iteration (reserved for future work):
