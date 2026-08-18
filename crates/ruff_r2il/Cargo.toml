@@ -37,6 +37,10 @@ required-features = ["lift"]
 name = "r2il_corpus_profile"
 required-features = ["lift"]
 
+[[example]]
+name = "r2il_roundtrip_oracle"
+required-features = ["lift"]
+
 [lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "warn"
