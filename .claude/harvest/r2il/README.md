@@ -22,11 +22,18 @@ curl -sL -o r2il-convention.toml.gz \
 zcat r2il-pass1.ore.tsv.gz | head        # read without unpacking
 ```
 
-**Scratch mirror:** S3 (Tigris), `s3://$AWS_S3_BUCKET_NAME/ruff-r2il/harvest/pass1/`
-— the full set including the small files, for cross-session scratch. Read via
-`AWS_ENDPOINT_URL` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from the
-environment; never hardcode an endpoint or a key. The Release is authoritative;
-S3 is a working mirror that may be pruned.
+**Scratch mirror:** S3 (Tigris), `s3://$AWS_S3_BUCKET_NAME/r2il-arc/harvest/`
+— the full set including the small files, plus `STAGED-CODEGEN-GUIDE.md`, for
+cross-session scratch. Read via `AWS_ENDPOINT_URL` / `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` from the environment; never hardcode an endpoint or a
+key. The Release is authoritative; S3 is a working mirror that may be pruned.
+
+The bucket is **shared** with other work (`q2`, `MedCare-rs`, `OSM`,
+`ontologies`, …), so everything this arc wrote lives under the single
+`r2il-arc/` prefix and nothing is written at the root. The one exception is the
+MedCare-rs config/harvest backup, which belongs to that repo's own prefix and
+sits at `MedCare-rs/harvest/2026-08-18/` — datestamped, per the
+`bakes/<name>-<date>/` convention already in use there.
 
 Both are gitignored, so a regenerate run leaves the tree clean.
 
