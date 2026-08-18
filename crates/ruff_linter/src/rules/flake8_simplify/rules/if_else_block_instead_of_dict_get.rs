@@ -205,11 +205,11 @@ pub(crate) fn if_else_block_instead_of_dict_get(checker: &Checker, stmt_if: &ast
         func: Box::new(node2.into()),
         arguments: Arguments {
             args: Box::from([node1, node]),
-            keywords: Box::from([]),
+            keywords: std::iter::empty().collect(),
             range: TextRange::default(),
             node_index: ruff_python_ast::AtomicNodeIndex::NONE,
         },
-        range: TextRange::default(),
+        range_start: ruff_text_size::TextSize::default(),
         node_index: ruff_python_ast::AtomicNodeIndex::NONE,
     };
     let node4 = expected_var.clone();
@@ -314,11 +314,11 @@ pub(crate) fn if_exp_instead_of_dict_get(
         func: Box::new(dict_get_node.into()),
         arguments: Arguments {
             args: Box::from([dict_key_node, default_value_node]),
-            keywords: Box::from([]),
+            keywords: std::iter::empty().collect(),
             range: TextRange::default(),
             node_index: ruff_python_ast::AtomicNodeIndex::NONE,
         },
-        range: TextRange::default(),
+        range_start: ruff_text_size::TextSize::default(),
         node_index: ruff_python_ast::AtomicNodeIndex::NONE,
     };
 

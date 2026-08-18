@@ -228,7 +228,7 @@ impl UnittestAssert {
     }
 
     /// Create a map from argument name to value.
-    pub(crate) fn args_map<'a>(
+    fn args_map<'a>(
         &'a self,
         args: &'a [Expr],
         keywords: &'a [Keyword],
@@ -393,11 +393,11 @@ impl UnittestAssert {
                     func: Box::new(node.into()),
                     arguments: Arguments {
                         args: Box::from([(**obj).clone(), (**cls).clone()]),
-                        keywords: Box::from([]),
+                        keywords: std::iter::empty().collect(),
                         range: TextRange::default(),
                         node_index: ruff_python_ast::AtomicNodeIndex::NONE,
                     },
-                    range: TextRange::default(),
+                    range_start: ruff_text_size::TextSize::default(),
                     node_index: ruff_python_ast::AtomicNodeIndex::NONE,
                 };
                 let isinstance = node1.into();
@@ -442,11 +442,11 @@ impl UnittestAssert {
                     func: Box::new(node1.into()),
                     arguments: Arguments {
                         args: Box::from([(**regex).clone(), (**text).clone()]),
-                        keywords: Box::from([]),
+                        keywords: std::iter::empty().collect(),
                         range: TextRange::default(),
                         node_index: ruff_python_ast::AtomicNodeIndex::NONE,
                     },
-                    range: TextRange::default(),
+                    range_start: ruff_text_size::TextSize::default(),
                     node_index: ruff_python_ast::AtomicNodeIndex::NONE,
                 };
                 let re_search = node2.into();

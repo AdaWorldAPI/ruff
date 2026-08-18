@@ -1,6 +1,7 @@
-use crate::{Db, types::BoundTypeVarInstance};
+use crate::Db;
+use crate::{ProgramEnvironment, types::BoundTypeVarIdentity};
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, get_size2::GetSize)]
 pub enum TypeVarVariance {
     Invariant,
     Covariant,
@@ -9,14 +10,6 @@ pub enum TypeVarVariance {
 }
 
 impl TypeVarVariance {
-    pub const fn bottom() -> Self {
-        TypeVarVariance::Bivariant
-    }
-
-    pub const fn top() -> Self {
-        TypeVarVariance::Invariant
-    }
-
     // supremum
     #[must_use]
     pub(crate) const fn join(self, other: Self) -> Self {
@@ -99,6 +92,17 @@ impl TypeVarVariance {
             TypeVarVariance::Contravariant | TypeVarVariance::Bivariant
         )
     }
+
+    /// Returns a human-readable name for this variance, matching the keyword
+    /// argument names used in `TypeVar(covariant=True)` / `TypeVar(contravariant=True)`.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            TypeVarVariance::Invariant => "invariant",
+            TypeVarVariance::Covariant => "covariant",
+            TypeVarVariance::Contravariant => "contravariant",
+            TypeVarVariance::Bivariant => "bivariant",
+        }
+    }
 }
 
 impl std::iter::FromIterator<Self> for TypeVarVariance {
@@ -130,7 +134,12 @@ pub(crate) trait VarianceInferable<'db>: Sized {
     ///
     /// Sometimes the recursive calls will be in positions where you need to
     /// specify a non-covariant polarity. See `with_polarity` for more details.
-    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance;
+    fn variance_of(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        typevar: BoundTypeVarIdentity<'db>,
+    ) -> TypeVarVariance;
 
     /// Creates a `VarianceInferable` that applies `polarity` (see
     /// `TypeVarVariance::compose`) to the result of variance inference on the
@@ -162,12 +171,17 @@ impl<'db, T> VarianceInferable<'db> for WithPolarity<T>
 where
     T: VarianceInferable<'db>,
 {
-    fn variance_of(self, db: &'db dyn Db, typevar: BoundTypeVarInstance<'db>) -> TypeVarVariance {
+    fn variance_of(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        typevar: BoundTypeVarIdentity<'db>,
+    ) -> TypeVarVariance {
         let WithPolarity {
             variance_inferable,
             polarity,
         } = self;
 
-        polarity.compose_thunk(|| variance_inferable.variance_of(db, typevar))
+        polarity.compose_thunk(|| variance_inferable.variance_of(db, env, typevar))
     }
 }

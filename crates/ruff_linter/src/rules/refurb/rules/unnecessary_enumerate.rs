@@ -248,11 +248,11 @@ fn generate_range_len_call(name: Name, generator: Generator) -> String {
         ),
         arguments: Arguments {
             args: Box::from([var.into()]),
-            keywords: Box::from([]),
+            keywords: std::iter::empty().collect(),
             range: TextRange::default(),
             node_index: ruff_python_ast::AtomicNodeIndex::NONE,
         },
-        range: TextRange::default(),
+        range_start: ruff_text_size::TextSize::default(),
         node_index: ruff_python_ast::AtomicNodeIndex::NONE,
     };
     // Construct `range(len(name))`.
@@ -268,11 +268,11 @@ fn generate_range_len_call(name: Name, generator: Generator) -> String {
         ),
         arguments: Arguments {
             args: Box::from([len.into()]),
-            keywords: Box::from([]),
+            keywords: std::iter::empty().collect(),
             range: TextRange::default(),
             node_index: ruff_python_ast::AtomicNodeIndex::NONE,
         },
-        range: TextRange::default(),
+        range_start: ruff_text_size::TextSize::default(),
         node_index: ruff_python_ast::AtomicNodeIndex::NONE,
     };
     // And finally, turn it into a statement.

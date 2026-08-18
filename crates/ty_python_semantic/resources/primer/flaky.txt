@@ -1,3 +1,2 @@
-prefect
-pydantic
-scikit-build-core
+meson
+steam.py

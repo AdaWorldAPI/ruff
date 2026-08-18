@@ -5,9 +5,13 @@
 Comparisons on union types need to consider all possible cases:
 
 ```py
-def _(flag: bool):
-    one_or_two = 1 if flag else 2
+from typing import Literal
 
+def _(
+    one_or_two: Literal[1, 2],
+    a_or_ab: Literal["a", "ab"],
+    one_or_none: Literal[1] | None,
+):
     reveal_type(one_or_two <= 2)  # revealed: Literal[True]
     reveal_type(one_or_two <= 1)  # revealed: bool
     reveal_type(one_or_two <= 0)  # revealed: Literal[False]
@@ -30,8 +34,6 @@ def _(flag: bool):
     reveal_type(one_or_two != 3)  # revealed: Literal[True]
     reveal_type(one_or_two != 1)  # revealed: bool
 
-    a_or_ab = "a" if flag else "ab"
-
     reveal_type(a_or_ab in "ab")  # revealed: Literal[True]
     reveal_type("a" in a_or_ab)  # revealed: Literal[True]
 
@@ -40,8 +42,6 @@ def _(flag: bool):
 
     reveal_type("b" in a_or_ab)  # revealed: bool
     reveal_type("b" not in a_or_ab)  # revealed: bool
-
-    one_or_none = 1 if flag else None
 
     reveal_type(one_or_none is None)  # revealed: bool
     reveal_type(one_or_none is not None)  # revealed: bool
@@ -53,10 +53,9 @@ With unions on both sides, we need to consider the full cross product of options
 resulting (union) type:
 
 ```py
-def _(flag_s: bool, flag_l: bool):
-    small = 1 if flag_s else 2
-    large = 2 if flag_l else 3
+from typing import Literal
 
+def _(small: Literal[1, 2], large: Literal[2, 3]):
     reveal_type(small <= large)  # revealed: Literal[True]
     reveal_type(small >= large)  # revealed: bool
 
@@ -93,7 +92,6 @@ error[unsupported-operator]: Unsupported `in` operation
    |              |    |
    |              |    Has type `list[int] | Literal[1]`
    |              Has type `Literal[1]`
-   |
 info: Operation fails because operator `in` is not supported between two objects of type `Literal[1]`
 ```
 
@@ -110,7 +108,6 @@ error[unsupported-operator]: Unsupported `in` operation
    |               -^^^^-
    |               |
    |               Both operands have type `list[int] | Literal[1]`
-   |
 info: Operation fails because operator `in` is not supported between objects of type `list[int]` and `Literal[1]`
 ```
 
@@ -127,7 +124,6 @@ error[unsupported-operator]: Unsupported `<` operation
    |               |    |
    |               |    Has type `tuple[str] | tuple[str, str]`
    |               Has type `tuple[int]`
-   |
 info: Operation fails because operator `<` is not supported between objects of type `int` and `str`
 ```
 
@@ -144,7 +140,6 @@ error[unsupported-operator]: Unsupported `<` operation
    |               |    |
    |               |    Has type `tuple[int]`
    |               Has type `tuple[str] | tuple[str, str]`
-   |
 info: Operation fails because operator `<` is not supported between objects of type `str` and `int`
 ```
 
@@ -161,6 +156,5 @@ error[unsupported-operator]: Unsupported `<` operation
    |               |    |
    |               |    Has type `tuple[str] | tuple[str, str]`
    |               Has type `tuple[int] | tuple[int, int]`
-   |
 info: Operation fails because operator `<` is not supported between objects of type `int` and `str`
 ```

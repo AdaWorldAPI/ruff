@@ -42,8 +42,8 @@ import types
 import unittest
 from _typeshed import ExcInfo
 from collections.abc import Callable
-from typing import Any, Final, NamedTuple, type_check_only
-from typing_extensions import Self, TypeAlias
+from typing import Any, Final, NamedTuple, TypeAlias, type_check_only
+from typing_extensions import Self
 
 __all__ = [
     "register_optionflag",
@@ -422,6 +422,12 @@ class DocTestRunner:
         it displays failures.  See the documentation for `testmod` for
         more information.
         """
+
+    if sys.version_info >= (3, 15):
+        def report_skip(self, out: _Out, test: DocTest, example: Example) -> None:
+            """
+            Report that the given example was skipped.
+            """
 
     def report_start(self, out: _Out, test: DocTest, example: Example) -> None:
         """

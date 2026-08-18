@@ -137,7 +137,7 @@ fn collect_nested_args(min_max: MinMax, args: &[Expr], semantic: &SemanticModel)
                         range: _,
                         node_index: _,
                     },
-                range: _,
+                range_start: _,
                 node_index: _,
             }) = arg
             {
@@ -203,11 +203,11 @@ pub(crate) fn nested_min_max(
             func: Box::new(func.clone()),
             arguments: Arguments {
                 args: collect_nested_args(min_max, args, checker.semantic()).into_boxed_slice(),
-                keywords: Box::from(keywords),
+                keywords: keywords.iter().cloned().collect(),
                 range: TextRange::default(),
                 node_index: ruff_python_ast::AtomicNodeIndex::NONE,
             },
-            range: TextRange::default(),
+            range_start: ruff_text_size::TextSize::default(),
             node_index: ruff_python_ast::AtomicNodeIndex::NONE,
         });
         diagnostic.set_fix(Fix::unsafe_edit(Edit::range_replacement(

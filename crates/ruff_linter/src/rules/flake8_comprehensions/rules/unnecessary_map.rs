@@ -6,6 +6,7 @@ use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{self as ast, Expr, ExprContext, Parameters, Stmt};
 use ruff_python_ast::{ExprLambda, visitor};
 use ruff_python_semantic::SemanticModel;
+use ruff_text_size::Ranged;
 
 use crate::Fix;
 use crate::checkers::ast::Checker;
@@ -146,7 +147,7 @@ pub(crate) fn unnecessary_map(checker: &Checker, call: &ast::ExprCall) {
         return;
     }
 
-    let mut diagnostic = checker.report_diagnostic(UnnecessaryMap { object_type }, call.range);
+    let mut diagnostic = checker.report_diagnostic(UnnecessaryMap { object_type }, call.range());
     diagnostic.try_set_fix(|| {
         fixes::fix_unnecessary_map(
             call,
@@ -208,6 +209,10 @@ fn lambda_has_expected_arity(lambda: &ExprLambda) -> bool {
         return false;
     };
 
+    if parameters.len() != 1 {
+        return false;
+    }
+
     let [parameter] = &*parameters.args else {
         return false;
     };
@@ -215,11 +220,6 @@ fn lambda_has_expected_arity(lambda: &ExprLambda) -> bool {
     if parameter.default.is_some() {
         return false;
     }
-
-    if parameters.vararg.is_some() || parameters.kwarg.is_some() {
-        return false;
-    }
-
     if late_binding(parameters, &lambda.body) {
         return false;
     }

@@ -92,6 +92,97 @@ def exhaustiveness_using_containment_checks():
         assert_never(norm_str)
 ```
 
+## Checks on fixed-length tuples
+
+Finite tuple elements are expanded into their Cartesian product when checking whether a `match`
+statement is exhaustive. The expansion is used only for reachability; it does not affect the
+inferred type of the subject or pattern captures.
+
+```py
+def constructed_bool_tuple(b_1: bool, b_2: bool) -> int:
+    match (b_1, b_2):
+        case (True, True):
+            return 0
+        case (False, _):
+            return 1
+        case (_, False):
+            return 2
+
+def direct_bool_tuple(pair: tuple[bool, bool]) -> int:
+    match pair:
+        case (True, True):
+            return 0
+        case (False, _):
+            return 1
+        case (_, False):
+            return 2
+
+def non_exhaustive_bool_tuple(pair: tuple[bool, bool]) -> int:  # error: [invalid-return-type]
+    match pair:
+        case (True, True):
+            return 0
+        case (False, _):
+            return 1
+
+def guarded_bool_tuple(pair: tuple[bool, bool], flag: bool) -> int:  # error: [invalid-return-type]
+    match pair:
+        case (True, True) if flag:
+            return 0
+        case (False, _):
+            return 1
+        case (_, False):
+            return 2
+```
+
+Although this tuple has 128 possible value combinations, the patterns only constrain the first two
+positions. Tuple-pattern fallthrough only expands positions that can fail, so it can prove the match
+exhaustive without enumerating the remaining elements.
+
+```py
+def tuple_expands_only_constrained_positions(
+    value: tuple[bool, bool, bool, bool, bool, bool, bool],
+) -> int:
+    match value:
+        case (True, True, _, _, _, _, _):
+            return 0
+        case (False, _, _, _, _, _, _):
+            return 1
+        case (_, False, _, _, _, _, _):
+            return 2
+```
+
+Tuple length alone does not prevent exhaustive sequence-pattern checking. The patterns below
+constrain only the first element, and together they cover every possible value of the tuple.
+
+```py
+# fmt: off
+LongBoolTuple = tuple[
+    bool, bool, bool, bool, bool, bool, bool, bool, bool, bool,
+    bool, bool, bool, bool, bool, bool, bool, bool, bool, bool,
+    bool, bool, bool, bool, bool, bool, bool, bool, bool, bool,
+    bool, bool, bool, bool, bool, bool, bool, bool, bool, bool,
+    bool, bool, bool, bool, bool, bool, bool, bool, bool, bool,
+    bool, bool, bool, bool, bool, bool, bool, bool, bool, bool,
+    bool, bool, bool, bool, bool,
+]
+
+def long_tuple_with_one_constrained_position(value: LongBoolTuple) -> int:
+    match value:
+        case (
+            True, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+            _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+            _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+        ):
+            return 0
+        case (
+            False, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+            _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+            _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+        ):
+            return 1
+# fmt: on
+```
+
 ## Checks on enum literals
 
 ```py
@@ -192,6 +283,134 @@ def match_non_exhaustive(x: Color):
             assert_never(x)  # error: [type-assertion-failure]
 ```
 
+Matching every named member is not exhaustive for `Flag` classes.
+
+Custom `_missing_` methods technically could create a new undeclared member via `object.__new__`,
+but this is also possible outside a `_missing_` method. We choose to in general ignore this
+possibility; we don't assume that a `_missing_` method will do this.
+
+```py
+from enum import Enum, Flag
+
+class Permission(Flag):
+    READ = 1
+
+class MissingValueEnum(Enum):
+    ONLY = 1
+
+    @classmethod
+    def _missing_(cls, value: object) -> "MissingValueEnum":
+        return cls.ONLY
+
+def match_flag(value: Permission) -> int:  # error: [invalid-return-type]
+    match value:
+        case Permission.READ:
+            return 1
+
+def match_custom_missing_enum(value: MissingValueEnum) -> int:
+    match value:
+        case MissingValueEnum.ONLY:
+            return 1
+```
+
+## Checks on enums with custom missing methods
+
+An enum remains exhaustive when it overrides `_missing_`, even if its value comes from a function
+with the enum as its return type.
+
+```py
+from enum import Enum
+from typing import assert_never
+
+class FallbackColor(Enum):
+    RED = 1
+    BLUE = 2
+
+    @classmethod
+    def _missing_(cls, value: object) -> "FallbackColor":
+        return FallbackColor.RED
+
+def get_color() -> FallbackColor:
+    return FallbackColor.BLUE
+
+color = get_color()
+match color:
+    case FallbackColor.RED:
+        pass
+    case FallbackColor.BLUE:
+        pass
+    case _:
+        assert_never(color)
+```
+
+## Checks on enum literal subsets
+
+```py
+from enum import Enum
+from typing import Literal, assert_never
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+    ORANGE = 4
+
+def match_exhaustive_literal_or_pattern(v: Literal[Color.RED, Color.GREEN, Color.BLUE]) -> None:
+    match v:
+        case Color.RED | Color.GREEN | Color.BLUE:
+            pass
+        case _:
+            assert_never(v)
+
+def match_exhaustive_literal_or_non_enum_pattern(v: Literal[Color.RED, Color.GREEN, Color.BLUE]) -> None:
+    match v:
+        case Color.RED | Color.GREEN | Color.BLUE | int():
+            pass
+        case _:
+            assert_never(v)
+
+def match_exhaustive_literal_grouped_or_pattern(v: Literal[Color.RED, Color.GREEN, Color.BLUE]) -> None:
+    match v:
+        case (Color.RED | Color.GREEN) | Color.BLUE:
+            pass
+        case _:
+            assert_never(v)
+
+def match_exhaustive_literal_or_as_pattern(v: Literal[Color.RED, Color.GREEN]) -> None:
+    match v:
+        case (Color.RED | Color.GREEN) as selected:
+            pass
+        case _:
+            assert_never(v)
+
+def match_overlapping_or_arm_is_reachable(v: Literal[Color.RED, Color.GREEN, Color.BLUE]) -> None:
+    match v:
+        case Color.RED:
+            pass
+        case Color.RED | Color.GREEN | Color.BLUE:
+            assert_never(v)  # error: [type-assertion-failure]
+
+def match_class_pattern_arm_is_reachable(v: Literal[Color.RED, Color.GREEN, Color.BLUE]) -> None:
+    match v:
+        case Color.RED | Color.GREEN:
+            pass
+        case Color():
+            assert_never(v)  # error: [type-assertion-failure]
+
+def match_mixed_or_arm_is_reachable(v: Literal[Color.RED]) -> None:
+    match v:
+        case Color.BLUE | Color():
+            assert_never(v)  # error: [type-assertion-failure]
+
+def match_non_exhaustive_literal_or_pattern(v: Literal[Color.RED, Color.GREEN, Color.BLUE]) -> None:
+    match v:
+        case Color.RED | Color.GREEN:
+            pass
+        case _:
+            # this diagnostic is correct: inferred type of `v` is `Literal[Color.BLUE]`
+            assert_never(v)  # error: [type-assertion-failure]
+```
+
 ## `isinstance` checks
 
 ```toml
@@ -281,7 +500,7 @@ def match_exhaustive_generic[T](obj: GenericClass[T]) -> GenericClass[T]:
             reveal_type(obj)  # revealed: GenericClass[T@match_exhaustive_generic]
             return obj
         case GenericClass(x=x):
-            reveal_type(x)  # revealed: @Todo(`match` pattern definition types)
+            reveal_type(x)  # revealed: T@match_exhaustive_generic
             reveal_type(obj)  # revealed: GenericClass[T@match_exhaustive_generic]
             return obj
 ```
@@ -632,4 +851,42 @@ def i(x: ComplexN) -> bool:
         return True
     elif isinstance(x, complex):
         return False
+```
+
+## `isinstance` checks with `Callable`
+
+```toml
+[environment]
+python-version = "3.12"
+
+[rules]
+possibly-unresolved-reference = "error"
+```
+
+The final `Callable` check is exhaustive. These examples deliberately omit an `else` branch and any
+terminal-call assertions so that reachability is determined by the `isinstance` checks alone.
+
+```py
+from collections.abc import Callable
+from typing import Callable as TypingCallable
+
+def assigned(x: Callable[[int], int] | dict[str, int]) -> int:
+    if isinstance(x, dict):
+        result = 1
+    elif isinstance(x, Callable):
+        result = 2
+    return result
+
+def returns(x: Callable[[int], int] | dict[str, int]) -> int:
+    if isinstance(x, dict):
+        return 1
+    elif isinstance(x, TypingCallable):
+        return 2
+
+def match_exhaustive(x: Callable[[int], int] | dict[str, int]) -> int:
+    match x:
+        case dict():
+            return 1
+        case Callable():
+            return 2
 ```

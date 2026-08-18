@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lsp_types::Position;
+use lsp_types::{Documentation, MarkupKind, Position};
 use ruff_db::system::SystemPath;
 use ty_server::ClientOptions;
 
@@ -79,6 +79,233 @@ walktr
     Ok(())
 }
 
+#[test]
+fn complete_function_parentheses_disabled_by_default() -> Result<()> {
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+def complete_parentheses() -> None: ...
+
+complete_parenth
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_initialization_options(ClientOptions::default())
+        .enable_completion_snippets(true)
+        .with_workspace(workspace_root, None)?
+        .with_file(foo, foo_content)?
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(foo, foo_content, 1);
+
+    let completions = server.completion_request(&server.file_uri(foo), Position::new(2, 16));
+    insta::assert_json_snapshot!(completions, @r#"
+    [
+      {
+        "label": "complete_parentheses",
+        "kind": 3,
+        "detail": "def complete_parentheses() -> None",
+        "sortText": "0"
+      }
+    ]
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn complete_function_parentheses() -> Result<()> {
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+def complete_parentheses() -> None: ...
+
+complete_parenth
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_initialization_options(
+            ClientOptions::default().with_complete_function_parentheses(true),
+        )
+        .enable_completion_snippets(true)
+        .with_trigger_parameter_hints_command()
+        .with_workspace(workspace_root, None)?
+        .with_file(foo, foo_content)?
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(foo, foo_content, 1);
+
+    let completions = server.completion_request(&server.file_uri(foo), Position::new(2, 16));
+    insta::assert_json_snapshot!(completions, @r#"
+    [
+      {
+        "label": "complete_parentheses",
+        "kind": 3,
+        "detail": "def complete_parentheses() -> None",
+        "sortText": "0",
+        "insertText": "complete_parentheses($0)",
+        "insertTextFormat": 2,
+        "command": {
+          "title": "Trigger parameter hints",
+          "command": "ty.triggerParameterHints"
+        }
+      }
+    ]
+    "#);
+
+    Ok(())
+}
+
+/// Tests that the signature-help command is omitted when the client has not
+/// advertised support for it (for example, editors that would surface an
+/// "unsupported command" error).
+#[test]
+fn complete_function_parentheses_without_command_support() -> Result<()> {
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+def complete_parentheses() -> None: ...
+
+complete_parenth
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_initialization_options(
+            ClientOptions::default().with_complete_function_parentheses(true),
+        )
+        .enable_completion_snippets(true)
+        .with_workspace(workspace_root, None)?
+        .with_file(foo, foo_content)?
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(foo, foo_content, 1);
+
+    let completions = server.completion_request(&server.file_uri(foo), Position::new(2, 16));
+    insta::assert_json_snapshot!(completions, @r#"
+    [
+      {
+        "label": "complete_parentheses",
+        "kind": 3,
+        "detail": "def complete_parentheses() -> None",
+        "sortText": "0",
+        "insertText": "complete_parentheses($0)",
+        "insertTextFormat": 2
+      }
+    ]
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn complete_function_parentheses_without_snippet_support() -> Result<()> {
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+def complete_parentheses() -> None: ...
+
+complete_parenth
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_initialization_options(
+            ClientOptions::default().with_complete_function_parentheses(true),
+        )
+        .with_workspace(workspace_root, None)?
+        .with_file(foo, foo_content)?
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(foo, foo_content, 1);
+
+    let completions = server.completion_request(&server.file_uri(foo), Position::new(2, 16));
+    insta::assert_json_snapshot!(completions, @r#"
+    [
+      {
+        "label": "complete_parentheses",
+        "kind": 3,
+        "detail": "def complete_parentheses() -> None",
+        "sortText": "0",
+        "insertText": "complete_parentheses()"
+      }
+    ]
+    "#);
+
+    Ok(())
+}
+
+#[test]
+fn complete_function_parentheses_preserves_qualified_label() -> Result<()> {
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+import typing
+
+is_typedd
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_initialization_options(
+            ClientOptions::default().with_complete_function_parentheses(true),
+        )
+        .enable_completion_snippets(true)
+        .with_trigger_parameter_hints_command()
+        .with_workspace(workspace_root, None)?
+        .with_file(foo, foo_content)?
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(foo, foo_content, 1);
+
+    let completions = server.completion_request(&server.file_uri(foo), Position::new(2, 8));
+    insta::assert_json_snapshot!(completions, @r#"
+    [
+      {
+        "label": "typing.is_typeddict",
+        "kind": 3,
+        "sortText": "0",
+        "insertText": "typing.is_typeddict($0)",
+        "insertTextFormat": 2,
+        "command": {
+          "title": "Trigger parameter hints",
+          "command": "ty.triggerParameterHints"
+        }
+      },
+      {
+        "label": "is_typeddict (import typing_extensions)",
+        "kind": 3,
+        "sortText": "1",
+        "insertText": "is_typeddict($0)",
+        "insertTextFormat": 2,
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from typing_extensions import is_typeddict\n"
+          }
+        ],
+        "command": {
+          "title": "Trigger parameter hints",
+          "command": "ty.triggerParameterHints"
+        }
+      }
+    ]
+    "#);
+
+    Ok(())
+}
+
 /// Tests that auto-import completions show the fully
 /// qualified form when it will insert it for you. Also,
 /// that an `import` won't be shown when it won't
@@ -119,9 +346,72 @@ TypedDi<CURSOR>
         "insertText": "typing.is_typeddict"
       },
       {
+        "label": "TypedDict (import typing_extensions)",
+        "kind": 6,
+        "sortText": "2",
+        "insertText": "TypedDict",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from typing_extensions import TypedDict\n"
+          }
+        ]
+      },
+      {
+        "label": "TypedDictFallback (import _typeshed._type_checker_internals)",
+        "kind": 7,
+        "sortText": "3",
+        "insertText": "TypedDictFallback",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from _typeshed._type_checker_internals import TypedDictFallback\n"
+          }
+        ]
+      },
+      {
+        "label": "is_typeddict (import typing_extensions)",
+        "kind": 3,
+        "sortText": "4",
+        "insertText": "is_typeddict",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from typing_extensions import is_typeddict\n"
+          }
+        ]
+      },
+      {
         "label": "_FilterConfigurationTypedDict (import logging.config)",
         "kind": 7,
-        "sortText": "2",
+        "sortText": "5",
         "insertText": "_FilterConfigurationTypedDict",
         "additionalTextEdits": [
           {
@@ -142,7 +432,7 @@ TypedDi<CURSOR>
       {
         "label": "_FormatterConfigurationTypedDict (import logging.config)",
         "kind": 6,
-        "sortText": "3",
+        "sortText": "6",
         "insertText": "_FormatterConfigurationTypedDict",
         "additionalTextEdits": [
           {
@@ -157,6 +447,27 @@ TypedDi<CURSOR>
               }
             },
             "newText": "from logging.config import _FormatterConfigurationTypedDict\n"
+          }
+        ]
+      },
+      {
+        "label": "_typeshed.dbapi (import _typeshed.dbapi)",
+        "kind": 9,
+        "sortText": "7",
+        "insertText": "_typeshed.dbapi",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "import _typeshed.dbapi\n"
           }
         ]
       }
@@ -233,9 +544,72 @@ TypedDi<CURSOR>
         ]
       },
       {
+        "label": "TypedDict (import typing_extensions)",
+        "kind": 6,
+        "sortText": "2",
+        "insertText": "TypedDict",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from typing_extensions import TypedDict\n"
+          }
+        ]
+      },
+      {
+        "label": "TypedDictFallback (import _typeshed._type_checker_internals)",
+        "kind": 7,
+        "sortText": "3",
+        "insertText": "TypedDictFallback",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from _typeshed._type_checker_internals import TypedDictFallback\n"
+          }
+        ]
+      },
+      {
+        "label": "is_typeddict (import typing_extensions)",
+        "kind": 3,
+        "sortText": "4",
+        "insertText": "is_typeddict",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "from typing_extensions import is_typeddict\n"
+          }
+        ]
+      },
+      {
         "label": "_FilterConfigurationTypedDict (import logging.config)",
         "kind": 7,
-        "sortText": "2",
+        "sortText": "5",
         "insertText": "_FilterConfigurationTypedDict",
         "additionalTextEdits": [
           {
@@ -256,7 +630,7 @@ TypedDi<CURSOR>
       {
         "label": "_FormatterConfigurationTypedDict (import logging.config)",
         "kind": 6,
-        "sortText": "3",
+        "sortText": "6",
         "insertText": "_FormatterConfigurationTypedDict",
         "additionalTextEdits": [
           {
@@ -271,6 +645,27 @@ TypedDi<CURSOR>
               }
             },
             "newText": "from logging.config import _FormatterConfigurationTypedDict\n"
+          }
+        ]
+      },
+      {
+        "label": "_typeshed.dbapi (import _typeshed.dbapi)",
+        "kind": 9,
+        "sortText": "7",
+        "insertText": "_typeshed.dbapi",
+        "additionalTextEdits": [
+          {
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            },
+            "newText": "import _typeshed.dbapi\n"
           }
         ]
       }
@@ -442,4 +837,78 @@ take({\"\"})
     "#);
 
     Ok(())
+}
+
+#[test]
+fn documentation_prefers_markdown_when_listed_first() -> Result<()> {
+    assert_eq!(
+        documentation_format(vec![MarkupKind::Markdown, MarkupKind::PlainText])?,
+        MarkupKind::Markdown,
+    );
+    Ok(())
+}
+
+#[test]
+fn documentation_prefers_plain_text_when_listed_first() -> Result<()> {
+    assert_eq!(
+        documentation_format(vec![MarkupKind::PlainText, MarkupKind::Markdown])?,
+        MarkupKind::PlainText,
+    );
+    Ok(())
+}
+
+#[test]
+fn documentation_supports_only_markdown() -> Result<()> {
+    assert_eq!(
+        documentation_format(vec![MarkupKind::Markdown])?,
+        MarkupKind::Markdown
+    );
+    Ok(())
+}
+
+#[test]
+fn documentation_supports_only_plain_text() -> Result<()> {
+    assert_eq!(
+        documentation_format(vec![MarkupKind::PlainText])?,
+        MarkupKind::PlainText
+    );
+    Ok(())
+}
+
+fn documentation_format(formats: Vec<MarkupKind>) -> Result<MarkupKind> {
+    let workspace_root = SystemPath::new("src");
+    let document_path = SystemPath::new("src/foo.py");
+    let document_content = r#"def foo_with_documentation() -> None:
+    """
+    Example doc comment
+    """
+    ...
+
+foo_
+"#;
+    let mut server = TestServerBuilder::new()?
+        .with_workspace(workspace_root, None)?
+        .with_file(document_path, document_content)?
+        .with_completion_documentation_format(formats)
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(document_path, document_content, 1);
+
+    let completions =
+        server.completion_request(&server.file_uri(document_path), Position::new(6, 4));
+
+    let completion = completions
+        .into_iter()
+        .find(|completion| completion.label == "foo_with_documentation")
+        .expect("Completion of function should exist");
+    let documentation = completion
+        .documentation
+        .expect("Expected documentation in completion");
+
+    let Documentation::MarkupContent(markup) = documentation else {
+        panic!("Expected markup documentation");
+    };
+
+    Ok(markup.kind)
 }

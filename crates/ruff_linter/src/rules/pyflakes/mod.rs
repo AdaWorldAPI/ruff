@@ -134,6 +134,7 @@ mod tests {
     #[test_case(Rule::RedefinedWhileUnused, Path::new("F811_32.py"))]
     #[test_case(Rule::RedefinedWhileUnused, Path::new("F811_33.pyi"))]
     #[test_case(Rule::RedefinedWhileUnused, Path::new("F811_35.py"))]
+    #[test_case(Rule::RedefinedWhileUnused, Path::new("F811_36.py"))]
     #[test_case(Rule::UndefinedName, Path::new("F821_0.py"))]
     #[test_case(Rule::UndefinedName, Path::new("F821_1.py"))]
     #[test_case(Rule::UndefinedName, Path::new("F821_2.py"))]
@@ -171,6 +172,7 @@ mod tests {
     #[test_case(Rule::UndefinedName, Path::new("F821_32.pyi"))]
     #[test_case(Rule::UndefinedName, Path::new("F821_33.py"))]
     #[test_case(Rule::UndefinedName, Path::new("F821_34.pyi"))]
+    #[test_case(Rule::UndefinedName, Path::new("F821_34.py"))]
     #[test_case(Rule::UndefinedExport, Path::new("F822_0.py"))]
     #[test_case(Rule::UndefinedExport, Path::new("F822_0.pyi"))]
     #[test_case(Rule::UndefinedExport, Path::new("F822_1.py"))]
@@ -221,10 +223,8 @@ mod tests {
     fn f821_with_builtin_added_on_new_py_version_but_old_target_version_specified() {
         let diagnostics = test_snippet(
             "PythonFinalizationError",
-            &LinterSettings {
-                unresolved_target_version: ruff_python_ast::PythonVersion::PY312.into(),
-                ..LinterSettings::for_rule(Rule::UndefinedName)
-            },
+            &LinterSettings::for_rule(Rule::UndefinedName)
+                .with_target_version(ruff_python_ast::PythonVersion::PY312),
         );
         assert_diagnostics!(diagnostics);
     }
@@ -234,10 +234,8 @@ mod tests {
         // frozendict is available starting in Python 3.15.
         let diagnostics = test_snippet(
             "frozendict",
-            &LinterSettings {
-                unresolved_target_version: ruff_python_ast::PythonVersion::PY315.into(),
-                ..LinterSettings::for_rule(Rule::UndefinedName)
-            },
+            &LinterSettings::for_rule(Rule::UndefinedName)
+                .with_target_version(ruff_python_ast::PythonVersion::PY315),
         );
         assert!(diagnostics.is_empty());
     }
@@ -247,10 +245,8 @@ mod tests {
         // frozendict is not available before Python 3.15.
         let diagnostics = test_snippet(
             "frozendict",
-            &LinterSettings {
-                unresolved_target_version: ruff_python_ast::PythonVersion::PY314.into(),
-                ..LinterSettings::for_rule(Rule::UndefinedName)
-            },
+            &LinterSettings::for_rule(Rule::UndefinedName)
+                .with_target_version(ruff_python_ast::PythonVersion::PY314),
         );
         assert_diagnostics!(diagnostics);
     }
@@ -263,6 +259,7 @@ mod tests {
     #[test_case(Rule::UnusedImport, Path::new("F401_28__all_multiple/__init__.py"))]
     #[test_case(Rule::UnusedImport, Path::new("F401_29__all_conditional/__init__.py"))]
     #[test_case(Rule::UndefinedExport, Path::new("__init__.py"))]
+    #[test_case(Rule::RedefinedWhileUnused, Path::new("F811_36.py"))]
     fn preview_rules(rule_code: Rule, path: &Path) -> Result<()> {
         let snapshot = format!(
             "preview__{}_{}",
@@ -271,10 +268,7 @@ mod tests {
         );
         let diagnostics = test_path(
             Path::new("pyflakes").join(path).as_path(),
-            &LinterSettings {
-                preview: PreviewMode::Enabled,
-                ..LinterSettings::for_rule(rule_code)
-            },
+            &LinterSettings::for_rule(rule_code).with_preview_mode(),
         )?;
         assert_diagnostics!(snapshot, diagnostics);
         Ok(())
@@ -468,10 +462,7 @@ mod tests {
             snapshot,
             Path::new("pyflakes").join(path).as_path(),
             &LinterSettings::for_rule(rule_code),
-            &LinterSettings {
-                preview: PreviewMode::Enabled,
-                ..LinterSettings::for_rule(rule_code)
-            }
+            &LinterSettings::for_rule(rule_code).with_preview_mode()
         );
         Ok(())
     }
@@ -609,10 +600,7 @@ mod tests {
                 is_stub: false,
             },
             Path::new("f401_preview_submodule.py"),
-            &LinterSettings {
-                preview: PreviewMode::Enabled,
-                ..LinterSettings::for_rule(Rule::UnusedImport)
-            },
+            &LinterSettings::for_rule(Rule::UnusedImport).with_preview_mode(),
         )
         .0;
         assert_diagnostics!(snapshot, diagnostics);
@@ -754,10 +742,7 @@ mod tests {
     fn f811_annotated_assignment_redefinition() -> Result<()> {
         let diagnostics = test_path(
             Path::new("pyflakes/F811_34.py"),
-            &LinterSettings {
-                preview: PreviewMode::Enabled,
-                ..LinterSettings::for_rule(Rule::RedefinedWhileUnused)
-            },
+            &LinterSettings::for_rule(Rule::RedefinedWhileUnused).with_preview_mode(),
         )?;
         assert_diagnostics!(diagnostics);
         Ok(())
@@ -1226,6 +1211,21 @@ mod tests {
         // Use of the C{__builtins__} magic global should not emit an undefined
         // name warning.
         flakes("__builtins__", &[]);
+    }
+
+    #[test]
+    fn builtin_after_exception_target_cleanup() {
+        flakes(
+            r"
+            try:
+                pass
+            except Exception as len:
+                pass
+
+            print(len)
+            ",
+            &[Rule::UnusedVariable],
+        );
     }
 
     #[test]
@@ -4486,7 +4486,7 @@ lambda: fu
     }
 
     #[test]
-    fn idiomiatic_typing_guards() {
+    fn idiomatic_typing_guards() {
         // typing.TYPE_CHECKING: python3.5.3+.
         flakes(
             r"

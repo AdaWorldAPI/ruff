@@ -53,7 +53,7 @@ use crate::{Edit, Fix, FixAvailability, Violation};
 /// `XCom` layout, and a function with multiple return paths may not always
 /// return a dict.
 #[derive(ViolationMetadata)]
-#[violation_metadata(preview_since = "NEXT_RUFF_VERSION")]
+#[violation_metadata(preview_since = "0.15.14")]
 pub(crate) struct AirflowTaskImplicitMultipleOutputs {
     annotation_is_mapping: bool,
 }
@@ -221,7 +221,7 @@ fn annotation_is_typed_dict_subclass(annotation: &Expr, semantic: &SemanticModel
     };
     let Some(binding_id) = semantic
         .resolve_name(name)
-        .or_else(|| semantic.lookup_symbol(&name.id))
+        .or_else(|| semantic.lookup_symbol(&name.id).binding_id())
     else {
         return false;
     };

@@ -27,7 +27,6 @@ error[invalid-syntax]: cannot use an asynchronous comprehension inside of a sync
   |
 6 |     return {n: [x async for x in elements(n)] for n in range(3)}
   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
 ```
 
 If all of the comprehensions are `async`, on the other hand, the code was still valid:
@@ -44,7 +43,6 @@ error[not-iterable]: Object of type `range` is not async-iterable
   |
 9 |     return [[x async for x in elements(n)] async for n in range(3)]
   |                                                           ^^^^^^^^
-  |
 info: It has no `__aiter__` method
 ```
 
@@ -199,6 +197,87 @@ Walrus operators cannot rebind variables already in use as iterators:
 
 # error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
 {y := 5 for y in range(10)}
+
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[(a := 0) for a in range(3)]
+# error: [unresolved-reference]
+reveal_type(a)  # revealed: Unknown
+
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[i for i in range(5) if (i := 0)]
+# error: [unresolved-reference]
+reveal_type(i)  # revealed: Unknown
+
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[(item := 0) for (item, other) in [(0, 1)]]
+
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[x for x in [1] if (y := x) for y in [1]]
+
+[x for x in [0] if [(y := z) for z in [1]] for y in [2]]
+
+# An active outer target remains active within a nested result.
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[[(outer := 1) for _ in []] for outer in []]
+
+# An active outer target remains active within a nested filter.
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[[a for a in [] if (outer := 1)] for outer in []]
+
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[(x := 1).bit_length() for x in [0]]
+# error: [unresolved-reference]
+reveal_type(x)  # revealed: Unknown
+
+[x for x in range(3) if (lambda: (x := 1))()]
+# error: [unresolved-reference]
+reveal_type(x)  # revealed: Unknown
+
+[outer for outer in range(3) if (lambda: [(outer := 1) for _ in [0]])()]
+# error: [unresolved-reference]
+reveal_type(outer)  # revealed: Unknown
+```
+
+## Walrus in invalid comprehension contexts
+
+```py
+class C:
+    # error: [invalid-syntax] "assignment expression within a comprehension cannot be used in a class body"
+    [(x := y) for y in range(3)]
+    # error: [unresolved-reference]
+    reveal_type(x)  # revealed: Unknown
+
+class D:
+    # Lambda bodies own their walrus targets.
+    [(lambda: (local := 1))() for local in [0]]
+
+    # Lambda defaults are evaluated in the enclosing comprehension scope.
+    # error: [invalid-syntax] "assignment expression within a comprehension cannot be used in a class body"
+    [(lambda value=(default := 1): value)() for item in [0]]
+
+def returns_list() -> list[int]:
+    return [1, 2, 3]
+
+# error: [invalid-syntax] "assignment expression cannot be used in a comprehension iterable expression"
+[x for x in (y := returns_list())]
+
+# error: [invalid-syntax] "assignment expression cannot be used in a comprehension iterable expression"
+[x for x in (z := returns_list()).copy()]
+
+def invalid_later_iterable():
+    # error: [invalid-syntax] "assignment expression cannot be used in a comprehension iterable expression"
+    [item for item in [0] for _ in (escaped := [1])]
+    # error: [unresolved-reference]
+    reveal_type(escaped)  # revealed: Unknown
+
+# error: [invalid-syntax] "assignment expression cannot be used in a comprehension iterable expression"
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[a for a in [(b := 1) for b in [1]]]
+
+xs = [1]
+# error: [invalid-syntax] "assignment expression cannot be used in a comprehension iterable expression"
+# error: [invalid-syntax] "assignment expression cannot rebind comprehension variable"
+[x for x in xs if [z for z in (x := xs)]]
 ```
 
 ## Multiple case assignments
@@ -416,7 +495,6 @@ error[invalid-syntax]: `break` outside loop
   |
 1 | break  # snapshot: invalid-syntax
   | ^^^^^
-  |
 
 
 error[invalid-syntax]: `continue` outside loop
@@ -424,7 +502,6 @@ error[invalid-syntax]: `continue` outside loop
   |
 2 | continue  # snapshot: invalid-syntax
   | ^^^^^^^^
-  |
 
 
 error[invalid-syntax]: `break` outside loop
@@ -432,7 +509,6 @@ error[invalid-syntax]: `break` outside loop
   |
 9 |         break  # snapshot: invalid-syntax
   |         ^^^^^
-  |
 
 
 error[invalid-syntax]: `continue` outside loop
@@ -440,7 +516,6 @@ error[invalid-syntax]: `continue` outside loop
    |
 10 |         continue  # snapshot: invalid-syntax
    |         ^^^^^^^^
-   |
 
 
 error[invalid-syntax]: `break` outside loop
@@ -448,7 +523,6 @@ error[invalid-syntax]: `break` outside loop
    |
 14 |         break  # snapshot: invalid-syntax
    |         ^^^^^
-   |
 
 
 error[invalid-syntax]: `continue` outside loop
@@ -456,7 +530,6 @@ error[invalid-syntax]: `continue` outside loop
    |
 15 |         continue  # snapshot: invalid-syntax
    |         ^^^^^^^^
-   |
 ```
 
 ## name cannot refer to a parameter and a global variable
@@ -501,7 +574,6 @@ error[invalid-syntax]: name `a` cannot refer to a parameter and a global variabl
   |
 4 |     global a  # snapshot: invalid-syntax
   |            ^
-  |
 
 
 error[invalid-syntax]: name `a` cannot refer to a parameter and a global variable
@@ -509,7 +581,6 @@ error[invalid-syntax]: name `a` cannot refer to a parameter and a global variabl
   |
 8 |         global a  # snapshot: invalid-syntax
   |                ^
-  |
 
 
 error[invalid-syntax]: name `a` cannot refer to a parameter and a global variable
@@ -517,7 +588,6 @@ error[invalid-syntax]: name `a` cannot refer to a parameter and a global variabl
    |
 16 |         global a  # snapshot: invalid-syntax
    |                ^
-   |
 
 
 error[invalid-syntax]: name `a` cannot refer to a parameter and a global variable
@@ -525,7 +595,6 @@ error[invalid-syntax]: name `a` cannot refer to a parameter and a global variabl
    |
 22 |     global a  # snapshot: invalid-syntax
    |            ^
-   |
 
 
 error[invalid-syntax]: name `a` cannot refer to a parameter and a global variable
@@ -533,5 +602,60 @@ error[invalid-syntax]: name `a` cannot refer to a parameter and a global variabl
    |
 27 |     global a  # snapshot: invalid-syntax
    |            ^
-   |
+```
+
+## name cannot refer to a parameter and a nonlocal variable
+
+```py
+a = None
+
+def outer():
+    a = None
+    def f(a):
+        nonlocal a  # snapshot: invalid-syntax
+
+def outer():
+    a = None
+    def g(a):
+        if True:
+            nonlocal a  # error: [invalid-syntax]
+
+def h(a):
+    def inner():
+        nonlocal a
+
+def outer():
+    a = None
+    def i(a):
+        try:
+            nonlocal a  # error: [invalid-syntax]
+        except Exception:
+            pass
+
+def outer():
+    a = None
+    def f(a):
+        a = 1
+        a = 2
+        nonlocal a  # error: [invalid-syntax]
+
+def f(a):
+    class Inner:
+        nonlocal a
+
+def f(a):
+    def inner(a):
+        nonlocal a  # error: [invalid-syntax]
+
+def f(a=1):
+    def inner():
+        nonlocal a
+```
+
+```snapshot
+error[invalid-syntax]: name `a` cannot refer to a parameter and a nonlocal variable
+ --> src/mdtest_snippet.py:6:18
+  |
+6 |         nonlocal a  # snapshot: invalid-syntax
+  |                  ^
 ```

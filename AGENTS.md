@@ -4,33 +4,82 @@ This repository contains both Ruff (a Python linter and formatter) and ty (a Pyt
 
 The `ruff_*_spo` crates (`ruff_ruby_spo`, `ruff_python_spo`, `ruff_csharp_spo`, `ruff_cpp_spo`, `ruff_spo_triplet`, …) are the AdaWorldAPI **SPO/transcode** side — AST → `(subject, predicate, object)` fact harvest feeding the OGAR transpiler. Methods for that side are curated in `.claude/knowledge/` (each with a `READ BY:` header) and applied by agents in `.claude/agents/`. **Before harvesting method-body facts or lowering a behaviour arm, read `.claude/knowledge/fuzzy-recipe-codebook.md`** — it teaches how to cook a `(verb, criteria)` recipe codebook and correlate fuzzy imperative bodies to declarative recipes, rather than transcribing bodies. The `fuzzy-proposer` agent carries that method. **Before starting (or resuming) any whole legacy-app→Rust transcode — odoo→odoo-rs, redmine/OpenProject→openproject-nexgen-rs, WoA→woa-rs (worked reference: MedCare→MedCare-rs) — read `.claude/knowledge/consumer-transcode-furnace-playbook.md`** — it frames the loop *around* the codebook: the ore/slag furnace, the two parity oracles (value + Klickwege structure), the three-axis mint gate, the no-hand-roll rule, and a per-consumer portability map.
 
+## Code Review Rules
+
+When reviewing a branch or pull request, be deliberately nitpicky. Report not
+only bugs and regressions, but also architectural and maintenance risks, weak
+test coverage, unclear code, unnecessary complexity, and meaningful style or
+consistency issues. Order findings by severity, cite files and lines, and
+distinguish blockers from non-blocking improvements. Number each review point
+for easy reference in subsequent review discussion.
+
+During code review, check the proposed changes against all applicable code, test,
+documentation, and architectural conventions in this `AGENTS.md`. Report
+meaningful violations introduced by the changes; do not apply agent-only workflow
+instructions to PR authors or flag unrelated pre-existing issues.
+
 ## Running Tests
 
-Run all tests (using `nextest` for faster execution, setting `CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_DEBUG="line-tables-only"` to enable optimizations while retaining some debug info, and setting `INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1` to ensure all snapshots are updated):
+Run all tests (using `nextest` for faster execution and setting `INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1` to ensure all snapshots are updated):
 
 ```sh
-CARGO_PROFILE_DEV_OPT_LEVEL=1 INSTA_FORCE_PASS=1 INSTA_UPDATE=always CARGO_PROFILE_DEV_DEBUG="line-tables-only" MDTEST_UPDATE_SNAPSHOTS=1 cargo nextest run
+INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1 cargo nextest run
 ```
+
+File-watcher tests do not work inside the sandbox. It is usually unnecessary to run them locally before filing a change unless you are certain that the change affects file-watching behavior.
 
 Run tests for a specific crate:
 
 ```sh
-CARGO_PROFILE_DEV_OPT_LEVEL=1 INSTA_FORCE_PASS=1 INSTA_UPDATE=always CARGO_PROFILE_DEV_DEBUG="line-tables-only" MDTEST_UPDATE_SNAPSHOTS=1 cargo nextest run -p ty_python_semantic
+INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1 cargo nextest run -p ty_python_semantic
 ```
 
-Run a single mdtest file. The path to the mdtest file should be relative to the `crates/ty_python_semantic/resources/mdtest` folder:
+Run a single mdtest file. The path to the mdtest file should be relative to the `crates/ty_python_semantic/resources/mdtest` folder. Include `--test mdtest` to avoid building unrelated test binaries:
 
 ```sh
-CARGO_PROFILE_DEV_OPT_LEVEL=1 INSTA_FORCE_PASS=1 INSTA_UPDATE=always CARGO_PROFILE_DEV_DEBUG="line-tables-only" MDTEST_UPDATE_SNAPSHOTS=1 cargo nextest run -p ty_python_semantic -- mdtest::<path/to/mdtest_file.md>
+INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1 cargo nextest run -p ty_python_semantic --test mdtest -- mdtest::<path/to/mdtest_file.md>
 ```
 
 To run a specific mdtest within a file, use a substring of the Markdown header text as `MDTEST_TEST_FILTER`. Only use this if it's necessary to isolate a single test case:
 
 ```sh
-MDTEST_TEST_FILTER="<filter>" CARGO_PROFILE_DEV_OPT_LEVEL=1 INSTA_FORCE_PASS=1 INSTA_UPDATE=always CARGO_PROFILE_DEV_DEBUG="line-tables-only" MDTEST_UPDATE_SNAPSHOTS=1 cargo nextest run -p ty_python_semantic -- mdtest::<path/to/mdtest_file.md>
+MDTEST_TEST_FILTER="<filter>" INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1 cargo nextest run -p ty_python_semantic --test mdtest -- mdtest::<path/to/mdtest_file.md>
 ```
 
+### Fallback without nextest
+
+If `cargo nextest` is not available, use `cargo test` with the same environment variables:
+
+```sh
+# Run all tests.
+INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1 cargo test
+
+# Run tests for a specific crate.
+INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1 cargo test -p ty_python_semantic
+
+# Run a single mdtest file.
+INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1 cargo test -p ty_python_semantic --test mdtest -- <path/to/mdtest_file.md>
+
+# Run a specific mdtest within a file.
+MDTEST_TEST_FILTER="<filter>" INSTA_FORCE_PASS=1 INSTA_UPDATE=always MDTEST_UPDATE_SNAPSHOTS=1 cargo test -p ty_python_semantic --test mdtest -- <path/to/mdtest_file.md>
+```
+
+### Snapshot updates
+
 After running the tests, always review the contents of any snapshots that have been added or updated.
+
+When running tests with `INSTA_FORCE_PASS=1`, check for `.pending-snap` files if any affected tests use inline snapshots.
+
+Never edit snapshot files or inline snapshot bodies manually. Regenerate them by running the relevant tests with the snapshot-update environment variables documented above, then review the generated diff.
+
+## Writing mdtests
+
+- Write mdtests as readable, literate specifications, and minimize the context a reader must hold in mind. Prefer short, focused code blocks, and define types, fixtures, and helpers close to the assertions that use them. Give independent scenarios separate sibling Markdown test headings at the same level; only introduce child headings if any existing code beneath their parent is first moved into child sections. When scenarios need shared setup, interleave short prose-and-code blocks under the same heading. Code blocks for the same file within a section are concatenated, so do not repeat imports or definitions.
+- Prioritize document structure and readability over avoiding duplicated setup. Add a test to an existing section when its heading accurately describes the new scenario, adding or improving introductory prose as needed; otherwise, create a separate sibling section, even if that requires repeating a small fixture.
+- Introduce each scenario with a short prose paragraph explaining the code immediately below. Use clear, precise terminology. Avoid using jargon where it's unnecessary, and avoid inventing new jargon if there's an existing term of art used in that file. Avoid long paragraphs covering multiple scenarios followed by a single long code block.
+- Minimize regression examples to the behavior under test. When adapting real-world code or an issue reproducer, remove incidental types, methods, type parameters, imports, and domain-specific details. Preserve complexity only when necessary to reproduce the regression or distinguish the intended behavior, and reuse nearby fixtures or simple built-in types when doing so keeps the test easy to understand.
+- Prefer a minimal, purpose-built custom type over a standard-library type when a regression depends on particular attributes, methods, bounds, or constraints. Define the relevant behavior in the test so readers do not need to look up the standard-library type to understand the scenario. For commonly used standard-library types, consider adding a separate regression using the real type to protect against changes in typeshed.
+- Place each mdtest in a file for the behavior it actually tests, and assert that behavior directly. Prefer an existing file when one already covers that behavior; create a new file when no existing file is a good fit. Do not choose a file solely because its directive or helper can express the assertion.
 
 ## Running Clippy
 
@@ -54,34 +103,82 @@ Run ty:
 cargo run --bin ty -- check path/to/file.py
 ```
 
-## Reproducing and minimizing ty ecosystem changes
+## Working on ty
 
-If asked to reproduce changes in the ty ecosystem, use this script to clone the project to some
-directory and install its dependencies into `.venv`:
+The guidance in this section applies to edits to `ty*` crates, reviews of ty PRs, or other work when the ty type checker has been specifically mentioned by the user.
+
+### Related skills
+
+When the task matches a more specific ty workflow, also read and follow that skill from the repository root:
+
+- Diagnostic changes, diagnostic message changes, or diagnostic reviews: `.agents/skills/adding-ty-diagnostics/SKILL.md`.
+- Ecosystem report summaries: `.agents/skills/summarise-ecosystem-results/SKILL.md`.
+- Reproducing, investigating, or minimizing ecosystem or primer differences: `.agents/skills/minimizing-ty-ecosystem-changes/SKILL.md`.
+
+### Completion ranking
+
+When changing ty autocomplete ranking, add or update evaluation fixtures under `crates/ty_completion_eval/truth/`. Extend an existing project when it is a good fit for the behavior being tested; otherwise, add a new one. Use `<CURSOR:expected_name>` directives to assert ranking, and include the expected module for auto-import completions. Add `completion.rs` unit tests only when the evaluation fixtures cannot adequately cover the behavior.
+
+Regenerate and review the committed evaluation results after changing ranking behavior or fixtures:
 
 ```sh
-uv run scripts/setup_primer_project.py <project-name> <some-temp-dir>
+CARGO_PROFILE_DEV_OPT_LEVEL=1 CARGO_PROFILE_DEV_LTO=off CARGO_PROFILE_DEV_DEBUG="line-tables-only" cargo run --package ty_completion_eval -- all --threshold 0.4 --tasks crates/ty_completion_eval/completion-evaluation-tasks.csv
 ```
 
-If asked to *minimize* a change in the ty ecosystem, you should start off with the above command to ensure that the change reproduces. You should then attempt to minimize the Python code required to demonstrate a behaviour difference between ty on your feature branch and ty on the main branch. Your minimization process should consist of systematically removing files from the cloned ecosystem project, and stripping content from existing files, until the behaviour difference between your branch and `main` no longer reproduces.
+To inspect one evaluation task, run `cargo run --package ty_completion_eval -- show-one <fixture-name> --file-name <file-name> --index <cursor-index>`.
 
-## Pull Requests
+### Ad hoc reproductions
 
-When working on ty, PR titles should start with `[ty]` and be tagged with the `ty` GitHub label.
+When running ty against a temporary Python reproduction file, create it outside the Ruff checkout (for example, under `/tmp`). A file inside the checkout discovers Ruff's root `pyproject.toml`, whose `requires-python = ">=3.7"` causes ty to infer Python 3.7 as the default Python version.
+
+### PR conventions
+
+When working on ty, PR titles should start with `[ty]`. Add the `ty` GitHub label if you have permission to do so;
+if you don't, however, automation should add it anyway, so there's no need to worry about it. Similarly, add the `server`
+label if your change only affects the LSP server and you have permission to add that label.
+
+### The `db` parameter
+
+For free functions and associated functions without a `self` parameter, `db` should be the first parameter. For methods with a `self` parameter, `db` should come immediately after `self`.
+
+### Salsa tips
+
+#### Tracked functions and methods
+
+Adding `#[salsa::tracked]` to a function or method means that the Salsa framework will cache the function/method.
+This can sometimes be done for performance reasons, and can also be done to ensure incremental computation in an
+IDE context.
+
+Methods that access `.node()` should usually be `#[salsa::tracked]`, or ty's incrementality will suffer:
+we don't want to accidentally introduce a dependency on module `a`'s AST in a Salsa query that would be
+called when type-checking module `b`. Prefer higher-level semantic APIs over raw AST access where possible,
+but ask for guidance from the user if this would require significant refactoring.
+
+#### Reduce memory usage where possible
+
+For Salsa-cached values, avoid retaining excess collection capacity. Prefer boxed slices; otherwise shrink collections that may have spare capacity before returning them. In particular, inspect `HashMap` and `HashSet` values constructed via `extend`, `collect`, explicit reservation, or removal, since those operations can leave capacity that insert-only construction does not.
+
+Salsa caching can occur due to a function/method having `#[salsa::tracked]` on it, or due to a struct with `#[salsa::interned]` being constructed.
+
+## Generated Release Workflow
+
+Parts of `.github/workflows/release.yml` are generated by cargo-dist from `dist-workspace.toml`. Before editing the release workflow, check whether the relevant section is generated. Prefer changing `dist-workspace.toml` or the referenced reusable workflow instead of editing generated YAML. After modifying cargo-dist configuration, regenerate the workflow with the cargo-dist version pinned in `dist-workspace.toml` and inspect the resulting diff to ensure the change will survive future regenerations.
 
 ## Development Guidelines
 
-- All changes must be tested. If you're not testing your changes, you're not done.
+- All significant changes must be tested. Add or update focused tests for semantic changes when existing coverage does not already establish the intended behavior.
 - Look to see if your tests could go in an existing file before adding a new file for your tests.
 - Get your tests to pass. If you didn't run the tests, your code does not work.
 - Follow existing code style. Check neighboring files for patterns.
+- Prefer narrow visibility by default because this workspace is generally its own consumer. However, do not add workarounds solely to avoid `pub`: make an item public when another workspace crate needs it and that produces the cleaner implementation.
 - Rust imports should always go at the top of the file, never locally in functions.
-- Run `uvx prek` at the end of a task if you changed files in the repo. This includes changes such as rebases or addressing review comments. Prefer a branch-scoped run like `uvx prek run --from-ref '@{upstream}'`, which checks files changed relative to the current branch's configured upstream. If the branch has no configured upstream, use the intended base branch explicitly, usually `uvx prek run --from-ref main`. Use `uvx prek run -a` when a full-repository hook sweep is specifically needed.
-- Avoid writing significant amounts of new code. This is often a sign that we're missing an existing method or mechanism that could help solve the problem. Look for existing utilities first.
-- Try hard to avoid patterns that require `panic!`, `unreachable!`, or `.unwrap()`. Instead, try to encode those constraints in the type system. Don't be afraid to write code that's more verbose or requires largeish refactors if it enables you to avoid these unsafe calls.
-- Prefer let chains (`if let` combined with `&&`) over nested `if let` statements to reduce indentation and improve readability. At the end of a task, always check your work to see if you missed opportunities to use `let` chains.
+- Run `uv run --only-group dev --locked prek` at the end of a task if you changed files in the repo. This includes changes such as rebases or addressing review comments. Use `uv run --only-group dev --locked prek run --files <path1> <path2>` and pass every file you changed. This keeps the hook run independent of staged state and avoids sweeping unrelated changes. Use `uv run --only-group dev --locked prek run --all-files` when a full-repository hook sweep is specifically needed.
+- Before writing significant amounts of new code, look for existing utilities or mechanisms that could solve the problem. Avoid expanding the task to unrelated issues, but do not confuse keeping the task focused with minimizing the size of the implementation. Prefer addressing the underlying architectural problem over adding a localized workaround, even when doing so requires a substantial refactor or rearchitecture. Ask the user for guidance if in doubt about whether to attempt a larger refactor or not.
+- Try hard to avoid patterns that require `panic!`, `unreachable!`, `.unwrap()` or `.expect()`. Instead, try to encode those constraints in the type system. Don't be afraid to write code that's more verbose or requires largeish refactors if it enables you to avoid these unsafe calls.
+- Prefer let chains (`if let` combined with `&&`) and let guards (`PAT if let ... =>`) over nested `if let` statements to reduce indentation and improve readability. At the end of a task, always check your work to see if you missed opportunities to use `let` chains or `let` guards.
 - If you *have* to suppress a Clippy lint, prefer to use `#[expect()]` over `[allow()]`, where possible. But if a lint is complaining about unused/dead code, it's usually best to just delete the unused code.
-- Use comments purposefully. Don't use comments to narrate code, but do use them to explain invariants and why something unusual was done a particular way.
-- When adding new ty checks, it's important to make error messages concise. Think about how an error message would look on a narrow terminal screen. Sometimes more detail can be provided in subdiagnostics or secondary annotations, but it's also important to make sure that the diagnostic is understandable if the user has passed `--output-format=concise`.
-- **Salsa incrementality (ty):** Any method that accesses `.node()` must be `#[salsa::tracked]`, or it will break incrementality. Prefer higher-level semantic APIs over raw AST access.
+- Don't use comments to narrate code, but do use them to explain invariants and why something unusual was done a particular way. Make sure that a comment will make sense to somebody who's reading the code for the first time. Prefer plain language, avoid jargon, and don't be afraid to be more verbose if it's necessary to explain something well. Giving examples of the kind of Python code we're trying to model at this particular point in Ruff or ty can often be very helpful for future readers of the code.
 - Run `cargo dev generate-all` after changing configuration options, CLI arguments, lint rules, or environment variable definitions, as these changes require regeneration of schemas, docs, and CLI references.
+- Don't prefix tests with `test_`.
+- Don't separate struct definitions from their `impl` blocks unless the `impl` is deliberately placed in a separate file, as for large structs.
+- Avoid running `uv run` for any scripts from the repository root unless you use `--no-project`, `--script` or similar. Using `uv run` from the Ruff repo root without these flags will build Ruff from source, which is very slow and usually unnecessary.
