@@ -2205,6 +2205,12 @@ mod tests {
         // action is `leaf` — never `root`, since this triple set carries no
         // navigates_to/selects_view out-edges for `menu_roots` to key off.
         let mut parentless_checked = 0usize;
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "each entry is checked independently against only its own \
+                value and a running count; the assertions below do not depend \
+                on iteration order"
+        )]
         for (node, (loc, action)) in &lines {
             if !parent_of.contains_key(node) {
                 assert_eq!(
