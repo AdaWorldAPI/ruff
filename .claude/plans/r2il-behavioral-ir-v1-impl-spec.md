@@ -86,7 +86,7 @@ strings is forbidden as a data path. Therefore:
     round-trips.
 - The join is **verified, not assumed**: at each site compare `OpTag::from_op(ssa_op)` against the
     R2IL op's tag; a mismatch (the `Multiequal` index shift, or a `CallDefine` insertion) emits
-    `ResidualReason::OpSiteJoinMismatch`, never a silently mis-attributed coordinate.
+    `ResidualReason::OpSiteJoinMismatch`, never a silently misattributed coordinate.
 - Rows with no source varnode (phi inputs, `CallDefine`) get `at: None` and become the **named**
     residual `ResidualReason::NoFacetCoordinate`. Nothing is dropped.
 
