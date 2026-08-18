@@ -57,11 +57,11 @@ dotnet run --project crates/ruff_csharp_spo/harvester/CSharpSpoHarvester.csproj 
 All optional; defaults reproduce the original EF-Core-flavoured behaviour, so
 existing invocations are unaffected.
 
-| flag                           | default                                                       | what it does                                                                                                                                                                                                                                                                      |
-| ------------------------------ | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--ns <name>`                  | `csharp`                                                      | IRI namespace prefix for every subject/object                                                                                                                                                                                                                                    |
-| `--mutator-names a,b,c`        | the EF Core set (`SaveChanges`, `Update`, `Add`, `Remove`, …) | exact method names that make a `calls` fact fire — **replaces** the default set when given                                                                                                                                                                                        |
-| `--mutator-prefixes add_,del_` | none                                                          | method-name *prefixes* that also count as mutators — for bespoke ADO.NET DALs with a naming convention instead of a fixed method set                                                                                                                                              |
+| flag                           | default                                                       | what it does                                                                                                                                                                                                                                                               |
+| ------------------------------ | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--ns <name>`                  | `csharp`                                                      | IRI namespace prefix for every subject/object                                                                                                                                                                                                                              |
+| `--mutator-names a,b,c`        | the EF Core set (`SaveChanges`, `Update`, `Add`, `Remove`, …) | exact method names that make a `calls` fact fire — **replaces** the default set when given                                                                                                                                                                                 |
+| `--mutator-prefixes add_,del_` | none                                                          | method-name *prefixes* that also count as mutators — for bespoke ADO.NET DALs with a naming convention instead of a fixed method set                                                                                                                                       |
 | `--mutator-receivers mysql`    | none (any receiver)                                           | restricts the `calls` fact to invocations whose receiver's last identifier segment is in this list — `main.mysql.add_x(...)` matches receiver `mysql`; a form's own `set_Foo(...)` does not. **Applies to every mutator match**, name-set or prefix-based alike, once set. |
 
 A name match is `--mutator-names` (exact) **OR** `--mutator-prefixes` (prefix)
@@ -81,15 +81,15 @@ The scaffold walks the **syntax layer** and emits the structural facts every
 class carries. Subjects/objects are namespaced with the `--ns` prefix
 (`csharp:` by default).
 
-| C# construct                             | SPO triple                                                                                                                        |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `class Invoice`                          | `(csharp:Invoice, rdf:type, ogit:ObjectType)`                                                                                     |
-| `: DbBase` / `: IFoo`                    | `(csharp:Invoice, inherits_from, csharp:DbBase)`                                                                                  |
-| `string number { get; set; }` / field    | `(csharp:Invoice, has_field, csharp:Invoice.number)` + `(…​.number, rdf:type, ogit:Property)` + `(…​.number, field_type, string)`   |
-| `void Save()`                            | `(csharp:Invoice, has_function, csharp:Invoice.Save)` + `(…​.Save, rdf:type, ogit:Function)`                                       |
-| `static` method                          | `(csharp:Invoice.Save, is_static, true)`                                                                                          |
-| `int Foo(int x, string y)`               | `(csharp:Invoice.Foo, returns_type, int)` + `(…​.Foo, has_param_type, "0:int")` + `(…​.Foo, has_param_type, "1:string")`            |
-| method access specifier (always present) | `(csharp:Invoice.Foo, has_visibility, "public"\|"protected"\|"private")`                                                          |
+| C# construct                             | SPO triple                                                                                                                      |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `class Invoice`                          | `(csharp:Invoice, rdf:type, ogit:ObjectType)`                                                                                   |
+| `: DbBase` / `: IFoo`                    | `(csharp:Invoice, inherits_from, csharp:DbBase)`                                                                                |
+| `string number { get; set; }` / field    | `(csharp:Invoice, has_field, csharp:Invoice.number)` + `(…​.number, rdf:type, ogit:Property)` + `(…​.number, field_type, string)` |
+| `void Save()`                            | `(csharp:Invoice, has_function, csharp:Invoice.Save)` + `(…​.Save, rdf:type, ogit:Function)`                                     |
+| `static` method                          | `(csharp:Invoice.Save, is_static, true)`                                                                                        |
+| `int Foo(int x, string y)`               | `(csharp:Invoice.Foo, returns_type, int)` + `(…​.Foo, has_param_type, "0:int")` + `(…​.Foo, has_param_type, "1:string")`          |
+| method access specifier (always present) | `(csharp:Invoice.Foo, has_visibility, "public"\|"protected"\|"private")`                                                        |
 
 All predicates above are in the closed vocabulary already (shared with the
 C++/Rails frontends). NARS truth is `(f=1.0, c=0.9)` — the declared/structural

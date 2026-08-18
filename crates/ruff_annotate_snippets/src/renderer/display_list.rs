@@ -1267,9 +1267,8 @@ fn format_snippet<'m>(
 }
 
 #[inline]
-// TODO: option_zip
 fn zip_opt<A, B>(a: Option<A>, b: Option<B>) -> Option<(A, B)> {
-    a.and_then(|a| b.map(|b| (a, b)))
+    a.zip(b)
 }
 
 fn format_header<'a>(

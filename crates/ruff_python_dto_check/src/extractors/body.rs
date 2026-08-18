@@ -129,7 +129,7 @@ pub fn extract_body(func: &StmtFunctionDef, profile: &ExtractionProfile) -> Body
         soft_delete: false,
     };
 
-    // Decorators feed guard predicates (auth, modul, tenant gates).
+    // Decorators feed guard predicates (auth, module, tenant gates).
     for dec in &func.decorator_list {
         if let Some(name) = guard_name(&dec.expression) {
             w.guards.push(name);
@@ -245,7 +245,7 @@ impl Walker<'_> {
                     }
                 }
                 // else/finally commonly carry the return + side-effects;
-                // skipping them mis-classifies OutputKind (Codex P2).
+                // skipping them misclassifies OutputKind (Codex P2).
                 for s in &t.orelse {
                     self.walk_stmt(s);
                 }

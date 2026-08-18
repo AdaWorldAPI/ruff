@@ -104,7 +104,7 @@ use crate::triple::{EntityKind, Predicate, Provenance, Triple};
 /// `(s, p, o)` is produced twice with different provenance, the
 /// first-in-sort-order (which, after sort, is deterministic but provenance-
 /// arbitrary) wins. Frontends should not emit conflicting provenance for
-/// one identity; [`crate::ndjson`] round-trips assume a clean IR.
+/// one identity; `crate::ndjson` round-trips assume a clean IR.
 #[must_use]
 pub fn expand(graph: &ModelGraph) -> Vec<Triple> {
     let mut exp = Expander::new();

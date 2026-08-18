@@ -540,6 +540,10 @@ impl NarrowRange<'_> {
             // The challenge here is that the second line of the multiline string uses a 4 space indentation. Using `dedent` would
             // dedent the second line to 0 spaces and the `indent` then adds a 2 space indentation to match the indentation in the source.
             // This is incorrect because the leading whitespace is the content of the string and not indentation, resulting in changed string content.
+            #[expect(
+                clippy::question_mark,
+                reason = "the else branch documents why the None case must not narrow the range"
+            )]
             if let Some(indentation) =
                 indentation_at_offset(first_child.start(), self.context.source())
             {

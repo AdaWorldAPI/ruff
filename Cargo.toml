@@ -1,5 +1,11 @@
 [workspace]
 members = ["crates/*"]
+# ruff_r2il is a workspace-EXCLUDED standalone crate (its own workspace root):
+# it path-deps the r2sleigh sibling checkout (r2il/r2ssa), and exclusion keeps
+# the main workspace and its Cargo.lock sibling-free. Build it via
+# `cargo <cmd> --manifest-path crates/ruff_r2il/Cargo.toml`.
+# See .claude/plans/r2il-behavioral-ir-v1.md.
+exclude = ["crates/ruff_r2il"]
 resolver = "2"
 
 [workspace.package]
@@ -38,7 +44,6 @@ ruff_python_parser = { path = "crates/ruff_python_parser" }
 ruff_python_semantic = { path = "crates/ruff_python_semantic" }
 ruff_python_stdlib = { path = "crates/ruff_python_stdlib" }
 ruff_python_trivia = { path = "crates/ruff_python_trivia" }
-ruff_ruby_spo = { path = "crates/ruff_ruby_spo" }
 ruff_server = { path = "crates/ruff_server" }
 ruff_source_file = { path = "crates/ruff_source_file" }
 ruff_spo_triplet = { path = "crates/ruff_spo_triplet" }

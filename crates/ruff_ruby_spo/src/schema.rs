@@ -202,12 +202,12 @@ const COLUMN_TYPES: &[&str] = &[
 /// model are recorded in the report — the join-table population is real
 /// and expected (`changesets_work_packages` et al. have no AR class).
 ///
-/// After the column merge, a **compute-linkage pass** ([`link_computed_fields`])
+/// After the column merge, a **compute-linkage pass** (`link_computed_fields`)
 /// runs over every model: a `def compute_<x>` whose class ALSO has a
 /// (schema-merged) field named `<x>` gets `field.emitted_by = Some("compute_<x>")`
 /// — the Rails-side equivalent of Odoo's declared `compute=`. This only ever
 /// runs here (the schema-aware path), because the model-only stratum
-/// ([`crate::extract_fields`]) never populates `fields` at all — the pass
+/// (`crate::extract_fields`) never populates `fields` at all — the pass
 /// would be a no-op there. It never synthesizes a `Field` from a method name
 /// alone: linkage requires the field to already exist.
 ///
@@ -215,11 +215,11 @@ const COLUMN_TYPES: &[&str] = &[
 ///
 /// `<root>/db/migrate/tables/` is checked first: if it contains any `.rb`
 /// file, this is the `OpenProject`-style squashed baseline and the
-/// [`parse_tables_dir`] path runs, followed by
-/// [`replay_post_baseline_migrations`] (module doc: "Post-baseline
+/// `parse_tables_dir` path runs, followed by
+/// `replay_post_baseline_migrations` (module doc: "Post-baseline
 /// replay"). Otherwise, if `<root>/db/migrate/` itself contains any `.rb`
 /// file, this is a classic Rails app (Redmine and similar — no baseline
-/// squash, only the full migration history) and [`parse_migrations_dir`]
+/// squash, only the full migration history) and `parse_migrations_dir`
 /// runs instead — untouched by this pass. Neither directory existing
 /// leaves [`SchemaReport::tables_seen`] at zero, same as before the classic
 /// fallback was added.

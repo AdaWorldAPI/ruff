@@ -11,6 +11,10 @@ extend-exclude = [
     "crates/ty_ide/src/completion.rs",
     # Same for "Did you mean...?" levenshtein tests.
     "crates/ty_python_semantic/src/diagnostic/levenshtein.rs",
+    # Generated harvest evidence: hashes, addresses and opcode tags, not prose.
+    # The hook read the hex `a8ad31e12dbe9f80` as a misspelling and dropped a
+    # digit, breaking the shape_id join between two sections of the ledger.
+    ".claude/harvest/**/*",
 ]
 
 [default.extend-words]
@@ -26,6 +30,17 @@ BA = "BA" # acronym for "Bad Allowed", used in testing.
 jod = "jod" # e.g., `jod-thread`
 Numer = "Numer" # Library name 'NumerBlox' in "Who's Using Ruff?"
 CPY = "CPY"  # it's a Ruff rule category
+# P-code / R2IL opcode names, not prose. INT_SCARRY is signed-carry; the
+# hook's "scary" correction silently corrupts an emitted wire tag.
+scarry = "scarry"
+# Tesseract really does ship `src/ccstruct/statistc.h` under that spelling.
+# "Correcting" it points the harvest docs at a file that does not exist.
+statistc = "statistc"
+# `oce` is the C# harvester's local for an ObjectCreationExpressionSyntax
+# pattern binding; `tage` is a legacy column name carried by a codegen fixture.
+# Both are identifiers under test — renaming them changes what is exercised.
+oce = "oce"
+tage = "tage"
 
 [default]
 extend-ignore-re = [

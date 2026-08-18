@@ -1,16 +1,16 @@
 //! `ruff_spo_address` — the deterministic `(part_of:is_a)` rank-minter.
 //!
 //! This is the one genuinely-new brick between the `ruff_*_spo` SPO harvest and
-//! the lance-graph `(part_of:is_a)` GUID SoA (see lance-graph
+//! the lance-graph `(part_of:is_a)` GUID `SoA` (see lance-graph
 //! `.claude/knowledge/ast-as-partof-isa-address.md` — "The missing brick"). The
-//! carrier ([`lance_graph_contract::facet::FacetCascade`], shipped #613/#614) is
+//! carrier (`lance_graph_contract::facet::FacetCascade`, shipped #613/#614) is
 //! already there; this crate fills the *mint*.
 //!
 //! Given a corpus's two structural relations:
 //!
-//! - **part_of** (mereology / membership) — harvested as `has_field` /
-//!   `has_function` (`class → member`, so the member is *part_of* the class);
-//! - **is_a** (taxonomy / typing) — harvested as `inherits_from` (`class →
+//! - **`part_of`** (mereology / membership) — harvested as `has_field` /
+//!   `has_function` (`class → member`, so the member is *`part_of`* the class);
+//! - **`is_a`** (taxonomy / typing) — harvested as `inherits_from` (`class →
 //!   base`) and, for leaves, `rdf:type` (`member → kind`);
 //!
 //! it assigns every node a deterministic `(part_of_rank, is_a_rank)` at each of
@@ -26,7 +26,7 @@
 //!
 //! So [`Facet::part_of_chain`] == `FacetCascade::hi_chain` and
 //! [`Facet::is_a_chain`] == `FacetCascade::lo_chain`. Both chains are
-//! **prefix-routable**: two nodes in the same part_of subtree share a leading
+//! **prefix-routable**: two nodes in the same `part_of` subtree share a leading
 //! `part_of_chain` prefix (a `documentSymbol` / containment query is a longest-
 //! common-prefix), and two nodes under the same supertype share a leading
 //! `is_a_chain` prefix (a `typeHierarchy` walk).
@@ -44,15 +44,15 @@
 //! saturated rank at every tier their facets collide. Verified against a real
 //! multi-thousand-node corpus, the failure has two distinct causes: **God-
 //! classes** (a single class with hundreds of fields, e.g. a large UI form)
-//! overflowing the part_of axis, and **flat is_a roots** (a kind-discriminator
+//! overflowing the `part_of` axis, and **flat `is_a` roots** (a kind-discriminator
 //! type with thousands of direct children, e.g. every "Property" or "Function"
-//! node parented straight under one root) overflowing the is_a axis. So
+//! node parented straight under one root) overflowing the `is_a` axis. So
 //! "exact" holds for a class graph whose every sibling set is ≤ 255 and depth
 //! ≤ 6 — NOT for arbitrary real corpora. The flat-is_a-root case is the
 //! dominant one and is addressable: a member's *kind* (e.g. Property/Function)
 //! belongs in its `facet_classid`, not in a 6-tier sibling rank under a
 //! mega-root. [`mint_factored`] is the corrected minter that fixes both
-//! failure modes (base-255 positional part_of paths + is_a built from
+//! failure modes (base-255 positional `part_of` paths + `is_a` built from
 //! `inherits_from` only, kind moved to a bounded leaf enum).
 //!
 //! # `facet_classid`
@@ -114,14 +114,14 @@ impl Facet {
         u32::from_le_bytes([self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]])
     }
 
-    /// The **part_of** chain (coarse→fine) — the `FacetCascade` `hi_chain`.
+    /// The **`part_of`** chain (coarse→fine) — the `FacetCascade` `hi_chain`.
     #[must_use]
     pub const fn part_of_chain(self) -> [u8; TIERS] {
         let b = &self.bytes;
         [b[5], b[7], b[9], b[11], b[13], b[15]]
     }
 
-    /// The **is_a** chain (coarse→fine) — the `FacetCascade` `lo_chain`.
+    /// The **`is_a`** chain (coarse→fine) — the `FacetCascade` `lo_chain`.
     #[must_use]
     pub const fn is_a_chain(self) -> [u8; TIERS] {
         let b = &self.bytes;
@@ -130,7 +130,7 @@ impl Facet {
 }
 
 /// The result of minting a corpus: each node's [`Facet`], plus the nodes whose
-/// part_of/is_a depth exceeded the 6 tiers (or whose sibling count exceeded the
+/// `part_of/is_a` depth exceeded the 6 tiers (or whose sibling count exceeded the
 /// 255-per-tier byte) and were therefore truncated.
 #[derive(Clone, Debug, Default)]
 pub struct Mint {
@@ -162,7 +162,7 @@ impl Mint {
         self.facets.iter().map(|(k, &v)| (k.as_str(), v))
     }
 
-    /// Nodes whose address was truncated (part_of/is_a depth > 6 tiers, or a
+    /// Nodes whose address was truncated (`part_of/is_a` depth > 6 tiers, or a
     /// sibling set larger than 255). Empty for a corpus that fits — the honest
     /// fence on "exact": beyond the cap the facet is a routing prefix, not a
     /// lossless address (deeper levels are the registry/ref-escape's job).
@@ -183,12 +183,12 @@ impl Mint {
 }
 
 /// Which chain a [`RadixCodebook`] is ordered by — the two prefix-routable axes
-/// of a [`Facet`] (`5+2t` bytes = part_of / hi; `4+2t` bytes = is_a / lo).
+/// of a [`Facet`] (`5+2t` bytes = `part_of` / hi; `4+2t` bytes = `is_a` / lo).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Axis {
-    /// part_of (mereology / containment) — the `documentSymbol` axis (`hi_chain`).
+    /// `part_of` (mereology / containment) — the `documentSymbol` axis (`hi_chain`).
     PartOf,
-    /// is_a (taxonomy / inheritance) — the `typeHierarchy` axis (`lo_chain`).
+    /// `is_a` (taxonomy / inheritance) — the `typeHierarchy` axis (`lo_chain`).
     IsA,
 }
 
@@ -202,7 +202,7 @@ pub enum Axis {
 ///
 /// # When to build it (PROS) — modest-cardinality, readable, prefix-query work
 ///
-/// The Odoo / Redmine / MedCare *app-concept* scale (hundreds–thousands of nodes):
+/// The Odoo / Redmine / `MedCare` *app-concept* scale (hundreds–thousands of nodes):
 ///
 /// - **O(log n + k) prefix queries.** `documentSymbol(class)` /
 ///   `typeHierarchy(base)` become a range scan; no graph traversal.
@@ -210,7 +210,7 @@ pub enum Axis {
 ///   radix order; built from facets you already hold, dropped when the workload
 ///   ends. Nothing is stored in the layout — the gate is "call the method", not
 ///   "feature-flag the address".
-/// - **Readable.** Each key is the legible part_of/is_a address, not a hash — you
+/// - **Readable.** Each key is the legible `part_of/is_a` address, not a hash — you
 ///   route, group, and reason on it without decoding a value.
 ///
 /// # When NOT to build it (CONS)
@@ -222,7 +222,7 @@ pub enum Axis {
 ///   *positionally* (the chain IS the coordinate — compute, don't look up). The
 ///   codebook is for the regime where a table is affordable AND the structure is
 ///   worth keeping readable; past that it is the wrong tool.
-/// - **One axis per codebook.** part_of and is_a sort differently; build both
+/// - **One axis per codebook.** `part_of` and `is_a` sort differently; build both
 ///   only if you need both query directions.
 pub struct RadixCodebook {
     axis: Axis,
@@ -250,8 +250,8 @@ impl RadixCodebook {
     }
 
     /// Every `(chain, node)` whose chain shares `prefix`'s first `depth` tiers —
-    /// the contiguous range under that ancestor. `documentSymbol` (PartOf) /
-    /// `typeHierarchy` (IsA) in `O(log n + k)`, no graph walk. `depth = 0`
+    /// the contiguous range under that ancestor. `documentSymbol` (`PartOf`) /
+    /// `typeHierarchy` (`IsA`) in `O(log n + k)`, no graph walk. `depth = 0`
     /// returns the whole codebook.
     #[must_use]
     pub fn under_prefix(&self, prefix: [u8; TIERS], depth: usize) -> &[([u8; TIERS], String)] {
@@ -374,7 +374,7 @@ pub fn mint_with_classid(triples: &[Triple], classid_of: impl Fn(&str) -> u32) -
 /// Structural mints are unaffected (both maps are always non-empty there).
 ///
 /// Determinism + the 6-tier / 255-sibling caps are inherited unchanged from
-/// [`ranks`] (a node exceeding either is flagged in [`Mint`]'s `truncated`).
+/// `ranks` (a node exceeding either is flagged in [`Mint`]'s `truncated`).
 #[must_use]
 pub fn mint_from_parents<'a>(
     nodes: &BTreeSet<&'a str>,
@@ -429,11 +429,11 @@ pub fn mint_from_parents<'a>(
 /// names:
 ///
 /// - **duplication** (a kind-discriminator mega-root, e.g. every `Property` /
-///   `Function` node parented straight under one root): is_a is built from
+///   `Function` node parented straight under one root): `is_a` is built from
 ///   `inherits_from` **only** (the real inheritance fan-out stays far below
 ///   255, so it never explodes); a member's *kind* becomes a bounded leaf enum
 ///   (`field` = 1, `fn` = 2), not a ranked child of a many-thousand-wide root.
-/// - **conflation** (a class with > 255 members): the part_of address is a
+/// - **conflation** (a class with > 255 members): the `part_of` address is a
 ///   **base-255 positional path** — each generation consumes
 ///   `ceil(log255(sibling_count))` tiers, so no tier exceeds 255 and the address
 ///   stays injective and prefix-routable (a child's chain extends its parent's).
@@ -548,6 +548,10 @@ const fn b255_width(n: usize) -> usize {
 
 /// Write the base-255 digits of 0-based sibling index `idx` into
 /// `out[at..at+w]`, big-endian, each digit `1..=255`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "x % 255 is always in 0..255, so the cast to u8 never truncates"
+)]
 fn b255_write(idx: usize, w: usize, out: &mut [u8; TIERS], at: usize) {
     let mut x = idx;
     for k in (0..w).rev() {
@@ -612,6 +616,10 @@ fn forest<'a>(
 /// The coarse→fine rank chain for `node` in one forest. Rank at tier `t` is the
 /// 1-based index of the ancestor at depth `t` among its siblings (1..=255; 0
 /// means "tier below this node's depth"). Returns `(chain, truncated)`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "clamped via `.min(u8::MAX as usize)` immediately before the cast, so it never truncates"
+)]
 fn ranks(
     node: &str,
     parent: &BTreeMap<&str, &str>,
@@ -656,7 +664,7 @@ mod tests {
     use super::*;
     use ruff_spo_triplet::from_ndjson;
 
-    /// The exact shape `ruff_csharp_spo`'s harvester emits for one MedCare model.
+    /// The exact shape `ruff_csharp_spo`'s harvester emits for one `MedCare` model.
     fn medcare_patient() -> Vec<Triple> {
         let ndjson = concat!(
             r#"{"s":"medcare:Patient","p":"rdf:type","o":"ogit:ObjectType","f":1.0,"c":0.9}"#,

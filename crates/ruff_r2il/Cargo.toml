@@ -1,0 +1,42 @@
+[package]
+name = "ruff_r2il"
+version = "0.1.0"
+publish = false
+# Excluded from the ruff workspace (root `exclude`), so nothing here can inherit from
+# [workspace.package] / [workspace.dependencies] / [workspace.lints]. edition/rust-version are
+# pinned by hand to satisfy BOTH sides: ruff (edition 2024, rust-version 1.93, toolchain 1.97.1)
+# and r2sleigh (edition 2024).
+edition = "2024"
+rust-version = "1.93"
+description = "R2IL intake arm: a lossless ore carrier over r2sleigh's r2il/r2ssa object graph, a furnace that melts it into flat facet-addressed concern rows, and an addressed residual (slag) ledger. Ore in, named slag out — no catch-all, nothing dropped."
+
+[lib]
+name = "ruff_r2il"
+
+[dependencies]
+# The AdaWorldAPI fork checkout, consumed by path (P0 fork rule). DEFAULT deps: the typed
+# behavioral surface is the crate's reason to exist.
+r2il  = { path = "../../../r2sleigh/crates/r2il" }
+r2ssa = { path = "../../../r2sleigh/crates/r2ssa" }
+
+# Non-default `lift`, mirroring the ruff_cpp_spo shape. NOTE the honest difference: r2ssa depends
+# on r2sleigh-lift unconditionally, so this feature does NOT keep libsla out of the build — it
+# gates only this crate's DIRECT use of the disassembler and the .sla/.pspec data.
+r2sleigh-lift = { path = "../../../r2sleigh/crates/r2sleigh-lift", optional = true }
+sleigh-config = { version = "1.0", optional = true, features = ["x86"] }
+
+[features]
+default = []
+lift = ["dep:r2sleigh-lift", "dep:sleigh-config"]
+
+[[example]]
+name = "harvest_r2il"
+required-features = ["lift"]
+
+[[example]]
+name = "r2il_corpus_profile"
+required-features = ["lift"]
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"

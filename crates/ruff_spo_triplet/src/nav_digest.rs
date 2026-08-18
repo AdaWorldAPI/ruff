@@ -1,4 +1,4 @@
-//! The Klickwege structure-parity oracle (transcode doctrine: "MySQL = value
+//! The Klickwege structure-parity oracle (transcode doctrine: "`MySQL` = value
 //! parity, Klickwege = structure parity").
 //!
 //! [`build_nav_digest`] folds the UI-navigation plane of a harvest — the
@@ -19,6 +19,10 @@ use std::fmt::Write;
 use crate::exam_config::ExamConfig;
 use crate::region::RegionSubject;
 use crate::triple::Triple;
+
+/// `(screen, region) -> [(dock/popup token, dock order)]` groupings used
+/// while assembling the `[regions]` digest section.
+type RegionEntries = BTreeMap<(String, String), Vec<(String, Option<u32>)>>;
 
 /// Strip a triple's namespace prefix (`"ns:"`), returning the local part.
 /// An IRI with no `:` passes through unchanged.
@@ -55,7 +59,7 @@ fn control_of(iri: &str) -> &str {
 /// (`0x<ID>`) when it resolves, else its screen name (fallback). There is no
 /// stored ordinal — the address IS the walked rail (V3 LE-contract §3: the
 /// existing concept ontology is the radix trie; menu location is a path
-/// through it). Cycle-guarded and depth-bounded so a mis-declared `part_of`
+/// through it). Cycle-guarded and depth-bounded so a misdeclared `part_of`
 /// cycle terminates instead of looping.
 fn menu_address(
     node: &str,
@@ -140,10 +144,10 @@ fn resolve_token(token: &str, config: &ExamConfig) -> Option<u16> {
 ///   (both ends) union every `selects_view` subject.
 /// - `[klickwege]` / `[views]` strip the namespace prefix from both sides.
 /// - `[concepts]` resolves each `surfaces_concept` object token via
-///   [`resolve_token`]; the screen is the namespace-stripped subject.
+///   `resolve_token`; the screen is the namespace-stripped subject.
 /// - `[screen surface]` only lists screens with `controls + handlers > 0`;
 ///   the screen is the namespace-stripped subject segment up to the first
-///   `.` (see [`screen_of`]).
+///   `.` (see `screen_of`).
 /// - `regions` / `[regions]` fold `docked_at` facts into the region frame:
 ///   the dock token is resolved through
 ///   [`crate::exam_config::ExamConfig::regions`] to a region name, falling
@@ -164,7 +168,7 @@ fn resolve_token(token: &str, config: &ExamConfig) -> Option<u16> {
 ///   Indentation is exactly two spaces.
 /// - `[menu-quad]` lowers the `(location, purpose, identity, action)` quad per
 ///   menu node into the existing classid ontology. `location` is the `part_of`
-///   rail walked as a radix-trie address ([`menu_address`]): the ancestor
+///   rail walked as a radix-trie address (`menu_address`): the ancestor
 ///   classid path, root-first, `0x<ID>` per resolved ancestor and the bare
 ///   screen name as fallback — **no stored ordinal**, the address IS the walk
 ///   (V3 LE-contract §3). `identity` is the node's own classid (`-` when
@@ -297,8 +301,7 @@ pub fn build_nav_digest(triples: &[Triple], config: &ExamConfig) -> String {
     }
 
     // Group docked controls (+ popup targets) by resolved region.
-    let mut region_entries: BTreeMap<(String, String), Vec<(String, Option<u32>)>> =
-        BTreeMap::new();
+    let mut region_entries: RegionEntries = BTreeMap::new();
     for ((screen, control), token) in &dock_of {
         let region = config
             .regions
@@ -665,7 +668,7 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
         // dot is NOT mistaken for the control boundary).
         assert!(
             digest.contains("widget_views.xml#view_form / center: partner_id(0)"),
-            "Odoo dotted-screen fact missing/mis-split in [regions]:\n{digest}"
+            "Odoo dotted-screen fact missing or wrongly split in [regions]:\n{digest}"
         );
     }
 
@@ -771,7 +774,7 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
             Triple::new(
                 "app:Leaf",
                 Predicate::PartOf,
-                "app:Aparent",
+                "app:Apparent",
                 Provenance::Inferred,
             ),
         ];
@@ -782,14 +785,14 @@ Invoice  loc=Invoice  purpose=list  id=-  action=root
             forward, reversed,
             "conflicting part_of must be order-independent"
         );
-        // Aparent (lexicographically smallest) is the canonical parent.
+        // Apparent (lexicographically smallest) is the canonical parent.
         assert!(
-            forward.contains("Leaf  loc=Aparent/Leaf"),
+            forward.contains("Leaf  loc=Apparent/Leaf"),
             "smallest parent must win deterministically:\n{forward}"
         );
     }
 
-    /// A mis-declared `part_of` cycle must terminate (cycle-guarded walk), not
+    /// A misdeclared `part_of` cycle must terminate (cycle-guarded walk), not
     /// loop forever — the address is the bounded chain up to the first repeat.
     #[test]
     fn menu_quad_part_of_cycle_terminates() {

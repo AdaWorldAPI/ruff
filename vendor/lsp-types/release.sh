@@ -7,9 +7,9 @@ if [ -z "$LEVEL" ]; then
     exit 1
 fi
 
-clog --$LEVEL
+clog --"$LEVEL"
 
 git add CHANGELOG.md
 git commit -m "Update changelog"
 
-cargo release $LEVEL --execute
+cargo release "$LEVEL" --execute

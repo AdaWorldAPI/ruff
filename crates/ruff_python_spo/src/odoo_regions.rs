@@ -393,11 +393,11 @@ mod tests {
     use super::*;
     use ruff_spo_triplet::{Predicate, Provenance};
 
-    /// A neutral synthetic view exercising: a `<header>` button (top_bar), a
-    /// `<searchpanel>` field (left_nav), a `<sheet>` field + a `<notebook>`
-    /// field (center), a `oe_chatter` div field (right_panel), a comodel field
+    /// A neutral synthetic view exercising: a `<header>` button (`top_bar`), a
+    /// `<searchpanel>` field (`left_nav`), a `<sheet>` field + a `<notebook>`
+    /// field (center), a `oe_chatter` div field (`right_panel`), a comodel field
     /// nested inside a `line_ids` field (must NOT dock), and an
-    /// `type="action"` button (opens_popup). No corpus tokens — all invented.
+    /// `type="action"` button (`opens_popup`). No corpus tokens — all invented.
     const FIXTURE: &str = r#"
 <odoo>
   <record id="view_widget_form" model="ir.ui.view">
@@ -501,7 +501,7 @@ mod tests {
     /// Fence for the known codec edge (collapse-spec §2): the shared subject
     /// codec ([`RegionSubject::from_iri`](ruff_spo_triplet::RegionSubject))
     /// decodes on the LAST `.`, so a control that itself contains a `.` (a rare
-    /// Odoo related-field path like `currency_id.symbol`) would mis-split. On
+    /// Odoo related-field path like `currency_id.symbol`) would split wrongly. On
     /// this corpus controls are Python identifiers / `%(...)d` action refs —
     /// dotless. If a real dotted control ever appears this trips, and the
     /// canonical separator must escalate to `::` (with the C# harvester
@@ -512,7 +512,7 @@ mod tests {
         for f in &facts {
             assert!(
                 !f.control.contains('.'),
-                "dotted control {:?} would mis-rsplit through the shared subject codec",
+                "dotted control {:?} would rsplit wrongly through the shared subject codec",
                 f.control
             );
         }

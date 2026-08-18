@@ -50,7 +50,8 @@
 
 #![expect(
     clippy::print_stdout,
-    reason = "the whole point of this example is to print the exam report"
+    clippy::print_stderr,
+    reason = "the whole point of this example is to print the exam report (and a usage error to stderr on bad args)"
 )]
 
 use std::collections::BTreeMap;

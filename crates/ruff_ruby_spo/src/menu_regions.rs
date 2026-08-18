@@ -110,7 +110,7 @@ pub struct RegionEntry {
     /// The raw declared position directive.
     pub position: Position,
     /// The resolved 0-based sibling ordinal (§3), assigned by the single-
-    /// pass Rails `TreeNode` replay in [`resolve_group`]. Always `Some`
+    /// pass Rails `TreeNode` replay in `resolve_group`. Always `Some`
     /// under that model (declaration-order resolution always terminates);
     /// the `Option` is retained so any future regression that fails to
     /// assign an ordinal surfaces as `None` + a non-zero
@@ -126,7 +126,7 @@ pub struct RegionEntry {
     /// The `controller:` kwarg's VALUE (e.g. `"/work_packages"`,
     /// `"/admin/settings"`), when STATICALLY resolvable (a `Sym`/`Str`
     /// literal) — the identity-binding arm's raw signal (see
-    /// [`derive_model_from_controller`]). `None` for an absent `controller:`
+    /// `derive_model_from_controller`). `None` for an absent `controller:`
     /// (mirrors `has_controller == false`) OR a dynamic value (e.g.
     /// `options[:controller]` in the each-loop expansion — `has_controller`
     /// stays `true` there, but there is nothing static to derive from).
@@ -896,7 +896,7 @@ fn positional_args(args: &[Node]) -> Vec<&Node> {
 // (`Setting.*` / `admin?` / `logged?`). Both operands of a disjunction are
 // GUARDED-BY the item's visibility, so BOTH are emitted — the honest
 // weaker claim the OQ-GUARD-1 probe established (a flat "requires" would
-// mis-encode the one real disjunction in the corpus). Dynamic permission
+// misencode the one real disjunction in the corpus). Dynamic permission
 // arguments (a `Hash`/method-call, not a `Sym` literal) yield no symbol —
 // nothing is fabricated.
 // ─────────────────────────────────────────────────────────────────────────
@@ -1078,7 +1078,7 @@ impl RegionEntry {
     /// within-screen layout plane). `part_of` is Authoritative (Rails declares
     /// the parent via `parent:`); `purpose` classifies the target `action:`
     /// (a bare `controller:` defaults to Rails' `index`) through the shared
-    /// [`classify_purpose`] engine + the [`RAILS_PURPOSE`] config.
+    /// [`classify_purpose`] engine + the `RAILS_PURPOSE` config.
     #[must_use]
     pub fn to_quad(&self, namespace: &str) -> MenuQuad {
         let token = match &self.action {
@@ -1208,7 +1208,7 @@ fn bind_identities(entries: &[RegionEntry], roster: &HashSet<String>) -> Vec<Ide
 /// Harvest every menu item as a [`MenuQuad`] — the `location`/`purpose` half of
 /// the Klickwege menu quad, PLUS the `identity` axis (`surfaces_concept`):
 /// each entry's `controller:` target is cross-checked against the real model
-/// roster ([`crate::schema::model_roster`]) via [`bind_identities`]; a
+/// roster (`crate::schema::model_roster`) via `bind_identities`; a
 /// roster match binds `identity_concept` at
 /// [`Provenance::OpenProjectExtracted`], everything else stays dormant
 /// (`None`, [`RegionEntry::to_quad`]'s default). Companion to
@@ -1769,7 +1769,7 @@ mod tests {
     /// treated this as a cycle and emitted `unresolved_order`; that was a
     /// divergence from Rails, caught by the correctness adversary.)
     ///   alpha after:beta -> beta absent -> plain add -> [alpha]
-    ///   beta  after:alpha -> alpha at 0 -> add_at 1  -> [alpha, beta]
+    ///   beta  after:alpha -> alpha at 0 -> `add_at` 1  -> [alpha, beta]
     #[test]
     fn mutual_after_reference_resolves_deterministically_single_pass() {
         let root = scratch_dir("mutual_after");
@@ -1827,8 +1827,8 @@ mod tests {
     /// `last_count`), so the trailing `last:` band is still {a}; the plain
     /// `c` inserts just before it. A phase-separated model that applied Last
     /// after Before/After would push `b` to the very end — the confirmed bug.
-    ///   a last  -> push, last_count=1        -> [a]
-    ///   b after:a -> a at 0 -> add_at 1      -> [a, b]  (last_count still 1)
+    ///   a last  -> push, `last_count=1`        -> [a]
+    ///   b after:a -> a at 0 -> `add_at` 1      -> [a, b]  (`last_count` still 1)
     ///   c plain -> insert at 2-1=1           -> [a, c, b]
     #[test]
     fn plain_push_after_splice_onto_last_respects_live_boundary() {
@@ -1989,7 +1989,7 @@ mod tests {
     /// probe below for the same finding on real data).
     #[test]
     fn menu_quad_round_trip_lowers_bare_name_chain_without_classid() {
-        let quads = vec![
+        let quads = [
             MenuQuad {
                 node: "app:root_item".to_string(),
                 parent: None,
@@ -2145,6 +2145,10 @@ mod tests {
         // Independent radix-walk mirroring `nav_digest::menu_address`'s
         // fallback path (bare node name per ancestor — Rails MenuQuads never
         // bind `identity_concept`, so classid resolution never fires here).
+        #[expect(
+            clippy::items_after_statements,
+            reason = "helper is scoped to this one probe test and reads clearest right where it's used"
+        )]
         fn expected_address(node: &str, parent_of: &BTreeMap<String, String>) -> String {
             let mut chain = Vec::new();
             let mut seen = BTreeSet::new();
@@ -2286,7 +2290,7 @@ mod tests {
     /// A disjunction (`allowed_globally?(:add_project) ||
     /// allowed_in_project?(:add_subprojects, project)`) → BOTH symbols
     /// emitted. This is the honest `guarded_by` semantics: both permissions
-    /// appear in the visibility guard, so a flat "requires" would mis-encode
+    /// appear in the visibility guard, so a flat "requires" would misencode
     /// it. (The `allowed_in_project?(:sym, project)` shape keeps `:sym` FIRST
     /// — the `project` receiver-context arg trails it, so this is normal-form,
     /// not receiver-style.)

@@ -1,3 +1,8 @@
+#![expect(
+    clippy::print_stdout,
+    reason = "this is a CLI validation example whose entire purpose is printing a load-status report to stdout"
+)]
+
 fn main() {
     let ndjson = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();
     match ruff_csharp_spo::load(&ndjson) {

@@ -12,6 +12,12 @@
 //!   triples.ndjson --ns medcare --exclude-prefix Crypt --exclude-prefix Mime
 //! ```
 
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "this is a CLI report example whose entire purpose is printing a census/validation report to stdout/stderr"
+)]
+
 use ruff_spo_triplet::{RecipeCentroid, classify, is_recoverable, reassemble_model_graph};
 use std::collections::BTreeMap;
 
@@ -93,6 +99,13 @@ fn main() {
     println!();
     println!("centroid distribution:");
     for (name, n) in &counts {
+        // Precision loss here is inconsequential: these counts are function
+        // tallies (far below f64's 52-bit mantissa range) rendered as a
+        // human-readable percentage.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "function-tally counts are far below f64's exact-integer range; only used for a display percentage"
+        )]
         let pct = 100.0 * (*n as f64) / (total.max(1) as f64);
         println!("  {n:6}  ({pct:5.1}%)  {name}");
         if let Some(ex) = examples.get(name) {
