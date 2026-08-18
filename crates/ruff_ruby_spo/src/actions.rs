@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use ruff_spo_triplet::{Predicate, Provenance, Triple};
 
 /// The mutating HTTP verb an action affordance carries. GET is deliberately
-/// absent — a GET affordance is navigation ([`crate::navigation`]), not an
+/// absent — a GET affordance is navigation (`crate::navigation`), not an
 /// action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ActionVerb {

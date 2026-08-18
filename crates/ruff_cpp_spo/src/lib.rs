@@ -35,7 +35,7 @@
 //!   methods with their flags, system-header classes filtered out).
 //!   [`extract`] — the corpus-TREE orchestration over `walk_tu` — remains
 //!   `todo!()` (per-TU include resolution + cross-TU dedup). The target
-//!   triple shape is locked by [`tests::locked_shape_expands_to_expected_triples`].
+//!   triple shape is locked by `tests::locked_shape_expands_to_expected_triples`.
 //!
 //! # Iron rules this frontend respects
 //!
@@ -195,14 +195,14 @@ pub enum Declaration {
 /// Top-level entry: walk a C++ corpus **tree** and produce the IR.
 ///
 /// **Still `todo!()` — what's missing now is only per-TU include
-/// auto-detection.** Everything beneath it is done: [`walk_tu`] walks ONE
-/// translation unit, and [`extract_tree`] already does the recursive
+/// auto-detection.** Everything beneath it is done: `walk_tu` walks ONE
+/// translation unit, and `extract_tree` already does the recursive
 /// enumeration + per-TU walk + cross-TU dedup for a SINGLE caller-supplied
 /// include-arg set. What `extract` adds is resolving the right include args
 /// *per TU automatically* (the `tesseract-ocr/tesseract@5.5.0` + leptonica
 /// include graph — the real remaining work), so a caller can point it at a
 /// corpus root without hand-supplying `-I` flags. Once that lands it is
-/// essentially [`extract_tree`] with auto-derived args, plus the
+/// essentially `extract_tree` with auto-derived args, plus the
 /// `CPP-SCHEMA-FIT` coverage gate (`.claude/plans/cpp-spo-probes-v1.md`).
 #[must_use]
 pub fn extract(source_tree: &Path) -> ModelGraph {

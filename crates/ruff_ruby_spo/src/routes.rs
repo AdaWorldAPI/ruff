@@ -57,7 +57,7 @@ use ruff_spo_triplet::{Predicate, Provenance, Triple};
 use crate::actions::ActionVerb;
 
 /// The mutating HTTP verb an action affordance carries. GET is deliberately
-/// absent — a GET affordance is navigation ([`crate::navigation`]), not an
+/// absent — a GET affordance is navigation (`crate::navigation`), not an
 /// action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RouteVerb {
@@ -149,7 +149,7 @@ impl RouteScopeKind {
 pub struct RouteEntry {
     /// The full Rails helper stem this route generates (the literal token
     /// Rails' route-helper generator produces — the same join contract
-    /// [`crate::actions::action_target`] uses, no `new_`/`edit_`
+    /// `crate::actions::action_target` uses, no `new_`/`edit_`
     /// stripping). `None` when no helper is derivable (a bare
     /// dynamic-segment string path with no `as:`).
     pub stem: Option<String>,

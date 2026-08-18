@@ -68,7 +68,7 @@ pub enum NavShape {
     ErbClick,
     /// Shape B — a controller *redirect* edge (`redirect_to`/`redirect_back`).
     ControllerRedirect,
-    /// Shape C — a [`crate::menu`] side-nav registration edge
+    /// Shape C — a `crate::menu` side-nav registration edge
     /// (`Redmine::MenuManager`-style `<menu>.push :label, …`), source fixed
     /// to the synthetic `"menu"` root. The Rails twin of the Odoo `<menuitem>`
     /// root (ruff #66) and op-nexgen's hand-authored `nav::MENU_NAV_EDGES`.

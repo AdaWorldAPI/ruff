@@ -141,7 +141,7 @@ pub fn extract_nav_edges(root: &Path, vocab: &NavVocab) -> Vec<PyNavEdge> {
 /// (skipping a file that fails to parse — the crate's silent-skip invariant),
 /// AST-visits for `url_for` / `reverse` / `redirect` calls with a string-
 /// literal first argument, and lifts each known-screen target to an edge whose
-/// source is the file's [`source_screen`]. Results are deduped by
+/// source is the file's `source_screen`. Results are deduped by
 /// `(source, target, call)` and sorted deterministically.
 #[must_use]
 pub fn extract_nav_edges_with_report(

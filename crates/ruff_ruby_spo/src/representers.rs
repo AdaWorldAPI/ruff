@@ -121,7 +121,7 @@ const KEYWORDS: &[&str] = &[
 
 /// Scan `root` recursively for `**/*_representer.rb` files and extract
 /// their declared fields. Files that produce zero declarations are
-/// omitted (presence-only, same discipline as [`crate::views`]'s
+/// omitted (presence-only, same discipline as `crate::views`'s
 /// `views_with_hits` gate). Deterministic: files sorted by path, decls
 /// in file (source) order.
 #[must_use]
