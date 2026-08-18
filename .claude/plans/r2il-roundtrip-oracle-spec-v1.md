@@ -1,9 +1,15 @@
 # SPEC — PR2 slice: the round-trip reconstruction oracle (`oracle.rs`)
 
-> 5+3 council spec. **This file is DRAFT v2** (post-Phase-1 consolidation);
-> v1 is the previous git revision of this file. Phase-3 reviewers see THIS
-> document only. The change ledger (§7) records every savant finding and its
-> disposition, including losing findings (anti-collapse).
+> 5+3 council spec. **RATIFIED v3** (v1 and v2 are the prior git revisions
+> of this file). Council run: 5 savants (prior-art / iron-rules /
+> code-truth / cascade / views, all Sonnet) → consolidation → 3 reviewers
+> (overclaim / dilution-collapse / firewall charters, Sonnet) → fix.
+> Reviewer verdicts on v2: R3 all-PASS 0 findings; R2 five-PASS +
+> FIX(P2)×2; R1 four-PASS + FIX(P1)×1 + FIX(P2)×2; ZERO BLOCK. All five
+> FIX findings applied — §7 rows 15-18. This document is the executable
+> spec; implementation follows it without further design.
+> The change ledger (§7) records every finding and its disposition,
+> including losing findings (anti-collapse).
 >
 > Scope: the PR2 gate deliverable from `.claude/plans/r2il-behavioral-ir-v1.md`
 > — "round-trip reconstruction oracle (R2IL → routes → semantic-equivalent
@@ -142,11 +148,22 @@ Reconstruction`:
 ### 3.4 `judge` — the verdict, with a PINNED universe ✎
 
 **Universe = source op sites** `(block_addr, op_idx)` enumerated from the
-input `&[R2ILBlock]`. For each site exactly one of: (a) reconstructed AND
-`OpSkeleton::of(source_op) == skeleton` → `matched`; (b) ≥1 ledger residual
-whose `provenance.op_site` equals the site → `ledger_accounted`; (c)
-neither → `orphans`. Skeleton inequality → `mismatches` (both skeletons
-carried as typed values).
+input `&[R2ILBlock]`. For each site, a TRUE 4-way partition, evaluated in
+this precedence order [R2 F1 / R1 F2]:
+
+1. reconstructed (complete) AND `OpSkeleton::of(source_op) == skeleton` →
+   `matched`;
+2. reconstructed (complete) AND unequal → `mismatches` (both skeletons
+   carried as typed values) — checked BEFORE the ledger criterion: a
+   mismatch is never excused by a coincident residual at the same site;
+3. not reconstructed — including every site whose op appears only via a
+   `ReconstructionMiss` (`MissingOperands` / `FacetInversion` mean the site
+   is NOT reconstructed) — AND ≥1 ledger residual whose
+   `provenance.op_site` equals the site → `ledger_accounted`. This is the
+   expected home of incomplete ops: the very operands that failed to melt
+   produced op_site-anchored residuals;
+4. else → `orphans`. An incomplete op with NO residual at its site orphans
+   — that is the correct failure signal, not a gap to paper over.
 
 ✎ **Ledger rows OUTSIDE the universe** — residuals with `op_site: None`
 (phi inputs, CallDefine, the Edge no-facet case; S3 Q6's anchor table) —
@@ -222,10 +239,12 @@ plan item O6 tracks it (✎ S4 Q4).
      == source op count` (exact), `ledger_accounted == 0` (exact),
      `ssa_only_residuals ==` exact phi+CallDefine count.
    - `minimal_pass_one` fixture: still `holds()` (accounted, not
-     orphaned); anti-vacuity `matched >= 1 && ledger_accounted >= 1`; PLUS
-     the framing assertion that `matched` under minimal < `matched` under
-     permissive on the same blocks (proves the two conventions measure
-     different things — S5 Q3).
+     orphaned); `matched == 0` EXACT — satisfiable and pinned, because all
+     7 classified opcodes carry ≥1 operand and no operand melts under zero
+     rows, so no op can fully reconstruct (the v2 draft's `matched >= 1`
+     conjunct was UNSATISFIABLE — R1 F1, P1); `ledger_accounted >= 1`
+     anti-vacuity; PLUS `matched(minimal) < matched(permissive)` on the
+     same blocks (the two conventions measure different things — S5 Q3).
    - mismatch can-fire: corrupt one operand row's facet → exactly one
      mismatch. ✎ swap can-fire (S5 Q2): swap two operand rows' facets
      ACROSS two ops → BOTH sites report mismatches (cross-row corruption
@@ -250,8 +269,10 @@ plan item O6 tracks it (✎ S4 Q4).
    (entry for the new example/artifact pair), `.claude/plans/
    r2il-behavioral-ir-v1.md` (new Open item **O6**: gap-census → widening
    decision; corpus-run-pending state; PR3 mint-scope note per S5 Q4),
-   this spec (ratification note). `facet.rs`: doc-comment cross-ref at
-   most. NO semantic diff in `furnace.rs`/`ore.rs`/`slag.rs`/`sink.rs`.
+   this spec (ratification note). `facet.rs`: **ZERO code diff** (same
+   commitment as §3.1's "no code change"); at most a doc-comment
+   cross-reference [R1 F5]. NO semantic diff in
+   `furnace.rs`/`ore.rs`/`slag.rs`/`sink.rs`.
 
 ## 6. PER-SAVANT QUESTION SETS — retired (Phase 1 complete)
 
@@ -270,8 +291,12 @@ Question sets from v1 were answered; findings and dispositions in §7.
 | 7 | S3 CONFIRMS | payload semantics, shared `prov.inst`, Varnode manual `PartialEq`, minimal-pass-one no-operand-melt | inventory marked verified |
 | 8 | S3 RISK | provenance anchors: phi/Edge block-only; `UserOpNotInConvention` dead | §3.4 universe pinned; `ssa_only_residuals` channel; dead variant recorded in §4 |
 | 9 | S4 GAP ×4 | Cargo.toml stanza, README entry, plan O6, guide row missing from file list | gate 5 completed |
-| 10 | S4 Q1 (partial) vs S4 Q3 | Q1 said the provisional facet row needs in-place edit; Q3 (deeper) says orthogonal | **Q3 wins** — no edit; losing finding recorded here per anti-collapse |
+| 10 | S4 Q1 (partial) vs S4 Q3 | Q1 said the provisional facet row needs in-place edit; Q3 (deeper) says orthogonal | **Q3 wins** — `unproject` recovers a typed `Varnode`, not a durable address, so the row's persistence caveat is untouched by this slice. Q1's ONE salvageable facet — a discoverability pointer toward the oracle's use of `unproject` — is granted as the `facet.rs` doc-comment cross-reference (§3.1, §5 gate 5); no other facet of Q1 survives unaddressed [R2 F2] |
 | 11 | S5 RISK | deferring widening is safe only if census is tracked | O6 mandatory-same-commit (§5) |
 | 12 | S5 RISK | forward re-smelt oracle tests furnace against itself; skeleton misses cross-row swaps | direction confirmed; swap can-fire added to gate 3 |
 | 13 | S5 RISK | permissive pass ≠ shipped-coverage proof | §3.5 honest-framing normative + dual-convention reporting + minimal<permissive assertion |
 | 14 | S5 GAP | gap census feeds PR3 mint scope | folded into O6 text |
+| 15 | R1 F1 FIX(P1) + v2→v3 | `matched >= 1` under `minimal_pass_one` was unsatisfiable (all 7 classified opcodes carry ≥1 operand; none melts under zero rows) | gate restated: `matched == 0` exact + `ledger_accounted >= 1` + the comparative inequality carries the signal |
+| 16 | R1 F2 / R2 F1 FIX(P2) | §3.4's "(a)/(b)/(c)" partition omitted the mismatch bucket and the `ReconstructionMiss` routing | true 4-way partition with precedence; misses route to rule 3 or orphan |
+| 17 | R1 F5 FIX(P2) | gate-5 facet.rs phrasing weaker than §3.1's "no code change" | aligned: ZERO code diff both places |
+| 18 | R2 F2 FIX(P2) | ledger row 10 not self-contained | row 10 now names Q1's one salvageable facet and where it is granted |
