@@ -70,7 +70,10 @@ pub use odoo_regions::{
 pub use odoo_views::{
     OdooViewScanReport, extract_odoo_view_field_sets, extract_odoo_view_field_sets_with_report,
 };
-pub use plain::{extract_plain, extract_plain_from_source};
+pub use plain::{
+    PlainResidual, PlainResidualReason, extract_plain, extract_plain_from_source,
+    extract_plain_from_source_with_residuals, extract_plain_with_residuals,
+};
 pub use templates::{
     ViewFieldSet, ViewScanReport, ViewTarget, extract_template_field_sets,
     extract_template_field_sets_with_report,
