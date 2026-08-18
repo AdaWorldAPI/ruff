@@ -890,19 +890,21 @@ fn a_bootstrapped_convention_resolves_register_operands_that_pass_one_cannot() {
     spec.registers.push(RegisterDef::new("named0", 0x00, 8));
     spec.registers.push(RegisterDef::new("named8", 0x08, 8));
 
-    let bootstrapped = R2ilConvention::from_arch(
-        &spec,
-        [
-            OpTag::Copy,
-            OpTag::IntAdd,
-            OpTag::Load,
-            OpTag::Store,
-            OpTag::CBranch,
-            OpTag::Call,
-            OpTag::Return,
-        ],
-    )
-    .expect("two named registers must fit within the interning budget");
+    let bootstrapped = must_ok(
+        R2ilConvention::from_arch(
+            &spec,
+            [
+                OpTag::Copy,
+                OpTag::IntAdd,
+                OpTag::Load,
+                OpTag::Store,
+                OpTag::CBranch,
+                OpTag::Call,
+                OpTag::Return,
+            ],
+        ),
+        "two named registers must fit within the interning budget",
+    );
 
     let (_flat_b, ledger_b, report_b) = furnace::smelt(&behavior, &blocks, &bootstrapped);
 
@@ -924,8 +926,10 @@ fn a_bootstrapped_convention_resolves_register_operands_that_pass_one_cannot() {
     // An UNNAMED offset (0x58, only touched by the un-classified IntSub in B0)
     // still resolves through the coarse Space fallback row, at depth() == 1 --
     // ties §5's bootstrap rule directly to the melt.
-    let unnamed_facet = facet::project(&reg(0x58, 8), bootstrapped.spaces())
-        .expect("the register space is always within the interning budget");
+    let unnamed_facet = must_ok(
+        facet::project(&reg(0x58, 8), bootstrapped.spaces()),
+        "the register space is always within the interning budget",
+    );
     bootstrapped
         .resolve(&unnamed_facet)
         .expect("the coarse register-space row must catch an unnamed offset");

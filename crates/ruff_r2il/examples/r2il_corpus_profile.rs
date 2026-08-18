@@ -80,6 +80,7 @@ mod elf {
     }
 
     pub(crate) struct Symbol {
+        pub(crate) name: String,
         pub(crate) value: u64,
         pub(crate) size: u64,
     }
@@ -217,10 +218,12 @@ mod elf {
                     if !in_exec {
                         continue;
                     }
-                    // Name is read only for completeness of the bounds-checked path; unused
-                    // beyond parse validation, so a malformed name still yields a usable symbol.
-                    let _name = read_name(bytes, strtab.offset, strtab.size, st_name);
+                    // A malformed/unreadable name still yields a usable symbol (name just
+                    // falls back to empty) — only value/size gate whether the symbol is used.
+                    let name =
+                        read_name(bytes, strtab.offset, strtab.size, st_name).unwrap_or_default();
                     functions.push(Symbol {
+                        name,
                         value: st_value,
                         size: st_size,
                     });
@@ -649,6 +652,19 @@ struct Pass2Stats {
     smelt_dropped: usize,
 }
 
+/// Record one skipped `STT_FUNC` symbol — named, addressed, never a silent omission — and bump
+/// the ledger. `symbol.name` may be empty (an unreadable/absent strtab entry); that is reported
+/// as `<unnamed>` rather than left blank.
+fn skip_function(stats: &mut Pass2Stats, symbol: &elf::Symbol, reason: &str) {
+    let label = if symbol.name.is_empty() {
+        "<unnamed>"
+    } else {
+        symbol.name.as_str()
+    };
+    println!("    skipped {label} @0x{:x}: {reason}", symbol.value);
+    stats.functions_skipped += 1;
+}
+
 /// Everything Pass 2 needs that does not change per binary: the disassembler, the arch spec
 /// used to build it, the pass-1-seven-opcode convention, and the two echoed caps.
 struct Setup {
@@ -796,17 +812,17 @@ fn run_pass2_over(
             .iter()
             .find(|s| symbol.value >= s.addr && symbol.value < s.end_addr())
         else {
-            stats.functions_skipped += 1;
+            skip_function(&mut stats, symbol, "no containing executable section");
             continue;
         };
         let Ok(sec_start) = usize::try_from(section.offset) else {
-            stats.functions_skipped += 1;
+            skip_function(&mut stats, symbol, "section offset does not fit usize");
             continue;
         };
         let full_len = usize::try_from(section.size).unwrap_or(0);
         let capped_len = full_len.min(setup.max_section_bytes);
         let Some(section_bytes) = bytes.get(sec_start..sec_start.saturating_add(capped_len)) else {
-            stats.functions_skipped += 1;
+            skip_function(&mut stats, symbol, "section bytes out of file bounds");
             continue;
         };
 
@@ -818,7 +834,7 @@ fn run_pass2_over(
             .min(section.end_addr())
             .min(section_capped_end);
         if fn_end <= fn_start {
-            stats.functions_skipped += 1;
+            skip_function(&mut stats, symbol, "empty range after capping to section bytes");
             continue;
         }
 
@@ -826,11 +842,11 @@ fn run_pass2_over(
         let leaders = compute_leaders(fn_start, fn_end, &infos);
         let ranges = basic_block_ranges(fn_end, &leaders);
         let Some(bbs) = lift_blocks(&setup.disasm, section_bytes, section.addr, &ranges) else {
-            stats.functions_skipped += 1;
+            skip_function(&mut stats, symbol, "lift_block failed on a basic block");
             continue;
         };
         let Some(behavior) = FunctionBehavior::from_blocks_raw(&bbs, Some(&setup.spec)) else {
-            stats.functions_skipped += 1;
+            skip_function(&mut stats, symbol, "FunctionBehavior::from_blocks_raw returned None");
             continue;
         };
 
@@ -873,10 +889,10 @@ fn run_pass2_over(
                 for vn in varnodes {
                     match facet::project(vn, setup.conv.spaces()) {
                         Ok(_) => stats.facet_ok += 1,
-                        Err(ruff_r2il::facet::FacetOverflow::UnknownCustomSpace { .. }) => {
+                        Err(facet::FacetOverflow::UnknownCustomSpace { .. }) => {
                             stats.facet_unknown_custom_space += 1;
                         }
-                        Err(ruff_r2il::facet::FacetOverflow::CustomOrdinalExhausted { .. }) => {
+                        Err(facet::FacetOverflow::CustomOrdinalExhausted { .. }) => {
                             stats.facet_ordinal_exhausted += 1;
                         }
                     }
