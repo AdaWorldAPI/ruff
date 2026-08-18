@@ -7,17 +7,17 @@
 //!
 //! # Architecture
 //!
-//! - [`mod@parse`] walks the directory, parses each `*.rb` with
+//! - `parse` walks the directory, parses each `*.rb` with
 //!   `lib-ruby-parser`, and finds class definitions (recursing into
 //!   `module ... end` namespaces). One AST pass per file.
-//! - [`mod@walk`] takes a class body and dispatches each top-level
+//! - `walk` takes a class body and dispatches each top-level
 //!   `Send` call (`belongs_to :project`, `validates :x`, `acts_as_list`,
 //!   …) to the right [`Declaration`] variant by method-name match.
 //! - [`extract`] unpacks each class's `declarations: Vec<Declaration>`
 //!   into the typed `Model::{associations, validations, callbacks, …}`
 //!   sibling slots the shared IR consumes.
 //!
-//! Method-body extraction ([`extract_fields`] / [`extract_functions`])
+//! Method-body extraction (`extract_fields` / `extract_functions`)
 //! is intentionally minimal in D-AR-3: the 100 % coverage gate (D-AR-4)
 //! measures *declarations*, not field/function depth. The two body
 //! extractors return empty vecs; the follow-up D-AR-3.5 implements them
@@ -99,7 +99,7 @@ pub struct RubyClass {
     /// sibling fields the shared IR consumes.
     pub declarations: Vec<Declaration>,
     /// Method-body extraction (D-AR-3.5): one [`Function`] per `def`
-    /// in the class body. Populated by [`parse::parse_models`] alongside
+    /// in the class body. Populated by `parse::parse_models` alongside
     /// `declarations`, then flowed straight onto `Model::functions` by
     /// [`extract`] below.
     pub functions: Vec<Function>,

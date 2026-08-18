@@ -110,7 +110,7 @@ pub struct RegionEntry {
     /// The raw declared position directive.
     pub position: Position,
     /// The resolved 0-based sibling ordinal (§3), assigned by the single-
-    /// pass Rails `TreeNode` replay in [`resolve_group`]. Always `Some`
+    /// pass Rails `TreeNode` replay in `resolve_group`. Always `Some`
     /// under that model (declaration-order resolution always terminates);
     /// the `Option` is retained so any future regression that fails to
     /// assign an ordinal surfaces as `None` + a non-zero
@@ -126,7 +126,7 @@ pub struct RegionEntry {
     /// The `controller:` kwarg's VALUE (e.g. `"/work_packages"`,
     /// `"/admin/settings"`), when STATICALLY resolvable (a `Sym`/`Str`
     /// literal) — the identity-binding arm's raw signal (see
-    /// [`derive_model_from_controller`]). `None` for an absent `controller:`
+    /// `derive_model_from_controller`). `None` for an absent `controller:`
     /// (mirrors `has_controller == false`) OR a dynamic value (e.g.
     /// `options[:controller]` in the each-loop expansion — `has_controller`
     /// stays `true` there, but there is nothing static to derive from).
@@ -1078,7 +1078,7 @@ impl RegionEntry {
     /// within-screen layout plane). `part_of` is Authoritative (Rails declares
     /// the parent via `parent:`); `purpose` classifies the target `action:`
     /// (a bare `controller:` defaults to Rails' `index`) through the shared
-    /// [`classify_purpose`] engine + the [`RAILS_PURPOSE`] config.
+    /// [`classify_purpose`] engine + the `RAILS_PURPOSE` config.
     #[must_use]
     pub fn to_quad(&self, namespace: &str) -> MenuQuad {
         let token = match &self.action {
@@ -1208,7 +1208,7 @@ fn bind_identities(entries: &[RegionEntry], roster: &HashSet<String>) -> Vec<Ide
 /// Harvest every menu item as a [`MenuQuad`] — the `location`/`purpose` half of
 /// the Klickwege menu quad, PLUS the `identity` axis (`surfaces_concept`):
 /// each entry's `controller:` target is cross-checked against the real model
-/// roster ([`crate::schema::model_roster`]) via [`bind_identities`]; a
+/// roster (`crate::schema::model_roster`) via `bind_identities`; a
 /// roster match binds `identity_concept` at
 /// [`Provenance::OpenProjectExtracted`], everything else stays dormant
 /// (`None`, [`RegionEntry::to_quad`]'s default). Companion to
