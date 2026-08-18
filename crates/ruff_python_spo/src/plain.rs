@@ -44,6 +44,85 @@ use ruff_spo_triplet::{Field, Function, Model, ModelGraph};
 use crate::functions::analyze_method;
 use crate::name_id;
 
+/// Why one site contributed less than it could have — the plain arm's
+/// residual ledger, mirroring the intake-arm slag doctrine: every silent
+/// skip becomes a **named, addressed** row, and there is deliberately no
+/// catch-all variant (`Other`/`Opaque` would hide exactly the information
+/// the ledger exists to surface). Each variant names a gap the module doc
+/// already declares; the ledger makes the gap *measurable* so a residual
+/// histogram over a real corpus can say where a drill-down would pay off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PlainResidualReason {
+    /// The file failed to parse; the whole module contributed nothing.
+    UnparsableSource,
+    /// A module-level single-name constant (`Assign`/`AnnAssign`) — the
+    /// harvest does not walk module-level assignments, so the constant is
+    /// invisible.
+    ModuleConstant,
+    /// A string-literal constant whose value is CURIE-shaped
+    /// (`PREFIX:localid`). The **prefix is the only drillable segment** —
+    /// OBO locals and SNOMED sctids alike are opaque, and hierarchy for
+    /// such vocabularies lives in the ontology's *edges*, not in the
+    /// identifier string — so `detail` carries the prefix verbatim and the
+    /// local id is never parsed. At module level the whole constant is
+    /// invisible (this subsumes [`Self::ModuleConstant`] — one row, not
+    /// two); at class level the `Field` IS emitted (as `str`) but the
+    /// VALUE channel is unharvested, which is what this row records.
+    CurieConstant,
+    /// A `class` nested inside a class body — not walked (same posture as
+    /// the Odoo arm).
+    NestedClass,
+    /// An `AnnAssign` field that WAS emitted but whose annotation could
+    /// not be reduced to a simple head (`field_type` is `None`): union
+    /// types, forward-reference strings, … `detail` is the annotation
+    /// expression's kind tag.
+    UnresolvedAnnotation,
+    /// A class-level single-name `Assign` whose RHS is not a trivially
+    /// inferable literal — no field emitted. `detail` is the RHS kind tag.
+    NonLiteralAssign,
+    /// An `Assign`/`AnnAssign` whose target is not a single plain name
+    /// (tuple / chained / attribute targets) — nothing emitted.
+    NonNameAssignTarget,
+    /// A base-class expression that did not resolve to a terminal name
+    /// (`Generic[T]`, a call, …) — the inherits edge is dropped. `detail`
+    /// is the base expression's kind tag.
+    UnresolvedBase,
+}
+
+impl PlainResidualReason {
+    /// Stable `snake_case` tag for histograms and TSV output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnparsableSource => "unparsable_source",
+            Self::ModuleConstant => "module_constant",
+            Self::CurieConstant => "curie_constant",
+            Self::NestedClass => "nested_class",
+            Self::UnresolvedAnnotation => "unresolved_annotation",
+            Self::NonLiteralAssign => "non_literal_assign",
+            Self::NonNameAssignTarget => "non_name_assign_target",
+            Self::UnresolvedBase => "unresolved_base",
+        }
+    }
+}
+
+/// One addressed residual row: which module, which class (if any), which
+/// name (if the site has one), and a reason-specific `detail` (a CURIE
+/// prefix, an expression kind tag). "Addressed" is the point — a residual
+/// a proposer cannot locate is noise, not ore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainResidual {
+    pub reason: PlainResidualReason,
+    /// Dotted module path (`export.sepio_export`).
+    pub module: String,
+    /// Enclosing class name, or `None` at module level.
+    pub context: Option<String>,
+    /// The assigned/base/class name at the site, when it has one.
+    pub name: Option<String>,
+    /// Reason-specific payload — see [`PlainResidualReason`].
+    pub detail: Option<String>,
+}
+
 /// The IRI namespace prefix [`extract_plain_from_source`] stamps on the
 /// [`ModelGraph`] it returns before [`extract_plain`] overwrites it with the
 /// caller-supplied namespace.
@@ -58,17 +137,61 @@ const PLAIN_NAMESPACE: &str = "py";
 /// graph), mirroring the Odoo extractor's silent-skip invariant.
 #[must_use]
 pub fn extract_plain_from_source(source: &str, module: &str) -> ModelGraph {
+    extract_plain_from_source_with_residuals(source, module).0
+}
+
+/// [`extract_plain_from_source`], additionally returning the residual
+/// ledger — one [`PlainResidual`] row per site that contributed less than
+/// it could have. The graph half is identical to what
+/// [`extract_plain_from_source`] returns; the ledger is strictly additive
+/// observation, never a behaviour change.
+#[must_use]
+pub fn extract_plain_from_source_with_residuals(
+    source: &str,
+    module: &str,
+) -> (ModelGraph, Vec<PlainResidual>) {
     let module_prefix = module.replace('.', "_");
+    let mut residuals = Vec::new();
     let Ok(parsed) = parse_module(source) else {
-        return ModelGraph::new(PLAIN_NAMESPACE);
+        residuals.push(PlainResidual {
+            reason: PlainResidualReason::UnparsableSource,
+            module: module.to_string(),
+            context: None,
+            name: None,
+            detail: None,
+        });
+        return (ModelGraph::new(PLAIN_NAMESPACE), residuals);
     };
 
     let mut models = Vec::new();
     let mut module_functions = Vec::new();
     for stmt in &parsed.syntax().body {
         match stmt {
-            Stmt::ClassDef(class) => models.push(walk_plain_class(class, &module_prefix)),
+            Stmt::ClassDef(class) => {
+                models.push(walk_plain_class(
+                    class,
+                    &module_prefix,
+                    module,
+                    &mut residuals,
+                ));
+            }
             Stmt::FunctionDef(func) => module_functions.push(analyze_method(func)),
+            Stmt::Assign(assign) => {
+                record_module_constant(
+                    single_name_target(assign),
+                    Some(&assign.value),
+                    module,
+                    &mut residuals,
+                );
+            }
+            Stmt::AnnAssign(ann) => {
+                record_module_constant(
+                    name_id(&ann.target),
+                    ann.value.as_deref(),
+                    module,
+                    &mut residuals,
+                );
+            }
             _ => {}
         }
     }
@@ -83,10 +206,13 @@ pub fn extract_plain_from_source(source: &str, module: &str) -> ModelGraph {
         });
     }
 
-    ModelGraph {
-        namespace: PLAIN_NAMESPACE.to_string(),
-        models,
-    }
+    (
+        ModelGraph {
+            namespace: PLAIN_NAMESPACE.to_string(),
+            models,
+        },
+        residuals,
+    )
 }
 
 /// Extract a [`ModelGraph`] from a source tree (recursively reads `*.py`),
@@ -96,29 +222,143 @@ pub fn extract_plain_from_source(source: &str, module: &str) -> ModelGraph {
 /// skipped (same silent-skip posture as an unparsable file).
 #[must_use]
 pub fn extract_plain(root: &Path, namespace: &str) -> ModelGraph {
+    extract_plain_with_residuals(root, namespace).0
+}
+
+/// [`extract_plain`], additionally returning the residual ledger
+/// accumulated across every file in the tree.
+#[must_use]
+pub fn extract_plain_with_residuals(
+    root: &Path,
+    namespace: &str,
+) -> (ModelGraph, Vec<PlainResidual>) {
     let mut models = Vec::new();
-    collect_plain(root, root, &mut models);
-    ModelGraph {
-        namespace: namespace.to_string(),
-        models,
-    }
+    let mut residuals = Vec::new();
+    collect_plain(root, root, &mut models, &mut residuals);
+    (
+        ModelGraph {
+            namespace: namespace.to_string(),
+            models,
+        },
+        residuals,
+    )
 }
 
 /// Recursively collect every `*.py` file's models under `dir`.
-fn collect_plain(root: &Path, dir: &Path, out: &mut Vec<Model>) {
+fn collect_plain(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<Model>,
+    residuals: &mut Vec<PlainResidual>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_plain(root, &path, out);
+            collect_plain(root, &path, out, residuals);
         } else if path.extension().is_some_and(|e| e == "py")
             && let Ok(src) = fs::read_to_string(&path)
             && let Some(module) = module_name(root, &path)
         {
-            out.extend(extract_plain_from_source(&src, &module).models);
+            let (graph, mut rows) = extract_plain_from_source_with_residuals(&src, &module);
+            out.extend(graph.models);
+            residuals.append(&mut rows);
         }
+    }
+}
+
+/// Record a module-level single-name constant on the residual ledger:
+/// [`PlainResidualReason::CurieConstant`] when its value is a CURIE-shaped
+/// string literal (with the prefix as `detail` — subsuming the plain
+/// module-constant row so one site never produces two rows), otherwise
+/// [`PlainResidualReason::ModuleConstant`]; a non-single-name target is a
+/// [`PlainResidualReason::NonNameAssignTarget`] row instead.
+fn record_module_constant(
+    target: Option<&str>,
+    value: Option<&Expr>,
+    module: &str,
+    residuals: &mut Vec<PlainResidual>,
+) {
+    let Some(name) = target else {
+        residuals.push(PlainResidual {
+            reason: PlainResidualReason::NonNameAssignTarget,
+            module: module.to_string(),
+            context: None,
+            name: None,
+            detail: None,
+        });
+        return;
+    };
+    let curie = value.and_then(curie_prefix_of_literal);
+    residuals.push(PlainResidual {
+        reason: if curie.is_some() {
+            PlainResidualReason::CurieConstant
+        } else {
+            PlainResidualReason::ModuleConstant
+        },
+        module: module.to_string(),
+        context: None,
+        name: Some(name.to_string()),
+        detail: curie,
+    });
+}
+
+/// The CURIE prefix of a string-literal expression whose value looks like
+/// `PREFIX:localid`, or `None`. Deliberately prefix-only: OBO locals and
+/// SNOMED sctids are opaque, and hierarchy for such vocabularies lives in
+/// the ontology's edges — the local id is never parsed here. The shape
+/// check rejects URLs (`https://…` — rest starts with `/`), Windows paths
+/// (backslash in rest), clock times (`12:30` — prefix must start
+/// alphabetic), and anything containing whitespace.
+fn curie_prefix_of_literal(value: &Expr) -> Option<String> {
+    let Expr::StringLiteral(lit) = value else {
+        return None;
+    };
+    let s = lit.value.to_str();
+    let (prefix, rest) = s.split_once(':')?;
+    let prefix_ok = !prefix.is_empty()
+        && prefix.len() <= 32
+        && prefix
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    let rest_ok = !rest.is_empty()
+        && !rest
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '\\'));
+    (prefix_ok && rest_ok).then(|| prefix.to_string())
+}
+
+/// Compact kind tag for an expression, used as residual `detail`. The
+/// closed reason taxonomy lives in [`PlainResidualReason`]; this tag is
+/// free-text granularity underneath it, so the trailing arm is acceptable
+/// here (it coarsens detail, never lumps reasons).
+fn expr_kind(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Name(_) => "name",
+        Expr::Attribute(_) => "attribute",
+        Expr::Call(_) => "call",
+        Expr::BinOp(_) => "binop",
+        Expr::Subscript(_) => "subscript",
+        Expr::StringLiteral(_) => "stringliteral",
+        Expr::FString(_) => "fstring",
+        Expr::Tuple(_) => "tuple",
+        Expr::List(_) => "list",
+        Expr::Dict(_) => "dict",
+        Expr::Set(_) => "set",
+        Expr::Lambda(_) => "lambda",
+        Expr::If(_) => "ifexp",
+        Expr::UnaryOp(_) => "unaryop",
+        Expr::Compare(_) => "compare",
+        Expr::Starred(_) => "starred",
+        Expr::Named(_) => "named",
+        Expr::Await(_) => "await",
+        _ => "other_expr",
     }
 }
 
@@ -133,42 +373,106 @@ fn module_name(root: &Path, file: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("."))
 }
 
-/// Walk one top-level `class X(Base1, Base2):` into a [`Model`].
-fn walk_plain_class(class: &StmtClassDef, module_prefix: &str) -> Model {
+/// Walk one top-level `class X(Base1, Base2):` into a [`Model`], recording
+/// every under-contributing site on the residual ledger.
+fn walk_plain_class(
+    class: &StmtClassDef,
+    module_prefix: &str,
+    module: &str,
+    residuals: &mut Vec<PlainResidual>,
+) -> Model {
+    let class_name = class.name.id.to_string();
+    let residual = |reason, name: Option<String>, detail: Option<String>| PlainResidual {
+        reason,
+        module: module.to_string(),
+        context: Some(class_name.clone()),
+        name,
+        detail,
+    };
     let mut fields = Vec::new();
     let mut functions = Vec::new();
     for stmt in &class.body {
         match stmt {
             Stmt::AnnAssign(ann) => {
                 if let Some(name) = name_id(&ann.target) {
+                    let field_type = field_type_from_annotation(&ann.annotation);
+                    if field_type.is_none() {
+                        residuals.push(residual(
+                            PlainResidualReason::UnresolvedAnnotation,
+                            Some(name.to_string()),
+                            Some(expr_kind(&ann.annotation).to_string()),
+                        ));
+                    }
                     fields.push(Field {
                         name: name.to_string(),
-                        field_type: field_type_from_annotation(&ann.annotation),
+                        field_type,
                         ..Field::default()
                     });
+                } else {
+                    residuals.push(residual(
+                        PlainResidualReason::NonNameAssignTarget,
+                        None,
+                        None,
+                    ));
                 }
             }
             Stmt::Assign(assign) => {
-                if let Some(name) = single_name_target(assign)
-                    && let Some(field_type) = field_type_from_literal(&assign.value)
-                {
-                    fields.push(Field {
-                        name: name.to_string(),
-                        field_type: Some(field_type),
-                        ..Field::default()
-                    });
+                if let Some(name) = single_name_target(assign) {
+                    if let Some(field_type) = field_type_from_literal(&assign.value) {
+                        // The field IS emitted; a CURIE-shaped value still
+                        // gets a row because the VALUE channel is dropped.
+                        if let Some(prefix) = curie_prefix_of_literal(&assign.value) {
+                            residuals.push(residual(
+                                PlainResidualReason::CurieConstant,
+                                Some(name.to_string()),
+                                Some(prefix),
+                            ));
+                        }
+                        fields.push(Field {
+                            name: name.to_string(),
+                            field_type: Some(field_type),
+                            ..Field::default()
+                        });
+                    } else {
+                        residuals.push(residual(
+                            PlainResidualReason::NonLiteralAssign,
+                            Some(name.to_string()),
+                            Some(expr_kind(&assign.value).to_string()),
+                        ));
+                    }
+                } else {
+                    residuals.push(residual(
+                        PlainResidualReason::NonNameAssignTarget,
+                        None,
+                        None,
+                    ));
                 }
             }
             Stmt::FunctionDef(func) => functions.push(function_from_raw(analyze_method(func))),
+            Stmt::ClassDef(nested) => {
+                residuals.push(residual(
+                    PlainResidualReason::NestedClass,
+                    Some(nested.name.id.to_string()),
+                    None,
+                ));
+            }
             _ => {}
         }
     }
 
-    let inherits = class
-        .arguments
-        .as_deref()
-        .map(|args| args.args.iter().filter_map(base_name).collect())
-        .unwrap_or_default();
+    let mut inherits = Vec::new();
+    if let Some(args) = class.arguments.as_deref() {
+        for base in &args.args {
+            match base_name(base) {
+                Some(name) => inherits.push(name),
+                None => residuals.push(residual(
+                    PlainResidualReason::UnresolvedBase,
+                    None,
+                    Some(expr_kind(base).to_string()),
+                )),
+            }
+        }
+    }
 
     Model {
         name: format!("{module_prefix}_{}", class.name.id),
@@ -428,6 +732,126 @@ class Row:
         let graph = extract_plain_from_source("class Foo:\n    pass\n", "export.sepio_export");
         assert_eq!(graph.models.len(), 1);
         assert_eq!(graph.models[0].name, "export_sepio_export_Foo");
+    }
+
+    /// Count ledger rows with the given reason.
+    fn count(rows: &[PlainResidual], reason: PlainResidualReason) -> usize {
+        rows.iter().filter(|r| r.reason == reason).count()
+    }
+
+    #[test]
+    fn module_constants_land_on_the_ledger_and_curie_shape_is_two_sided() {
+        let src = r#"
+HAS_PATHOPHYSIOLOGY = "dismech:has_pathophysiology"
+URL = "https://example.org/x"
+WIN = "C:\\temp\\x"
+CLOCK = "12:30"
+SPACED = "note: with a space"
+COUNT = 3
+a, b = 1, 2
+"#;
+        let (graph, rows) = extract_plain_from_source_with_residuals(src, "mod");
+        // No classes or defs — the graph is empty; the ledger is not.
+        assert!(graph.models.is_empty());
+        assert_eq!(rows.len(), 7);
+        // Exactly ONE CURIE row: the URL (rest starts with '/'), the
+        // Windows path (backslash), the clock time (digit prefix), and the
+        // spaced string (whitespace) must all stay ModuleConstant — the
+        // can-it-stay-silent half of the shape check.
+        assert_eq!(count(&rows, PlainResidualReason::CurieConstant), 1);
+        assert_eq!(count(&rows, PlainResidualReason::ModuleConstant), 5);
+        assert_eq!(count(&rows, PlainResidualReason::NonNameAssignTarget), 1);
+        let curie = rows
+            .iter()
+            .find(|r| r.reason == PlainResidualReason::CurieConstant)
+            .expect("curie row");
+        // Prefix only — the local id is opaque and never parsed.
+        assert_eq!(curie.detail.as_deref(), Some("dismech"));
+        assert_eq!(curie.name.as_deref(), Some("HAS_PATHOPHYSIOLOGY"));
+        assert_eq!(curie.context, None);
+    }
+
+    #[test]
+    fn class_body_residuals_are_named_addressed_and_conserved() {
+        let src = r#"
+class Sample(Base, Generic[T]):
+    ok: int
+    weird: str | None
+    fwd: "dict[str, int]"
+    TAG = "GO:0001234"
+    computed = some_call()
+    a = b = 1
+
+    class Inner:
+        pass
+"#;
+        let (graph, rows) = extract_plain_from_source_with_residuals(src, "mod");
+        let m = model(&graph, "mod_Sample");
+
+        // Conservation, per site kind. AnnAssign: 3 seen = 3 fields
+        // emitted (a field is ALWAYS emitted for a name target), of which
+        // exactly 2 carry an UnresolvedAnnotation row.
+        assert_eq!(count(&rows, PlainResidualReason::UnresolvedAnnotation), 2);
+        // Assign: 3 seen = 1 literal field (TAG) + 1 NonLiteralAssign
+        // (computed) + 1 NonNameAssignTarget (chained).
+        assert_eq!(m.fields.len(), 4);
+        assert_eq!(count(&rows, PlainResidualReason::NonLiteralAssign), 1);
+        assert_eq!(count(&rows, PlainResidualReason::NonNameAssignTarget), 1);
+        // TAG's field IS emitted as str — and its CURIE value channel gets
+        // its own row, prefix-only.
+        let tag = rows
+            .iter()
+            .find(|r| r.reason == PlainResidualReason::CurieConstant)
+            .expect("class-level curie row");
+        assert_eq!(tag.detail.as_deref(), Some("GO"));
+        assert_eq!(tag.context.as_deref(), Some("Sample"));
+        // Bases: 2 seen = 1 inherits edge (Base) + 1 UnresolvedBase
+        // (Generic[T], detail = its expression kind).
+        assert_eq!(m.inherits, vec!["Base".to_string()]);
+        let base = rows
+            .iter()
+            .find(|r| r.reason == PlainResidualReason::UnresolvedBase)
+            .expect("unresolved base row");
+        assert_eq!(base.detail.as_deref(), Some("subscript"));
+        // The nested class is named, not silently dropped.
+        let nested = rows
+            .iter()
+            .find(|r| r.reason == PlainResidualReason::NestedClass)
+            .expect("nested class row");
+        assert_eq!(nested.name.as_deref(), Some("Inner"));
+        // And the ledger is EXACTLY these rows — nothing extra, no lumping.
+        assert_eq!(rows.len(), 7);
+    }
+
+    #[test]
+    fn unparsable_source_lands_one_addressed_ledger_row() {
+        let (graph, rows) =
+            extract_plain_from_source_with_residuals("class Broken(:  # nope\n", "pkg.bad");
+        assert!(graph.models.is_empty());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reason, PlainResidualReason::UnparsableSource);
+        assert_eq!(rows[0].module, "pkg.bad");
+    }
+
+    #[test]
+    fn residual_ledger_never_changes_the_graph_half() {
+        // The observation is strictly additive: the graph from the
+        // with_residuals path must be identical to the plain path's, on a
+        // fixture that exercises every residual reason at once.
+        let src = r#"
+X = "dismech:x"
+class Sample(Generic[T]):
+    weird: str | None
+    computed = f()
+    class Inner:
+        pass
+def helper():
+    pass
+"#;
+        let plain = extract_plain_from_source(src, "mod");
+        let (with_rows, rows) = extract_plain_from_source_with_residuals(src, "mod");
+        assert_eq!(plain, with_rows);
+        assert!(!rows.is_empty());
     }
 
     #[test]

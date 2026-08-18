@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use ruff_python_spo::{extract, extract_plain};
+use ruff_python_spo::{PlainResidualReason, extract, extract_plain_with_residuals};
 
 fn main() {
     let root = std::env::args().nth(1).expect("usage: plain_census <root>");
@@ -21,7 +21,7 @@ fn main() {
     let odoo_graph = extract(root);
     println!("odoo baseline: models={}", odoo_graph.models.len());
 
-    let graph = extract_plain(root, "py");
+    let (graph, residuals) = extract_plain_with_residuals(root, "py");
 
     let mut functions = 0usize;
     let mut fields = 0usize;
@@ -91,5 +91,39 @@ fn main() {
     println!("top-10 called names:");
     for (name, count) in hist.into_iter().take(10) {
         println!("  {count:>4}  {name}");
+    }
+
+    // The residual histogram — where the harvest contributed less than it
+    // could have, grouped by named reason. This is the drill signal: a
+    // concentrated histogram says where a config row would pay off; a flat
+    // one says there is nothing to drill toward.
+    println!("residuals: {} rows", residuals.len());
+    let mut by_reason: HashMap<&'static str, usize> = HashMap::new();
+    let mut by_detail: HashMap<(&'static str, String), usize> = HashMap::new();
+    for r in &residuals {
+        *by_reason.entry(r.reason.as_str()).or_insert(0) += 1;
+        if matches!(
+            r.reason,
+            PlainResidualReason::CurieConstant
+                | PlainResidualReason::UnresolvedAnnotation
+                | PlainResidualReason::NonLiteralAssign
+                | PlainResidualReason::UnresolvedBase
+        ) && let Some(detail) = &r.detail
+        {
+            *by_detail
+                .entry((r.reason.as_str(), detail.clone()))
+                .or_insert(0) += 1;
+        }
+    }
+    let mut reasons: Vec<(&str, usize)> = by_reason.into_iter().collect();
+    reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    for (reason, count) in &reasons {
+        println!("  {count:>5}  {reason}");
+    }
+    let mut details: Vec<((&str, String), usize)> = by_detail.into_iter().collect();
+    details.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    println!("top-15 residual details (reason/detail):");
+    for ((reason, detail), count) in details.into_iter().take(15) {
+        println!("  {count:>5}  {reason}/{detail}");
     }
 }
