@@ -93,7 +93,7 @@ pub fn extract_plain_from_source(source: &str, module: &str) -> ModelGraph {
 /// under the given `namespace`. Module names are derived from each file's
 /// path relative to `root` (`graph.py` → `"graph"`, `export/sepio_export.py`
 /// → `"export.sepio_export"`); a file whose path isn't valid UTF-8 is
-/// skipped (same silent-skip posture as an unparseable file).
+/// skipped (same silent-skip posture as an unparsable file).
 #[must_use]
 pub fn extract_plain(root: &Path, namespace: &str) -> ModelGraph {
     let mut models = Vec::new();
