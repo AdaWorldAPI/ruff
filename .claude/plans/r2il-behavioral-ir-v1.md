@@ -112,6 +112,23 @@
 1. **Verdict: V3 is sufficient. No V4. The hypothesis stands un-falsified**
     pending the corpus measurements (which gate only the per-route LAYOUT
     choices, not the physical grammar).
+
+    > **⊘ SUPERSEDED — OPERATOR RULING, 2026-08-21.** *"V4 ist für R2IL 100%
+    > coverage und andere Special needs / V3 wie bisher."* V4 IS minted, as an
+    > **additive sibling tier**, not a replacement: V3 continues unchanged for
+    > everything it already carries; V4 is the tier for R2IL's 100%-coverage
+    > requirement and other special needs. What survives from the line above is
+    > its *evidence*: no V3 mechanism was falsified, and the mint is not a
+    > repair of a V3 defect. What is retracted is the *conclusion* — "no V4" was
+    > a session verdict, and a session verdict does not outrank an operator
+    > ruling. Board entry: lance-graph `.claude/board/EPIPHANIES.md`
+    > `E-V4-IS-THE-100-PERCENT-TIER-V3-UNCHANGED-1`. Open under the ruling and
+    > NOT decided here: V4's layout, its home crate, the full special-needs set,
+    > the V3-vs-V4 routing rule, and whether the `0xC4` mint (O5/PR 3) lands as
+    > V3 or V4. Corroboration that the label was already in circulation:
+    > lance-graph `docs/architecture/ARC-B-OWNERSHIP-AND-ADDRESSING-REASSESSMENT.md`
+    > §7 already writes the external path as `binary → Ghidra/SLEIGH/P-code →
+    > r2sleigh → V4 R2IL` (2026-08-19).
 1. **Honesty note**: network.rs's "byte-parity vs real Tesseract" is
     designed-for (oracle named) but in-repo tests are synthetic round-trips
     against pre-registered values. R2IL routes should meet the same standard
@@ -395,6 +412,9 @@ direct consumption already succeeds without it.
 - §22.1: direct r2il/r2ssa consumption solves the upstream seam — YES (43 s).
 - §22.4: V3 represents R2IL via routes+overflow — YES per audit; corpus gates layout only.
 - §22.5: no V4; variable arity already routed upstream (SsaGraph descriptor shape).
+    **⊘ SUPERSEDED 2026-08-21 (operator ruling):** the "no V4" half is retracted —
+    see the ⊘ block under the §22.5 verdict above. The "variable arity already
+    routed upstream" half is unaffected and stands.
 
 ## Open items
 
