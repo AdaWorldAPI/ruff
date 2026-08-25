@@ -361,6 +361,7 @@ dependencies = [
  "r2il",
  "r2sleigh-lift",
  "r2ssa",
+ "sleigh-compiler",
  "sleigh-config",
 ]
 

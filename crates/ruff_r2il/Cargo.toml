@@ -25,6 +25,11 @@ r2ssa = { path = "../../../r2sleigh/crates/r2ssa" }
 r2sleigh-lift = { path = "../../../r2sleigh/crates/r2sleigh-lift", optional = true }
 sleigh-config = { version = "1.0", optional = true, features = ["x86"] }
 
+[dev-dependencies]
+# Compiles the sibling checkout's unmodified 6502.slaspec at run time for harvest_6502 —
+# the same crate C64-rs uses at build time. Dev-only: the library never compiles specs.
+sleigh-compiler = "2.0"
+
 [features]
 default = []
 lift = ["dep:r2sleigh-lift", "dep:sleigh-config"]
@@ -39,6 +44,10 @@ required-features = ["lift"]
 
 [[example]]
 name = "r2il_roundtrip_oracle"
+required-features = ["lift"]
+
+[[example]]
+name = "harvest_6502"
 required-features = ["lift"]
 
 [lints.rust]
