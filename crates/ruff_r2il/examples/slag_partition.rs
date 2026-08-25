@@ -380,21 +380,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut best = (0.0f64, 0.0f64, false);
         let mut cands: Vec<f64> = c.iter().chain(d.iter()).cloned().collect();
         cands.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        for &thr in &cands {
+        for &threshold in &cands {
             for hi_is_data in [true, false] {
                 let dt = d
                     .iter()
-                    .filter(|&&x| if hi_is_data { x >= thr } else { x < thr })
+                    .filter(|&&x| {
+                        if hi_is_data {
+                            x >= threshold
+                        } else {
+                            x < threshold
+                        }
+                    })
                     .count() as f64
                     / d.len().max(1) as f64;
                 let ct = c
                     .iter()
-                    .filter(|&&x| if hi_is_data { x < thr } else { x >= thr })
+                    .filter(|&&x| {
+                        if hi_is_data {
+                            x < threshold
+                        } else {
+                            x >= threshold
+                        }
+                    })
                     .count() as f64
                     / c.len().max(1) as f64;
                 let bal = (dt + ct) / 2.0;
                 if bal > best.1 {
-                    best = (thr, bal, hi_is_data);
+                    best = (threshold, bal, hi_is_data);
                 }
             }
         }
