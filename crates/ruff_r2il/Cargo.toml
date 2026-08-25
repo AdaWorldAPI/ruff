@@ -50,6 +50,10 @@ required-features = ["lift"]
 name = "harvest_6502"
 required-features = ["lift"]
 
+[[example]]
+name = "slag_partition"
+required-features = ["lift"]
+
 [lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "warn"
