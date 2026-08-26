@@ -45,6 +45,7 @@ use std::path::PathBuf;
 
 use r2il::{R2ILOp, SpaceId};
 use r2sleigh_lift::{Disassembler, build_arch_spec, userop_map_for_arch};
+use ruff_r2il::absref::absolute_refs;
 use ruff_r2il::mgra::{EdgeKind, GraphBuilder, Palette, encode};
 use sleigh_compiler::{SleighCompiler, SleighCompilerOptions};
 
@@ -145,6 +146,17 @@ fn walk_into(
             let size = (block.size as usize).max(1);
             instructions += 1;
 
+            // Absolute references, resolved through the block by `ruff_r2il::absref`
+            // rather than read off the address operand — on 6502 the address of an
+            // absolute-indexed access is the constant operand of the `IntAdd` that defines
+            // the address temp. `in_image` is deliberately NOT applied: an out-of-image
+            // absolute is zero page, the stack page, or a hardware register, and those are
+            // real references. It would also be meaningless against a temp, whose offset is
+            // a slot number rather than an address.
+            for a in absolute_refs(&block.ops) {
+                g.edge(origin, a, EdgeKind::AbsRef);
+            }
+
             let mut stop = false;
             let mut redirect: Option<u64> = None;
             for op in &block.ops {
@@ -177,25 +189,6 @@ fn walk_into(
                     }
                     R2ILOp::Return { .. } | R2ILOp::BranchInd { .. } | R2ILOp::CallInd { .. } => {
                         stop = true;
-                    }
-                    // A constant address operand is a static reference. Measured on these
-                    // images (1777 load/store address operands): 1257 land in `Unique`,
-                    // 354 in `Register`, 166 in `Const` — and NOT ONE `Const` one is inside
-                    // the image. 6502 absolute addressing lifts its address into a computed
-                    // temp, so recovering an in-image data address needs constant
-                    // propagation through the p-code temps, which this walk does not do and
-                    // does not fake. What `Const` DOES catch is the out-of-image absolute:
-                    // zero page, the stack page, a hardware register. Those are real
-                    // references and they are what this arm emits.
-                    //
-                    // `in_image` is deliberately NOT applied. It would also be meaningless
-                    // against a `Unique` operand, whose offset is a temp slot number rather
-                    // than an address — 92 of them compare "inside the image" by pure
-                    // coincidence of numbering.
-                    R2ILOp::Load { addr: a, .. } | R2ILOp::Store { addr: a, .. }
-                        if a.space == SpaceId::Const =>
-                    {
-                        g.edge(origin, a.offset, EdgeKind::AbsRef);
                     }
                     _ => {}
                 }
