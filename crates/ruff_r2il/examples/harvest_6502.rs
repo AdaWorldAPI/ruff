@@ -121,7 +121,7 @@ fn corpus_paths() -> Vec<PathBuf> {
         env!("CARGO_MANIFEST_DIR"),
         "/../../../adaworldapi/elite-source-code-commodore-64/4-reference-binaries/gma86-pal"
     );
-    ["gma4.bin", "gma5.bin", "gma6.bin"]
+    ["LOCODE.unprot.bin", "HICODE.unprot.bin"]
         .iter()
         .map(|f| PathBuf::from(base).join(f))
         .collect()
@@ -495,8 +495,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             continue;
         }
-        let load_addr = u64::from(u16::from_le_bytes([data[0], data[1]]));
-        let code = &data[2..];
+        // The .unprot files are RAW (no PRG header) — their load addresses are the ones the
+        // encrypted gma5/gma6 headers carried: LOCODE $1d00, HICODE $6a00.
+        let load_addr: u64 = if label.starts_with("LOCODE") {
+            0x1d00
+        } else {
+            0x6a00
+        };
+        let code = &data[..];
         let fnv = fnv1a64(&data);
         eprintln!(
             "[harvest-6502] {label}: {} bytes, load ${load_addr:04x}, fnv1a64={fnv:016x}",

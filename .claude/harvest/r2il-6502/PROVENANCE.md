@@ -7,8 +7,7 @@ Spec: /home/user/ruff/crates/ruff_r2il/../../../c64-rs/vendor/ghidra-6502/data/l
 
 | image | bytes | fnv1a64 | status |
 |---|---|---|---|
-| /home/user/ruff/crates/ruff_r2il/../../../adaworldapi/elite-source-code-commodore-64/4-reference-binaries/gma86-pal/gma4.bin | 18018 | 1d5d5317a6c5f939 | harvested (31 JSR-partitioned functions, 629 facts, 1758 residual) |
-| /home/user/ruff/crates/ruff_r2il/../../../adaworldapi/elite-source-code-commodore-64/4-reference-binaries/gma86-pal/gma5.bin | 8663 | 5671e08933ce35ea | harvested (8 JSR-partitioned functions, 340 facts, 789 residual) |
-| /home/user/ruff/crates/ruff_r2il/../../../adaworldapi/elite-source-code-commodore-64/4-reference-binaries/gma86-pal/gma6.bin | 25314 | e020a16bc544855a | harvested (23 JSR-partitioned functions, 487 facts, 1195 residual) |
+| /home/user/ruff/crates/ruff_r2il/../../../adaworldapi/elite-source-code-commodore-64/4-reference-binaries/gma86-pal/LOCODE.unprot.bin | 8661 | 86b067878a1f3e30 | harvested (80 JSR-partitioned functions, 7308 facts, 16366 residual) |
+| /home/user/ruff/crates/ruff_r2il/../../../adaworldapi/elite-source-code-commodore-64/4-reference-binaries/gma86-pal/HICODE.unprot.bin | 25312 | 0d8c1becc1a0f453 | harvested (200 JSR-partitioned functions, 26878 facts, 57927 residual) |
 
-Conservation (harvested / classified / residual / dropped): 5198 / 1456 / 3742 / 0
+Conservation (harvested / classified / residual / dropped): 108479 / 34186 / 74293 / 0

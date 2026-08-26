@@ -1,10 +1,19 @@
 //! THE SLAG PARTITION PROBE — is "data lifted as code" separable from "opcode not yet
 //! classified"?
 //!
-//! `harvest_6502` sweeps a whole PRG as instructions because a PRG has no section headers.
-//! Elite's core image is **36% pure data** by byte count, so an unknown share of that harvest's
-//! 3742 residual rows are not unclassified opcodes at all — they are ship blueprints and market
-//! tables that never should have entered the furnace.
+//! `harvest_6502` sweeps a whole image as instructions because a 6502 binary has no section
+//! headers. This probe asks whether its residual rows split into "opcode not yet classified" vs
+//! "data lifted as code".
+//!
+//! **An earlier run of this probe measured CIPHERTEXT, and every number it produced is void.**
+//! Elite's `gma4/5/6` images are ENCRYPTED — the game's own `elite-checksum.asm` ("COMMODORE 64
+//! ELITE ENCRYPTION SOURCE"): a running-sum chain `c[i] = p[i] + p[i+1]`, `KEY1=$36` LOCODE /
+//! `KEY2=$49` HICODE / `KEY3=$8E` COMLOD. On decrypted plaintext the picture INVERTS: decode-error
+//! rises to **87.6%** balanced accuracy while control-flow density FALLS to **60.8%**. The earlier
+//! 77% was an artifact of comparing high-entropy ciphertext against structured data; on real code
+//! the control-flow densities (p50 22.8 code vs 26.6 data) genuinely cannot separate. A
+//! "counterintuitive keeper" recorded at the time — that DATA shows higher control-flow density
+//! than code — is false on real code.
 //!
 //! This probe asks whether the two populations can be told apart, and answers it with a
 //! **control group rather than a heuristic**: Elite ships files that are known-pure-data
@@ -29,7 +38,7 @@
 //!
 //! **The premise this probe was built to serve turned out to be FALSE, and the probe is what
 //! showed it.** It was written believing `harvest_6502` had lifted Elite's ship blueprints and
-//! market tables as opcodes, contaminating its 3742 residual rows. It had not: Elite keeps data
+//! market tables as opcodes, contaminating its residual rows. It had not: Elite keeps data
 //! in a SEPARATE source file (`elite-data.asm` → `SHIPS.bin` / `WORDS.bin` / `LODATA.bin` /
 //! `IANTOK.bin`), and the harvest corpus was `gma4/5/6` = COMLOD / LOCODE / HICODE, all code.
 //! The per-file numbers below corroborate it independently: both code files sit inside the CODE
@@ -83,16 +92,20 @@ struct Subject {
 /// Both groups are drawn from the SAME build of the SAME game, so a separation cannot be an
 /// artifact of era, assembler, or compiler.
 const SUBJECTS: &[Subject] = &[
+    // DECRYPTED plaintext 6502. The gma4/5/6 images are ENCRYPTED (Elite's own
+    // elite-checksum.asm, "COMMODORE 64 ELITE ENCRYPTION SOURCE": a running-sum chain,
+    // KEY1=$36 / KEY2=$49 / KEY3=$8E, with trailing unencrypted padding). Measuring on
+    // those measured ciphertext; every earlier number from them is void.
     Subject {
-        file: "gma5.bin",
-        load: 0,
-        prg_header: true,
+        file: "LOCODE.unprot.bin",
+        load: 0x1d00,
+        prg_header: false,
         truth: Truth::Code,
     },
     Subject {
-        file: "gma6.bin",
-        load: 0,
-        prg_header: true,
+        file: "HICODE.unprot.bin",
+        load: 0x6a00,
+        prg_header: false,
         truth: Truth::Code,
     },
     Subject {
