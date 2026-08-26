@@ -54,6 +54,10 @@ required-features = ["lift"]
 name = "slag_partition"
 required-features = ["lift"]
 
+[[example]]
+name = "reachability_probe"
+required-features = ["lift"]
+
 [lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "warn"
