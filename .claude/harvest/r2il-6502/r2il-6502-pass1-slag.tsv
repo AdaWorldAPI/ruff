@@ -2,112 +2,121 @@
 #version 1
 #section grouped — ResidualLedger::grouped(), merged across every harvested image
 #schema section	shape_id	reason	count	example_facet
-grouped	134a977e75924abd	opcode_not_in_convention	724	00000000004000000000000000000000
-grouped	67b2c44555057f14	opcode_not_in_convention	536	00000000004000000000000000000000
-grouped	c71d53c68ab98180	opcode_not_in_convention	468	00000000004000000000000000000000
-grouped	4195ea16a74b2541	opcode_not_in_convention	452	00000000004000000000000000000000
-grouped	7cd59576ae038a0d	opcode_not_in_convention	312	00000000004000000000000000000000
-grouped	98de717e2fe793ce	opcode_not_in_convention	296	00000000684600000000000000000000
-grouped	4a95503569ad12a6	no_facet_coordinate	233	-
-grouped	3ddd2923509c7f99	opcode_not_in_convention	147	00000000004000000000000000000000
-grouped	e8be19db525f9406	opcode_not_in_convention	124	00000000004000000000000000000000
-grouped	d363ef40e5e9d53b	memory_object_escaped	102	00000000004000000000000000000000
-grouped	13b27a08b280dbf9	opcode_not_in_convention	81	00000000c87500000000000000000000
-grouped	b5b8e47e410f229d	opcode_not_in_convention	72	00000000c87500000000000000000000
-grouped	5b7105f529b450ea	opcode_not_in_convention	64	00000000c87500000000000000000000
-grouped	dd677fa80bfaf4b2	opcode_not_in_convention	44	00000000424800000000000000000000
-grouped	38185eeb1240bc84	opcode_not_in_convention	24	00000000c87500000000000000000000
-grouped	234f01aef71604c0	opcode_not_in_convention	20	00000000684600000000000000000000
-grouped	463c09f7ecce624b	opcode_not_in_convention	16	000000002e4100000000000000000000
-grouped	3a97a07dfac9b131	opcode_not_in_convention	12	000000004a4b00000000000000000000
-grouped	60ef1844628ca77f	opcode_not_in_convention	11	00000000484600000000000000000000
-grouped	fe0a9a5b56991c1a	opcode_not_in_convention	4	00000000505f00000000000000000000
+grouped	67b2c44555057f14	opcode_not_in_convention	15280	00000000361d00000000000000000000
+grouped	4a95503569ad12a6	no_facet_coordinate	14285	-
+grouped	c71d53c68ab98180	opcode_not_in_convention	12852	00000000361d00000000000000000000
+grouped	134a977e75924abd	opcode_not_in_convention	6104	00000000001d00000000000000000000
+grouped	98de717e2fe793ce	opcode_not_in_convention	6096	00000000001d00000000000000000000
+grouped	13b27a08b280dbf9	opcode_not_in_convention	5729	00000000611d00000000000000000000
+grouped	4195ea16a74b2541	opcode_not_in_convention	2316	00000000001d00000000000000000000
+grouped	d363ef40e5e9d53b	memory_object_escaped	2068	00000000001d00000000000000000000
+grouped	3ddd2923509c7f99	opcode_not_in_convention	1443	00000000611d00000000000000000000
+grouped	e8be19db525f9406	opcode_not_in_convention	1120	00000000f42300000000000000000000
+grouped	b5b8e47e410f229d	opcode_not_in_convention	1089	00000000611d00000000000000000000
+grouped	5b7105f529b450ea	opcode_not_in_convention	968	00000000611d00000000000000000000
+grouped	dd677fa80bfaf4b2	opcode_not_in_convention	880	000000006f1d00000000000000000000
+grouped	7cd59576ae038a0d	opcode_not_in_convention	844	00000000001d00000000000000000000
+grouped	463c09f7ecce624b	opcode_not_in_convention	816	000000001c2900000000000000000000
+grouped	60ef1844628ca77f	opcode_not_in_convention	721	00000000611d00000000000000000000
+grouped	3a97a07dfac9b131	opcode_not_in_convention	516	00000000a42300000000000000000000
+grouped	059d86fc4e8c7de3	variadic_arity	379	00000000722f00000000000000000000
+grouped	38185eeb1240bc84	opcode_not_in_convention	363	00000000611d00000000000000000000
+grouped	fe0a9a5b56991c1a	opcode_not_in_convention	218	00000000c22300000000000000000000
+grouped	e6a2bff3439d33c2	variadic_arity	108	000000007d3600000000000000000000
+grouped	c7a7f8ea38ade9a1	variadic_arity	69	000000000a2500000000000000000000
+grouped	bf7e313290283aa9	variadic_arity	27	00000000ddb400000000000000000000
+grouped	234f01aef71604c0	opcode_not_in_convention	2	00000000001d00000000000000000000
 #section by_address — ResidualLedger::by_address(), the proposer's work queue, merged across every harvested image
 #schema section	prefix	shape_id	count
-by_address	space:2	134a977e75924abd	377
-by_address	space:2	4195ea16a74b2541	312
-by_address	-	4a95503569ad12a6	233
-by_address	space:0	134a977e75924abd	188
-by_address	space:0	67b2c44555057f14	134
-by_address	space:3	67b2c44555057f14	134
-by_address	space:1/offset:0x35/size:1	67b2c44555057f14	126
-by_address	space:3	134a977e75924abd	118
-by_address	space:0	c71d53c68ab98180	117
-by_address	space:3	c71d53c68ab98180	117
-by_address	space:1/offset:0x30/size:1	c71d53c68ab98180	117
-by_address	space:0	4195ea16a74b2541	115
-by_address	space:0	d363ef40e5e9d53b	102
-by_address	space:2	7cd59576ae038a0d	88
-by_address	space:0	13b27a08b280dbf9	81
-by_address	space:2	98de717e2fe793ce	79
-by_address	space:0	7cd59576ae038a0d	78
-by_address	space:3	7cd59576ae038a0d	78
-by_address	space:0	98de717e2fe793ce	77
-by_address	space:2	3ddd2923509c7f99	65
-by_address	space:1/offset:0x22/size:2	98de717e2fe793ce	64
-by_address	space:2	67b2c44555057f14	54
-by_address	space:1/offset:0x0/size:1	67b2c44555057f14	53
-by_address	space:1/offset:0x0/size:1	c71d53c68ab98180	53
-by_address	space:0	3ddd2923509c7f99	49
-by_address	space:2	e8be19db525f9406	49
-by_address	space:3	98de717e2fe793ce	47
-by_address	space:2	b5b8e47e410f229d	40
-by_address	space:2	c71d53c68ab98180	37
-by_address	space:0	e8be19db525f9406	31
-by_address	space:3	e8be19db525f9406	31
-by_address	space:0	b5b8e47e410f229d	24
-by_address	space:1/offset:0x0/size:1	134a977e75924abd	20
-by_address	space:1/offset:0x2/size:1	3ddd2923509c7f99	18
-by_address	space:1/offset:0x2/size:1	67b2c44555057f14	17
-by_address	space:1/offset:0x2/size:1	c71d53c68ab98180	17
-by_address	space:0	5b7105f529b450ea	16
-by_address	space:2	5b7105f529b450ea	16
-by_address	space:3	5b7105f529b450ea	16
-by_address	space:1/offset:0x1/size:1	3ddd2923509c7f99	15
-by_address	space:1/offset:0x0/size:1	4195ea16a74b2541	14
-by_address	space:1/offset:0x2/size:1	98de717e2fe793ce	13
-by_address	space:1/offset:0x0/size:1	98de717e2fe793ce	12
-by_address	space:1/offset:0x36/size:1	4195ea16a74b2541	11
-by_address	space:0	60ef1844628ca77f	11
-by_address	space:1/offset:0x30/size:1	7cd59576ae038a0d	11
-by_address	space:1/offset:0x31/size:1	7cd59576ae038a0d	11
-by_address	space:1/offset:0x32/size:1	7cd59576ae038a0d	11
-by_address	space:1/offset:0x33/size:1	7cd59576ae038a0d	11
-by_address	space:1/offset:0x34/size:1	7cd59576ae038a0d	11
-by_address	space:1/offset:0x35/size:1	7cd59576ae038a0d	11
-by_address	space:0	dd677fa80bfaf4b2	11
-by_address	space:2	dd677fa80bfaf4b2	11
-by_address	space:1/offset:0x36/size:1	dd677fa80bfaf4b2	11
-by_address	space:0	234f01aef71604c0	10
-by_address	space:2	234f01aef71604c0	10
-by_address	space:1/offset:0x1/size:1	67b2c44555057f14	10
-by_address	space:1/offset:0x1/size:1	c71d53c68ab98180	10
-by_address	space:1/offset:0x36/size:1	e8be19db525f9406	10
-by_address	space:0	38185eeb1240bc84	8
-by_address	space:2	38185eeb1240bc84	8
-by_address	space:1/offset:0x36/size:1	38185eeb1240bc84	8
-by_address	space:1/offset:0x31/size:1	5b7105f529b450ea	8
-by_address	space:1/offset:0x36/size:1	5b7105f529b450ea	8
-by_address	space:1/offset:0x0/size:1	b5b8e47e410f229d	8
-by_address	space:1/offset:0x2/size:1	dd677fa80bfaf4b2	7
-by_address	space:1/offset:0x36/size:1	134a977e75924abd	6
-by_address	space:1/offset:0x0/size:1	3a97a07dfac9b131	6
-by_address	space:0	3a97a07dfac9b131	4
-by_address	space:0	463c09f7ecce624b	4
-by_address	space:2	463c09f7ecce624b	4
-by_address	space:1/offset:0x0/size:1	463c09f7ecce624b	4
-by_address	space:1/offset:0x36/size:1	463c09f7ecce624b	4
-by_address	space:1/offset:0x31/size:1	67b2c44555057f14	4
-by_address	space:1/offset:0x1/size:1	98de717e2fe793ce	4
-by_address	space:1/offset:0x0/size:1	dd677fa80bfaf4b2	4
-by_address	space:0	fe0a9a5b56991c1a	4
+by_address	-	4a95503569ad12a6	14285
+by_address	space:0	13b27a08b280dbf9	5729
+by_address	space:0	67b2c44555057f14	3820
+by_address	space:3	67b2c44555057f14	3820
+by_address	space:1/offset:0x35/size:1	67b2c44555057f14	3510
+by_address	space:2	134a977e75924abd	3357
+by_address	space:0	c71d53c68ab98180	3213
+by_address	space:3	c71d53c68ab98180	3213
+by_address	space:1/offset:0x30/size:1	c71d53c68ab98180	3213
+by_address	space:0	d363ef40e5e9d53b	2068
+by_address	space:1/offset:0x0/size:1	67b2c44555057f14	1811
+by_address	space:1/offset:0x0/size:1	c71d53c68ab98180	1811
+by_address	space:0	134a977e75924abd	1661
+by_address	space:0	98de717e2fe793ce	1550
+by_address	space:2	4195ea16a74b2541	1548
+by_address	space:2	98de717e2fe793ce	1503
+by_address	space:1/offset:0x22/size:2	98de717e2fe793ce	1384
+by_address	space:2	67b2c44555057f14	1199
+by_address	space:3	98de717e2fe793ce	1062
+by_address	space:0	60ef1844628ca77f	721
+by_address	space:0	4195ea16a74b2541	620
+by_address	space:2	b5b8e47e410f229d	605
+by_address	space:2	3ddd2923509c7f99	593
+by_address	space:2	c71d53c68ab98180	592
+by_address	space:3	134a977e75924abd	508
+by_address	space:1/offset:0x1/size:1	67b2c44555057f14	491
+by_address	space:1/offset:0x1/size:1	c71d53c68ab98180	491
+by_address	space:0	3ddd2923509c7f99	481
+by_address	space:2	e8be19db525f9406	433
+by_address	space:1/offset:0x0/size:1	134a977e75924abd	422
+by_address	space:0	059d86fc4e8c7de3	379
+by_address	space:0	b5b8e47e410f229d	363
+by_address	space:2	7cd59576ae038a0d	335
+by_address	space:1/offset:0x2/size:1	67b2c44555057f14	319
+by_address	space:1/offset:0x2/size:1	c71d53c68ab98180	319
+by_address	space:0	e8be19db525f9406	280
+by_address	space:3	e8be19db525f9406	280
+by_address	space:1/offset:0x0/size:1	98de717e2fe793ce	274
+by_address	space:1/offset:0x0/size:1	3a97a07dfac9b131	258
+by_address	space:0	5b7105f529b450ea	242
+by_address	space:2	5b7105f529b450ea	242
+by_address	space:3	5b7105f529b450ea	242
+by_address	space:1/offset:0x2/size:1	3ddd2923509c7f99	232
+by_address	space:0	dd677fa80bfaf4b2	220
+by_address	space:2	dd677fa80bfaf4b2	220
+by_address	space:1/offset:0x36/size:1	dd677fa80bfaf4b2	220
+by_address	space:0	fe0a9a5b56991c1a	218
+by_address	space:0	7cd59576ae038a0d	211
+by_address	space:3	7cd59576ae038a0d	211
+by_address	space:0	463c09f7ecce624b	204
+by_address	space:2	463c09f7ecce624b	204
+by_address	space:1/offset:0x0/size:1	463c09f7ecce624b	204
+by_address	space:1/offset:0x36/size:1	463c09f7ecce624b	204
+by_address	space:1/offset:0x1/size:1	98de717e2fe793ce	196
+by_address	space:0	3a97a07dfac9b131	160
+by_address	space:1/offset:0x0/size:1	dd677fa80bfaf4b2	153
+by_address	space:1/offset:0x0/size:1	4195ea16a74b2541	144
+by_address	space:1/offset:0x36/size:1	134a977e75924abd	141
+by_address	space:1/offset:0x1/size:1	3ddd2923509c7f99	137
+by_address	space:1/offset:0x36/size:1	67b2c44555057f14	136
+by_address	space:1/offset:0x30/size:1	67b2c44555057f14	132
+by_address	space:1/offset:0x2/size:1	98de717e2fe793ce	127
+by_address	space:1/offset:0x36/size:1	e8be19db525f9406	124
+by_address	space:0	38185eeb1240bc84	121
+by_address	space:2	38185eeb1240bc84	121
+by_address	space:1/offset:0x36/size:1	38185eeb1240bc84	121
+by_address	space:1/offset:0x31/size:1	5b7105f529b450ea	121
+by_address	space:1/offset:0x36/size:1	5b7105f529b450ea	121
+by_address	space:1/offset:0x0/size:1	b5b8e47e410f229d	121
+by_address	space:0	e6a2bff3439d33c2	108
+by_address	space:2	3a97a07dfac9b131	98
+by_address	space:0	c7a7f8ea38ade9a1	69
+by_address	space:1/offset:0x36/size:1	7cd59576ae038a0d	63
+by_address	space:1/offset:0x1/size:1	dd677fa80bfaf4b2	44
+by_address	space:1/offset:0x31/size:1	67b2c44555057f14	42
+by_address	space:0	bf7e313290283aa9	27
+by_address	space:1/offset:0x2/size:1	dd677fa80bfaf4b2	23
+by_address	space:1/offset:0x36/size:1	4195ea16a74b2541	4
+by_address	space:1/offset:0x30/size:1	7cd59576ae038a0d	4
+by_address	space:1/offset:0x31/size:1	7cd59576ae038a0d	4
+by_address	space:1/offset:0x32/size:1	7cd59576ae038a0d	4
+by_address	space:1/offset:0x33/size:1	7cd59576ae038a0d	4
+by_address	space:1/offset:0x34/size:1	7cd59576ae038a0d	4
+by_address	space:1/offset:0x35/size:1	7cd59576ae038a0d	4
 by_address	space:1/offset:0x31/size:1	134a977e75924abd	3
 by_address	space:1/offset:0x32/size:1	134a977e75924abd	3
 by_address	space:1/offset:0x33/size:1	134a977e75924abd	3
 by_address	space:1/offset:0x34/size:1	134a977e75924abd	3
 by_address	space:1/offset:0x35/size:1	134a977e75924abd	3
-by_address	space:1/offset:0x30/size:1	67b2c44555057f14	3
 by_address	space:1/offset:0x30/size:1	e8be19db525f9406	3
-by_address	space:2	3a97a07dfac9b131	2
-by_address	space:1/offset:0x36/size:1	7cd59576ae038a0d	2
-by_address	space:1/offset:0x36/size:1	67b2c44555057f14	1
+by_address	space:0	234f01aef71604c0	1
+by_address	space:2	234f01aef71604c0	1
