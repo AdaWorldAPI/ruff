@@ -30,6 +30,16 @@ sleigh-config = { version = "1.0", optional = true, features = ["x86"] }
 # the same crate C64-rs uses at build time. Dev-only: the library never compiles specs.
 sleigh-compiler = "2.0"
 
+# The MGRA v3 CONSUMER, used as the decoder in `mgra`'s round-trip test. Testing an encoder
+# against a decoder written in the same module proves only self-consistency, which is why
+# the crate that actually renders this wire is the one that reads it back.
+#
+# `default-features = false` drops the `wgpu` feature: measured, zero wgpu crates enter the
+# lock. It is not free, though — 30 transitive crates arrive (ndarray, and the wasm-bindgen
+# / web-sys family behind the consumer's browser module). Dev-only, so nothing reaches the
+# library, and worth it for a falsifier that cannot agree with itself by construction.
+a2ui-graph = { path = "../../../a2ui-rs/crates/a2ui-graph", default-features = false }
+
 [features]
 default = []
 lift = ["dep:r2sleigh-lift", "dep:sleigh-config"]
@@ -56,6 +66,10 @@ required-features = ["lift"]
 
 [[example]]
 name = "reachability_probe"
+required-features = ["lift"]
+
+[[example]]
+name = "mgra_emit"
 required-features = ["lift"]
 
 [lints.rust]

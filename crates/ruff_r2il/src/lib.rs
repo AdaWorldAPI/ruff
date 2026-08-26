@@ -67,6 +67,7 @@ pub mod behavior;
 pub mod convention;
 pub mod facet;
 pub mod furnace;
+pub mod mgra;
 pub mod oracle;
 pub mod ore;
 pub mod sink;
