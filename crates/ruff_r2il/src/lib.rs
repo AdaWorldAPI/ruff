@@ -63,6 +63,7 @@
 //! reviewer who finds a signature here contradicting the actual upstream source should treat the
 //! source as authoritative and file a correction — never silently improvise a replacement shape.
 
+pub mod absref;
 pub mod behavior;
 pub mod convention;
 pub mod facet;
