@@ -8,6 +8,14 @@
 //! > **Code is what a call graph REACHES. Data is what is only ever loaded FROM.**
 //!
 //! A byte's role is a property of its ADDRESS's position in the graph, not of the byte's value.
+//!
+//! **Correction, 2026-08-26: the `unreached+ref` column was structurally zero until now.** It
+//! filtered `addr.space == Const && in_image(addr)`, which cannot match on this architecture —
+//! see [`Walk::data_refs`]. With the reference resolved properly through the block
+//! ([`ruff_r2il::absref`]) the column is a real measurement, and it says something: of 60
+//! in-image referenced addresses across both code images, **58 are never reached as code**
+//! (LOCODE 7 of 9, HICODE 51 of 51). That is the "data is what is only ever loaded from" half
+//! of the hypothesis, which the reached% column alone cannot show.
 //! So this probe replaces the linear sweep with **recursive descent** from the entry plus every
 //! discovered call target, and asks whether the reached set discriminates.
 //!
@@ -65,6 +73,7 @@ use std::path::PathBuf;
 
 use r2il::{R2ILOp, SpaceId};
 use r2sleigh_lift::{Disassembler, build_arch_spec, userop_map_for_arch};
+use ruff_r2il::absref::absolute_refs;
 use sleigh_compiler::{SleighCompiler, SleighCompilerOptions};
 
 const LIFT_MIN_BYTES: usize = 16;
@@ -138,9 +147,17 @@ const SUBJECTS: &[Subject] = &[
 struct Walk {
     /// Bytes covered by an instruction recursive descent actually decoded.
     reached: BTreeSet<u64>,
-    /// In-image addresses that appear as the address operand of a Load or Store — "referenced AS
-    /// DATA". A byte both unreached and data-referenced is the strongest data evidence available
-    /// without running the program.
+    /// In-image addresses named by a resolved absolute reference — "referenced AS DATA". A byte
+    /// both unreached and data-referenced is the strongest data evidence available without
+    /// running the program.
+    ///
+    /// Resolved by [`ruff_r2il::absref`], not read off the address operand. The earlier
+    /// `addr.space == Const && in_image(addr)` filter made this set STRUCTURALLY EMPTY: a full
+    /// linear sweep of LOCODE finds 1418 load/store address operands — 860 `Unique`, 328
+    /// `Register`, 230 `Const` — and not one `Const` operand inside the image, because 6502
+    /// absolute-indexed addressing puts the base in the constant operand of the `IntAdd` that
+    /// defines the address temp. The `unreached+ref` column read 0.00% and looked like a
+    /// measurement.
     data_refs: BTreeSet<u64>,
     /// Call targets discovered during the walk (the 6502 stand-in for a symbol table).
     calls: BTreeSet<u64>,
@@ -218,6 +235,17 @@ fn walk(disasm: &Disassembler, code: &[u8], load: u64, entries: &BTreeSet<u64>) 
                 w.reached.insert(addr + b);
             }
 
+            // Static data references, resolved through the block rather than read off the
+            // address operand. See `ruff_r2il::absref`: on 6502 the address of an
+            // absolute-indexed access is the constant operand of the `IntAdd` that defines
+            // the address temp, so the old `addr.space == Const` filter could never match
+            // and this set was structurally empty.
+            for a in absolute_refs(&block.ops) {
+                if in_image(a) {
+                    w.data_refs.insert(a);
+                }
+            }
+
             let mut stop = false;
             let mut redirect: Option<u64> = None;
             for op in &block.ops {
@@ -247,13 +275,6 @@ fn walk(disasm: &Disassembler, code: &[u8], load: u64, entries: &BTreeSet<u64>) 
                     }
                     R2ILOp::Return { .. } | R2ILOp::BranchInd { .. } | R2ILOp::CallInd { .. } => {
                         stop = true;
-                    }
-                    // A constant address operand is a static data reference. A register operand
-                    // is not resolvable here and is deliberately not guessed at.
-                    R2ILOp::Load { addr: a, .. } | R2ILOp::Store { addr: a, .. }
-                        if a.space == SpaceId::Const && in_image(a.offset) =>
-                    {
-                        w.data_refs.insert(a.offset);
                     }
                     _ => {}
                 }
@@ -322,8 +343,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== recursive descent from entry + discovered call targets ===");
     println!(
-        "{:<12} {:>6} {:>8} {:>10} {:>12} {:>8} {:>10}",
-        "file", "truth", "bytes", "reached%", "unreached+ref", "seeds", "instrs"
+        "{:<12} {:>6} {:>8} {:>10} {:>7} {:>12} {:>8} {:>10}",
+        "file", "truth", "bytes", "reached%", "refs", "unreached+ref", "seeds", "instrs"
     );
 
     for s in SUBJECTS {
@@ -343,8 +364,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let w = walk(&disasm, code, load, &seeds);
         let total = code.len() as f64;
         let reached_pct = 100.0 * w.reached.len() as f64 / total;
-        // Bytes never reached as code AND referenced by a constant-address load/store: the
+        // Bytes never reached as code AND named by a resolved absolute reference: the
         // strongest static evidence of a data role.
+        //
+        // Reported next to the RAW in-image reference count on purpose. One number cannot
+        // distinguish "the resolver found nothing" from "it found plenty and they were all
+        // reached code" — and the first of those is what this column silently was before
+        // `absref` landed.
         let unreached_ref = w
             .data_refs
             .iter()
@@ -352,7 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .count();
         let unreached_ref_pct = 100.0 * unreached_ref as f64 / total;
         println!(
-            "{:<12} {:>6} {:>8} {:>9.1}% {:>11.2}% {:>8} {:>10}",
+            "{:<12} {:>6} {:>8} {:>9.1}% {:>7} {:>11.2}% {:>8} {:>10}",
             s.file,
             if s.truth == Truth::Code {
                 "CODE"
@@ -361,6 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             code.len(),
             reached_pct,
+            w.data_refs.len(),
             unreached_ref_pct,
             seeds.len(),
             w.instructions
