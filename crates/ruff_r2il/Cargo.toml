@@ -4,8 +4,8 @@ version = "0.1.0"
 publish = false
 # Excluded from the ruff workspace (root `exclude`), so nothing here can inherit from
 # [workspace.package] / [workspace.dependencies] / [workspace.lints]. edition/rust-version are
-# pinned by hand to satisfy BOTH sides: ruff (edition 2024, rust-version 1.93, toolchain 1.97.1)
-# and r2sleigh (edition 2024).
+# pinned by hand to satisfy BOTH sides: ruff (edition 2024, rust-version per the workspace
+# Cargo.toml, toolchain per rust-toolchain.toml) and r2sleigh (edition 2024).
 edition = "2024"
 rust-version = "1.93"
 description = "R2IL intake arm: a lossless ore carrier over r2sleigh's r2il/r2ssa object graph, a furnace that melts it into flat facet-addressed concern rows, and an addressed residual (slag) ledger. Ore in, named slag out — no catch-all, nothing dropped."
