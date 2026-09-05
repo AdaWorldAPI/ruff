@@ -53,7 +53,11 @@ jobs:
       matrix:
         revision: [base, pr]
     runs-on: ${{ github.repository == 'astral-sh/ruff' && 'depot-ubuntu-22.04-32' || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    # The widest gap in the repository: upstream builds on a 32-core Depot
+    # machine, a fork on `ubuntu-latest`, and both were given five minutes.
+    # A fork build measured 5m34s with a warm `rust-cache`; 25 leaves room for
+    # a cold one, which is the case the five-minute limit could never survive.
+    timeout-minutes: ${{ github.repository == 'astral-sh/ruff' && 5 || 25 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
