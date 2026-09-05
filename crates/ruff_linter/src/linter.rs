@@ -1059,7 +1059,7 @@ mod tests {
             },
         );
         insta::with_settings!({filters => vec![(r"\\", "/")]}, {
-                assert_diagnostics!(snapshot.to_string(), diagnostics);
+                assert_diagnostics!(snapshot, diagnostics);
         });
 
         Ok(())
