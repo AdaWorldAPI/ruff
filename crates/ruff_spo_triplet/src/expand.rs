@@ -888,6 +888,52 @@ impl Expander {
             .to_string(),
             Provenance::CppExtracted,
         );
+        // Body arm — the `Function` quartet + J1 fact, SAME predicates, SAME
+        // object encoding, SAME truth tiers as the Ruby/Python path above, so
+        // `recipe::classify` and OGAR `lift_actions` see one shape. Own-member
+        // objects join the `cpp_field` node (`{model_iri}.{member}`); `raises`
+        // takes the `exc:` namespace here (the IR carries the bare type name);
+        // `calls` stays a verbatim `"receiver.method"` string, not an IRI.
+        for read in &method.reads {
+            self.push(
+                method_iri.clone(),
+                Predicate::ReadsField,
+                format!("{model_iri}.{read}"),
+                Provenance::Inferred,
+            );
+        }
+        for exc in &method.raises {
+            self.push(
+                method_iri.clone(),
+                Predicate::Raises,
+                format!("exc:{exc}"),
+                Provenance::Authoritative,
+            );
+        }
+        for write in &method.writes {
+            self.push(
+                method_iri.clone(),
+                Predicate::WritesField,
+                format!("{model_iri}.{write}"),
+                Provenance::Authoritative,
+            );
+        }
+        for gw in &method.guarded_writes {
+            self.push(
+                method_iri.clone(),
+                Predicate::WritesIfBlank,
+                format!("{model_iri}.{gw}"),
+                Provenance::Authoritative,
+            );
+        }
+        for call in &method.calls {
+            self.push(
+                method_iri.clone(),
+                Predicate::Calls,
+                call.clone(),
+                Provenance::Inferred,
+            );
+        }
         if let Some(req) = &method.requires_clause {
             // Last potential use of `method_iri` — move, don't clone.
             self.push(
@@ -2391,6 +2437,11 @@ mod tests {
             is_const: true,
             is_static: false,
             access: CppAccess::Public,
+            writes: vec!["status_".to_string(), "recognizer_".to_string()],
+            reads: vec!["recognizer_".to_string()],
+            raises: vec!["BadStatus".to_string()],
+            calls: vec!["repo_.Save".to_string()],
+            guarded_writes: vec!["recognizer_".to_string()],
         });
         rec.methods.push(CppMethod {
             name: "Clear".to_string(),
@@ -2405,6 +2456,11 @@ mod tests {
             is_const: false,
             is_static: false,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
         });
         rec.methods.push(CppMethod {
             name: "kMaxRating".to_string(),
@@ -2419,6 +2475,11 @@ mod tests {
             is_const: false,
             is_static: true,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
         });
         rec.methods.push(CppMethod {
             name: "operator==".to_string(),
@@ -2433,6 +2494,11 @@ mod tests {
             is_const: false,
             is_static: false,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
         });
         rec.templates.push(CppTemplate {
             kind: CppTemplateKind::Specialisation,
@@ -2548,6 +2614,87 @@ mod tests {
         // Inferred per-edge overrides
         assert_eq!(truth("uses_macro_expansion"), Some((0.85, 0.75)));
         assert_eq!(truth("template_instantiates"), Some((0.85, 0.75)));
+        // Body arm — the C++ method reuses the `Function` tiers verbatim, so
+        // the recipe classifier sees one calibration regardless of frontend.
+        // The reference is a Ruby/Python-shaped `Function` carrying the same
+        // five facts, built here rather than reused from `fixture()` (whose
+        // function has no writes or calls, so it could only prove the tiers
+        // agree on the two predicates it happens to emit).
+        let mut fn_graph = ModelGraph::new("ruby");
+        let mut fn_model = Model::new("Order");
+        fn_model.functions.push(Function {
+            name: "settle".to_string(),
+            reads: vec!["total".to_string()],
+            raises: vec!["UserError".to_string()],
+            writes: vec!["state".to_string()],
+            guarded_writes: vec!["state".to_string()],
+            calls: vec!["self.save".to_string()],
+            ..Function::default()
+        });
+        fn_graph.models.push(fn_model);
+        let fn_triples = expand(&fn_graph);
+        let fn_truth = |p: &str| fn_triples.iter().find(|t| t.p == p).map(|t| (t.f, t.c));
+        for p in [
+            "reads_field",
+            "writes_field",
+            "raises",
+            "calls",
+            "writes_if_blank",
+        ] {
+            let cpp = truth(p);
+            assert!(cpp.is_some(), "C++ fixture emitted no `{p}`");
+            assert_eq!(
+                cpp,
+                fn_truth(p),
+                "`{p}` tier differs between C++ and Function paths"
+            );
+        }
+    }
+
+    /// The C++ body arm expands to the SAME five predicates, with the SAME
+    /// object encoding, as a Ruby/Python `Function` body: own members join
+    /// the `cpp_field` node, exceptions take the `exc:` namespace, calls stay
+    /// verbatim `receiver.method` strings. Anchored on the per-overload
+    /// method IRI so a body fact can never attach to the wrong overload.
+    #[test]
+    fn cpp_method_body_arm_expands_to_the_function_quartet() {
+        let triples = expand(&cpp_fixture());
+        let m = "cpp:Tesseract::Recognizer.Recognize(int,const Image &) const";
+        let has =
+            |s: &str, p: &str, o: &str| triples.iter().any(|t| t.s == s && t.p == p && t.o == o);
+        assert!(has(m, "writes_field", "cpp:Tesseract::Recognizer.status_"));
+        assert!(has(
+            m,
+            "writes_field",
+            "cpp:Tesseract::Recognizer.recognizer_"
+        ));
+        assert!(has(
+            m,
+            "reads_field",
+            "cpp:Tesseract::Recognizer.recognizer_"
+        ));
+        assert!(has(
+            m,
+            "writes_if_blank",
+            "cpp:Tesseract::Recognizer.recognizer_"
+        ));
+        assert!(has(m, "raises", "exc:BadStatus"));
+        assert!(has(m, "calls", "repo_.Save"));
+        // The written member joins the field node `cpp_field` emitted.
+        assert!(has(
+            "cpp:Tesseract::Recognizer",
+            "has_field",
+            "cpp:Tesseract::Recognizer.recognizer_"
+        ));
+        // Silence half: the three arm-less overloads emit no body facts at all.
+        for t in &triples {
+            if matches!(
+                t.p.as_str(),
+                "writes_field" | "reads_field" | "raises" | "calls" | "writes_if_blank"
+            ) {
+                assert_eq!(t.s, m, "body fact `{}` leaked onto `{}`", t.p, t.s);
+            }
+        }
     }
 
     /// Every C++ machine-plane predicate fires from the fixture — the C++
@@ -2575,6 +2722,11 @@ mod tests {
             "is_const",
             "is_static",
             "has_visibility",
+            "writes_field",
+            "reads_field",
+            "raises",
+            "calls",
+            "writes_if_blank",
         ] {
             assert!(
                 seen.contains(p),

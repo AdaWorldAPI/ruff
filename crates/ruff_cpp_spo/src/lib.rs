@@ -59,8 +59,8 @@ use ruff_spo_triplet::{
 mod clang_walker;
 #[cfg(feature = "libclang")]
 pub use clang_walker::{
-    MAPPED_CURSOR_KINDS, ParseDiagnostic, WalkError, class_body_cursor_histogram, walk_enums,
-    walk_free_functions, walk_tu, walk_tu_with_diagnostics,
+    BodyArmConfig, MAPPED_CURSOR_KINDS, ParseDiagnostic, WalkError, class_body_cursor_histogram,
+    walk_enums, walk_free_functions, walk_tu, walk_tu_configured, walk_tu_with_diagnostics,
 };
 
 /// The namespace prefix for C++ machine-plane subjects/objects.
@@ -311,8 +311,14 @@ fn walk_files(files: &[std::path::PathBuf], args: &[String]) -> Result<ModelGrap
         match walk_tu(f, args) {
             Ok(classes) => {
                 for cls in classes {
-                    seen.entry(cls.qualified_name())
-                        .or_insert_with(|| model_from_class(&cls));
+                    match seen.entry(cls.qualified_name()) {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(model_from_class(&cls));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            merge_body_arms(e.get_mut(), &model_from_class(&cls));
+                        }
+                    }
                 }
             }
             Err(WalkError::Parse(_)) => {}
@@ -322,6 +328,46 @@ fn walk_files(files: &[std::path::PathBuf], args: &[String]) -> Result<ModelGrap
     let mut graph = ModelGraph::new(NAMESPACE);
     graph.models = seen.into_values().collect();
     Ok(graph)
+}
+
+/// Fold a later TU's view of an already-seen class into the kept one, taking
+/// the body arm from whichever TU actually had the body.
+///
+/// A class is normally declared once in a header and seen again in every TU
+/// that includes it, so first-wins is right for the signature plane — every
+/// sighting agrees. The body arm does NOT agree: a method declared in the
+/// header and DEFINED in a `.cpp` has an empty arm in every TU but that one,
+/// and the header is usually walked first. Without this fold the out-of-line
+/// definitions — which in a real C++ corpus is most of the interesting
+/// behaviour — would silently harvest nothing.
+///
+/// Methods are matched on `(name, param_types, is_const)`: the same identity
+/// the method IRI encodes, so a merge can never move one overload's body onto
+/// another. Only an EMPTY arm is filled; a non-empty one is never overwritten,
+/// so the result does not depend on which TU came first.
+#[cfg(feature = "libclang")]
+fn merge_body_arms(kept: &mut Model, incoming: &Model) {
+    for method in &mut kept.methods {
+        if !method.writes.is_empty()
+            || !method.reads.is_empty()
+            || !method.raises.is_empty()
+            || !method.calls.is_empty()
+        {
+            continue;
+        }
+        let Some(with_body) = incoming.methods.iter().find(|m| {
+            m.name == method.name
+                && m.param_types == method.param_types
+                && m.is_const == method.is_const
+        }) else {
+            continue;
+        };
+        method.writes.clone_from(&with_body.writes);
+        method.reads.clone_from(&with_body.reads);
+        method.raises.clone_from(&with_body.raises);
+        method.calls.clone_from(&with_body.calls);
+        method.guarded_writes.clone_from(&with_body.guarded_writes);
+    }
 }
 
 /// The pure unpacking: build a [`Model`] from a parsed [`CppClass`] by
@@ -401,6 +447,11 @@ mod tests {
             is_const: false,
             is_static: false,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
         });
         rec.methods.push(CppMethod {
             name: "Clear".to_string(),
@@ -415,6 +466,11 @@ mod tests {
             is_const: false,
             is_static: false,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
         });
         rec.templates.push(CppTemplate {
             kind: CppTemplateKind::Specialisation,
@@ -561,6 +617,11 @@ mod tests {
                     is_const: false,
                     is_static: false,
                     access: CppAccess::Public,
+                    writes: Vec::new(),
+                    reads: Vec::new(),
+                    raises: Vec::new(),
+                    calls: Vec::new(),
+                    guarded_writes: Vec::new(),
                 }),
                 Declaration::Template(CppTemplate {
                     kind: CppTemplateKind::Instantiation,
@@ -1000,6 +1061,98 @@ class Recognizer : public Classify {
             !expand(&graph).is_empty(),
             "expected SPO triples from the real header"
         );
+    }
+
+    /// A class declared in a header and DEFINED in a `.cpp` is seen by two
+    /// translation units: the header's sighting has the signatures and an
+    /// empty body arm, the source's has both. First-wins on the whole model
+    /// would keep the header's — so every out-of-line definition, which in a
+    /// real C++ corpus is most of the behaviour, would harvest nothing.
+    ///
+    /// Hermetic: writes its own two-file corpus, so it measures the merge and
+    /// not the availability of a real tree.
+    #[cfg(feature = "libclang")]
+    #[test]
+    fn a_body_defined_out_of_line_survives_the_cross_tu_dedup() {
+        let _guard = CLANG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join("cpp_merge_body_arms");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // `a_header.h` sorts before `b_source.cpp`, so the arm-less sighting
+        // is the one `walk_files` inserts first — the order the merge has to
+        // survive.
+        std::fs::write(
+            dir.join("a_header.h"),
+            "struct Repo { void Save(); };\n\
+             struct Svc { int status_; Repo repo_; void finish(int v); };\n",
+        )
+        .expect("header");
+        std::fs::write(
+            dir.join("b_source.cpp"),
+            "#include \"a_header.h\"\n\
+             void Svc::finish(int v) { status_ = v; repo_.Save(); }\n",
+        )
+        .expect("source");
+
+        // `-x c++` is load-bearing: without it libclang guesses the language
+        // from the extension and parses a `.h` as C, where the header's class
+        // fails to parse at all. The header would then contribute NOTHING, the
+        // source's sighting would be the only one, and first-wins would look
+        // like a working merge. (Measured — this test passed with the merge
+        // disabled until the flag was added.)
+        let args = [
+            "-std=c++17".to_string(),
+            "-x".to_string(),
+            "c++".to_string(),
+            format!("-I{}", dir.display()),
+        ];
+
+        // Anti-vacuity: the header's own sighting must really be arm-less, or
+        // there are not two different sightings to merge and the assertions
+        // below would hold with no merge at all.
+        let (header_classes, _) = crate::walk_tu_with_diagnostics(
+            &dir.join("a_header.h"),
+            &[
+                "-std=c++17".to_string(),
+                "-x".to_string(),
+                "c++".to_string(),
+            ],
+        )
+        .expect("header walks");
+        let header_finish = header_classes
+            .iter()
+            .find(|c| c.name == "Svc")
+            .and_then(|c| {
+                c.declarations.iter().find_map(|d| match d {
+                    Declaration::Method(m) if m.name == "finish" => Some(m),
+                    _ => None,
+                })
+            })
+            .expect("the header declares finish");
+        assert!(
+            header_finish.writes.is_empty(),
+            "the header sighting must be arm-less: {:?}",
+            header_finish.writes
+        );
+
+        let graph = extract_dir(&dir, &args).expect("libclang init (LIBCLANG_PATH set)");
+        let svc = graph
+            .models
+            .iter()
+            .find(|m| m.name == "Svc")
+            .expect("Svc harvested");
+        let finish = svc
+            .methods
+            .iter()
+            .find(|m| m.name == "finish")
+            .expect("finish harvested");
+        assert_eq!(finish.writes, ["status_"], "the out-of-line body's write");
+        assert_eq!(finish.calls, ["repo_.Save"], "the out-of-line body's call");
+        // The signature plane is unaffected by the merge.
+        assert_eq!(finish.param_types, ["int"]);
+        assert_eq!(svc.methods.len(), 1, "the class is not duplicated");
     }
 
     /// First **ndjson emission** from a real corpus subset — gated on
