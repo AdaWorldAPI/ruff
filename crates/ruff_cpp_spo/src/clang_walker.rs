@@ -1486,6 +1486,28 @@ pub(crate) fn bare_type_name(display: &str) -> String {
 #[cfg(all(test, feature = "libclang"))]
 pub(crate) static CLANG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// A per-process, per-call suffix for a test fixture directory.
+///
+/// [`CLANG_TEST_LOCK`] serialises libclang WITHIN a process, and that is all it
+/// can do: this repository runs tests under nextest, which gives every `#[test]`
+/// its OWN process, so a `Mutex` in one of them is invisible to the others.
+/// Twelve tests once shared `cpp_arm_shapes/f.cpp`, and `File::create`
+/// truncates, so one process could empty the file while another was inside
+/// `parse()`. That parse then found no methods and the caller's index panicked
+/// with `no entry found for key` — intermittently, which is the worst way to
+/// find out. Unique paths remove the sharing instead of trying to coordinate
+/// it.
+#[cfg(test)]
+pub(crate) fn fixture_salt() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 #[cfg(all(test, feature = "libclang"))]
 mod arm_tests {
     use super::*;
@@ -1515,15 +1537,14 @@ mod arm_tests {
     /// One parse per fixture, not one per method: `Clang` is a process
     /// singleton, so each parse serialises on [`CLANG_TEST_LOCK`].
     fn arms_with(name: &str, src: &str, cfg: &BodyArmConfig) -> BTreeMap<String, BodyArm> {
-        let dir = std::env::temp_dir().join(format!("cpp_arm_{name}"));
+        let dir = std::env::temp_dir().join(format!("cpp_arm_{name}_{}", fixture_salt()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
 
-        // The write happens INSIDE the lock. Twelve tests share the `shapes`
-        // fixture, so they share this path; `File::create` truncates, so a
-        // write outside the lock can empty the file while another thread is
-        // inside `parse()` on it. That parse then finds no methods and the
-        // caller's index panics.
+        // The write is inside the lock, which serialises libclang within THIS
+        // process. It does not make the fixture safe on its own: see
+        // `fixture_salt`, which is what actually stops two test PROCESSES
+        // sharing a path.
         let _guard = CLANG_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1648,7 +1669,7 @@ struct D : Base {
     void f() && override {}
 };
 ";
-        let dir = std::env::temp_dir().join("cpp_refq_override");
+        let dir = std::env::temp_dir().join(format!("cpp_refq_override_{}", fixture_salt()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
         let _guard = CLANG_TEST_LOCK
@@ -1908,7 +1929,7 @@ struct Svc {
 };
 void Svc::finish(int v) { status_ = v; repo_.Save(); }
 "#;
-        let dir = std::env::temp_dir().join("cpp_arm_outofline");
+        let dir = std::env::temp_dir().join(format!("cpp_arm_outofline_{}", fixture_salt()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
         std::fs::write(&path, src).expect("write fixture");
@@ -1955,7 +1976,7 @@ struct Holder {
     void value() { plain_only_ = 3; }
 };
 "#;
-        let dir = std::env::temp_dir().join("cpp_refqual");
+        let dir = std::env::temp_dir().join(format!("cpp_refqual_{}", fixture_salt()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
         std::fs::write(&path, src).expect("write fixture");
@@ -2011,7 +2032,7 @@ struct Holder {
         let src = r#"
 struct Svc { int status_; void set(int v) { status_ = v; } };
 "#;
-        let dir = std::env::temp_dir().join("cpp_arm_sigonly");
+        let dir = std::env::temp_dir().join(format!("cpp_arm_sigonly_{}", fixture_salt()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
         std::fs::write(&path, src).expect("write fixture");
@@ -2062,7 +2083,7 @@ mod walker_tests {
     /// Write `src` to a fresh temp file under a name-scoped dir (mirrors
     /// `arm_tests::arm_of`'s fixture-writing pattern), returning its path.
     fn write_fixture(name: &str, src: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("cpp_walker_{name}"));
+        let dir = std::env::temp_dir().join(format!("cpp_walker_{name}_{}", fixture_salt()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f.cpp");
         let mut fh = std::fs::File::create(&path).unwrap();
