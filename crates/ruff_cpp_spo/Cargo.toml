@@ -69,3 +69,7 @@ workspace = true
 [[example]]
 name = "harvest_events"
 required-features = ["libclang"]
+# The compilation-database reader lives here and has its own unit tests, so the
+# example is a test target too. Without this, `cargo test` builds it but never
+# runs those tests, and a parser regression ships silently.
+test = true
