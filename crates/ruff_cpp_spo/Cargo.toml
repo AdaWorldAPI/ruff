@@ -65,3 +65,7 @@ ruff_cpp_codegen = { workspace = true }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "harvest_events"
+required-features = ["libclang"]
