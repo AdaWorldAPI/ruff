@@ -664,13 +664,17 @@ codebook classifies on (`writes`/`reads`/`raises`/`calls` + the J1
 
 - **Correction, same day** — an earlier draft of this entry said the feature
   had "zero corpus-scale numbers". A one-off census HAS since been run, and
-  its numbers are below; what remains missing is a *committed, re-runnable*
-  census, because `crates/ruff_cpp_spo/examples/harvest_ladybug.rs` reports
-  only the signature plane (`inherits_from` trees, `has_function` top-25,
-  pure-virtual counts, `virtually_overrides`, field/template/static-assert
-  counts) and never calls `recipe::classify`. So the numbers below are a
-  measurement, not a gate: nothing re-runs them, and nothing fails if they
-  regress.
+  its numbers are below. **Second correction, same day:**
+  `crates/ruff_cpp_spo/examples/harvest_ladybug.rs` now reports the body arm
+  too — the five fact totals, a full `RecipeCentroid` census, and a
+  top-classes-by-body-fact list — so the census is re-runnable rather than
+  one-off. What is still missing is a *gate*: the example prints, it does not
+  assert, so a regression would show up in the output and fail nothing. On
+  `src/include/catalog` (headers only) it reports 2424 methods, 381 with at
+  least one body fact, census `Observe=283 Compute=62 Normalize=19
+  Cascade=10 Guard=7` — and that 381 agrees exactly with an independent count
+  of body-predicate subjects in the emitted ndjson, which is the cross-check
+  that makes the census trustworthy rather than merely present.
 
   `extract_tree` over `ladybug/src/catalog` (358 classes), every `CppMethod`
   through `recipe::classify`:
