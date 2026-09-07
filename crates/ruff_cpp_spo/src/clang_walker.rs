@@ -40,9 +40,12 @@ use std::fmt;
 use std::path::Path;
 
 use clang::diagnostic::Severity;
-use clang::{Accessibility, Clang, Entity, EntityKind, ExceptionSpecification, Index};
+use clang::{
+    Accessibility, Clang, Entity, EntityKind, ExceptionSpecification, Index, RefQualifier,
+};
 use ruff_spo_triplet::{
-    CppAccess, CppBase, CppField, CppFriend, CppMethod, CppTemplate, CppTemplateKind,
+    CppAccess, CppBase, CppField, CppFriend, CppMethod, CppRefQualifier, CppTemplate,
+    CppTemplateKind,
 };
 
 use crate::{CppClass, CppEnum, CppFunction, Declaration};
@@ -849,6 +852,16 @@ fn build_method(m: &Entity, arm: Option<&BodyArmConfig>) -> CppMethod {
         raises: body.raises,
         calls: body.calls,
         guarded_writes: body.guarded_writes,
+        // `void f() &` / `void f() &&`. Part of the method's identity, so it
+        // has to reach the IRI: two ref-qualified overloads otherwise share
+        // one node and the body-arm merge copies one's facts onto the other.
+        ref_qualifier: m
+            .get_type()
+            .and_then(|t| t.get_ref_qualifier())
+            .map(|q| match q {
+                RefQualifier::LValue => CppRefQualifier::LValue,
+                RefQualifier::RValue => CppRefQualifier::RValue,
+            }),
     }
 }
 
@@ -1732,6 +1745,67 @@ void Svc::finish(int v) { status_ = v; repo_.Save(); }
             .expect("finish");
         assert_eq!(finish.writes, ["status_"]);
         assert_eq!(finish.calls, ["repo_.Save"]);
+    }
+
+    /// libclang really does report the ref-qualifier, and each overload keeps
+    /// its own body.
+    ///
+    /// The IR-level falsifier for this builds `CppMethod`s by hand, so it
+    /// cannot tell a populated field from one that is always `None`. This
+    /// parses the real thing: if `build_method` stopped reading the qualifier,
+    /// all three overloads below would report `None` and the assertions fail.
+    #[test]
+    fn libclang_reports_the_ref_qualifier_and_each_overload_keeps_its_body() {
+        let src = r#"
+struct Holder {
+    int lvalue_only_;
+    int rvalue_only_;
+    int plain_only_;
+    void value() & { lvalue_only_ = 1; }
+    void value() && { rvalue_only_ = 2; }
+    void value() { plain_only_ = 3; }
+};
+"#;
+        let dir = std::env::temp_dir().join("cpp_refqual");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("f.cpp");
+        std::fs::write(&path, src).expect("write fixture");
+
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (classes, _) = walk_tu_configured(
+            &path,
+            &["-std=c++17".to_string()],
+            Some(&BodyArmConfig::default()),
+        )
+        .expect("walk");
+        let holder = classes.iter().find(|c| c.name == "Holder").expect("Holder");
+        let methods: Vec<&CppMethod> = holder
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::Method(m) if m.name == "value" => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(methods.len(), 3, "three overloads");
+
+        let by_qualifier = |q: Option<CppRefQualifier>| {
+            methods
+                .iter()
+                .find(|m| m.ref_qualifier == q)
+                .unwrap_or_else(|| panic!("no overload with qualifier {q:?}"))
+        };
+        assert_eq!(
+            by_qualifier(Some(CppRefQualifier::LValue)).writes,
+            ["lvalue_only_"]
+        );
+        assert_eq!(
+            by_qualifier(Some(CppRefQualifier::RValue)).writes,
+            ["rvalue_only_"]
+        );
+        assert_eq!(by_qualifier(None).writes, ["plain_only_"]);
     }
 
     /// The opt-out: a signature-only walk parses no bodies, so every arm is

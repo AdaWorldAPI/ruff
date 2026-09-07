@@ -777,11 +777,18 @@ impl Expander {
         // classes). Appending ` const` (the C++ spelling) keeps the two
         // overloads on distinct nodes. `reassemble` reconstructs the same
         // suffix from the recovered `is_const`.
+        // The ref-qualifier is part of the identity for exactly the reason the
+        // cv-qualifier is: `value() &` and `value() &&` share name AND param
+        // types, so without it in the IRI the two overloads collapse under the
+        // `(s, p, o)` dedup and one body arm lands on both.
         let method_iri = format!(
-            "{model_iri}.{}({}){}",
+            "{model_iri}.{}({}){}{}",
             method.name,
             method.param_types.join(","),
-            if method.is_const { " const" } else { "" }
+            if method.is_const { " const" } else { "" },
+            method
+                .ref_qualifier
+                .map_or_else(String::new, |q| format!(" {}", q.spelling()))
         );
         // Universal classification — same shape the core 7 give a Function.
         self.push(
@@ -2442,6 +2449,7 @@ mod tests {
             raises: vec!["BadStatus".to_string()],
             calls: vec!["repo_.Save".to_string()],
             guarded_writes: vec!["recognizer_".to_string()],
+            ref_qualifier: None,
         });
         rec.methods.push(CppMethod {
             name: "Clear".to_string(),
@@ -2461,6 +2469,7 @@ mod tests {
             raises: Vec::new(),
             calls: Vec::new(),
             guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.methods.push(CppMethod {
             name: "kMaxRating".to_string(),
@@ -2480,6 +2489,7 @@ mod tests {
             raises: Vec::new(),
             calls: Vec::new(),
             guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.methods.push(CppMethod {
             name: "operator==".to_string(),
@@ -2499,6 +2509,7 @@ mod tests {
             raises: Vec::new(),
             calls: Vec::new(),
             guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.templates.push(CppTemplate {
             kind: CppTemplateKind::Specialisation,
@@ -2649,6 +2660,71 @@ mod tests {
                 "`{p}` tier differs between C++ and Function paths"
             );
         }
+    }
+
+    /// A class may declare `value() &` and `value() &&`. They agree on name,
+    /// parameter types and cv-qualifier, so only the ref-qualifier keeps them
+    /// apart. Without it in the IRI they collapse to one node under the
+    /// `(s, p, o)` dedup and one overload's body facts land on both, which is
+    /// exactly what this asserted before the qualifier reached the IRI.
+    #[test]
+    fn ref_qualified_overloads_do_not_share_a_method_node() {
+        use crate::ir::CppRefQualifier;
+
+        let mut g = ModelGraph::new("cpp");
+        let mut m = Model::new("Holder");
+        m.methods.push(CppMethod {
+            name: "value".to_string(),
+            return_type: Some("T &".to_string()),
+            ref_qualifier: Some(CppRefQualifier::LValue),
+            writes: vec!["lvalue_only_".to_string()],
+            ..CppMethod::default()
+        });
+        m.methods.push(CppMethod {
+            name: "value".to_string(),
+            return_type: Some("T &&".to_string()),
+            ref_qualifier: Some(CppRefQualifier::RValue),
+            writes: vec!["rvalue_only_".to_string()],
+            ..CppMethod::default()
+        });
+        // The unqualified sibling must stay distinct from both.
+        m.methods.push(CppMethod {
+            name: "value".to_string(),
+            return_type: Some("T".to_string()),
+            writes: vec!["plain_only_".to_string()],
+            ..CppMethod::default()
+        });
+        g.models.push(m);
+        let triples = expand(&g);
+
+        let carriers: BTreeSet<&str> = triples
+            .iter()
+            .filter(|t| t.p == "writes_field")
+            .map(|t| t.s.as_str())
+            .collect();
+        assert_eq!(carriers.len(), 3, "overloads shared a node: {carriers:?}");
+        assert!(carriers.contains("cpp:Holder.value() &"));
+        assert!(carriers.contains("cpp:Holder.value() &&"));
+        assert!(carriers.contains("cpp:Holder.value()"));
+
+        // Each node carries ONLY its own write — the contamination this
+        // guards against is a body fact appearing on the wrong overload.
+        let writes_of = |iri: &str| {
+            triples
+                .iter()
+                .filter(|t| t.s == iri && t.p == "writes_field")
+                .map(|t| t.o.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            writes_of("cpp:Holder.value() &"),
+            ["cpp:Holder.lvalue_only_"]
+        );
+        assert_eq!(
+            writes_of("cpp:Holder.value() &&"),
+            ["cpp:Holder.rvalue_only_"]
+        );
+        assert_eq!(writes_of("cpp:Holder.value()"), ["cpp:Holder.plain_only_"]);
     }
 
     /// The C++ body arm expands to the SAME five predicates, with the SAME

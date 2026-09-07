@@ -349,10 +349,13 @@ fn walk_files(files: &[std::path::PathBuf], args: &[String]) -> Result<ModelGrap
 /// definitions — which in a real C++ corpus is most of the interesting
 /// behaviour — would silently harvest nothing.
 ///
-/// Methods are matched on `(name, param_types, is_const)`: the same identity
-/// the method IRI encodes, so a merge can never move one overload's body onto
-/// another. Only an EMPTY arm is filled; a non-empty one is never overwritten,
-/// so the result does not depend on which TU came first.
+/// Methods are matched on `(name, param_types, is_const, ref_qualifier)`: the
+/// same identity the method IRI encodes, so a merge can never move one
+/// overload's body onto another. The ref-qualifier is load-bearing here and
+/// not decoration — `value() &` and `value() &&` agree on the first three, and
+/// without the fourth this function would copy whichever body it found first
+/// onto both. Only an EMPTY arm is filled; a non-empty one is never
+/// overwritten, so the result does not depend on which TU came first.
 #[cfg(feature = "libclang")]
 fn merge_body_arms(kept: &mut Model, incoming: &Model) {
     for method in &mut kept.methods {
@@ -367,6 +370,7 @@ fn merge_body_arms(kept: &mut Model, incoming: &Model) {
             m.name == method.name
                 && m.param_types == method.param_types
                 && m.is_const == method.is_const
+                && m.ref_qualifier == method.ref_qualifier
         }) else {
             continue;
         };
@@ -460,6 +464,7 @@ mod tests {
             raises: Vec::new(),
             calls: Vec::new(),
             guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.methods.push(CppMethod {
             name: "Clear".to_string(),
@@ -479,6 +484,7 @@ mod tests {
             raises: Vec::new(),
             calls: Vec::new(),
             guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.templates.push(CppTemplate {
             kind: CppTemplateKind::Specialisation,
@@ -630,6 +636,7 @@ mod tests {
                     raises: Vec::new(),
                     calls: Vec::new(),
                     guarded_writes: Vec::new(),
+                    ref_qualifier: None,
                 }),
                 Declaration::Template(CppTemplate {
                     kind: CppTemplateKind::Instantiation,
@@ -1161,6 +1168,67 @@ class Recognizer : public Classify {
         // The signature plane is unaffected by the merge.
         assert_eq!(finish.param_types, ["int"]);
         assert_eq!(svc.methods.len(), 1, "the class is not duplicated");
+    }
+
+    /// The ref-qualifier is part of the merge key, not decoration.
+    ///
+    /// `value() &` and `value() &&` agree on name, parameter types and
+    /// cv-qualifier. Both are declared in the header with no body and defined
+    /// out of line, so both arrive at the merge with an empty arm and both
+    /// match on the first three fields. Matching on those alone copies
+    /// whichever definition `find` reaches first onto BOTH overloads.
+    #[cfg(feature = "libclang")]
+    #[test]
+    fn a_ref_qualified_overload_pair_does_not_swap_bodies_in_the_merge() {
+        let _guard = CLANG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join("cpp_merge_refqual");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("a_header.h"),
+            "struct Holder { int lvalue_only_; int rvalue_only_; \n\
+             void value() &; void value() &&; };\n",
+        )
+        .expect("header");
+        std::fs::write(
+            dir.join("b_source.cpp"),
+            "#include \"a_header.h\"\n\
+             void Holder::value() & { lvalue_only_ = 1; }\n\
+             void Holder::value() && { rvalue_only_ = 2; }\n",
+        )
+        .expect("source");
+
+        let args = [
+            "-std=c++17".to_string(),
+            "-x".to_string(),
+            "c++".to_string(),
+            format!("-I{}", dir.display()),
+        ];
+        let graph = extract_dir(&dir, &args).expect("libclang init (LIBCLANG_PATH set)");
+        let holder = graph
+            .models
+            .iter()
+            .find(|m| m.name == "Holder")
+            .expect("Holder harvested");
+        assert_eq!(holder.methods.len(), 2, "the overloads stayed distinct");
+
+        let of = |q| {
+            holder
+                .methods
+                .iter()
+                .find(|m| m.ref_qualifier == Some(q))
+                .unwrap_or_else(|| panic!("no {q:?} overload"))
+        };
+        assert_eq!(
+            of(ruff_spo_triplet::CppRefQualifier::LValue).writes,
+            ["lvalue_only_"]
+        );
+        assert_eq!(
+            of(ruff_spo_triplet::CppRefQualifier::RValue).writes,
+            ["rvalue_only_"]
+        );
     }
 
     /// First **ndjson emission** from a real corpus subset — gated on
