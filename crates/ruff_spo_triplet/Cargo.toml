@@ -4,7 +4,7 @@ version = "0.1.0"
 publish = false
 edition = "2024"
 rust-version = "1.86"
-description = "Language-agnostic SPO (Subject-Predicate-Object) triplet expansion. Turns a neutral ModelGraph IR — entities, properties, functions, and their compute/guard/traversal edges — into deterministic NARS-weighted RDF-shape triples (ndjson). The Python/Odoo frontend (ruff_python_dto_check) and a future Ruby/Rails frontend (OpenProject) both fill the same IR and call the same expander, so the downstream SPO graph is identical regardless of source language."
+description = "Language-agnostic SPO (Subject-Predicate-Object) triplet expansion. Turns a neutral ModelGraph IR — entities, properties, functions, and their compute/guard/traversal edges — into deterministic NARS-weighted RDF-shape triples (ndjson). Four frontends fill the same IR and call the same expander — ruff_python_spo (Odoo), ruff_ruby_spo (OpenProject/Rails), ruff_sqlalchemy_spo (Flask-SQLAlchemy) and ruff_cpp_spo (C++/libclang) — and ruff_csharp_spo joins at the ndjson contract instead, because Roslyn is .NET-only and its parse runs out of process. The downstream SPO graph is identical regardless of source language."
 license = "MIT"
 
 [lib]
