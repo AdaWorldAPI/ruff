@@ -1081,12 +1081,15 @@ mod tests {
     /// here serialises on the crate-wide lock — the same lock `arm_tests` and
     /// `libclang_tests` take.
     fn ore(name: &str, src: &str) -> (Vec<MethodOre>, Symbols) {
-        let dir = std::env::temp_dir().join(format!("cpp_ore_{name}"));
+        let dir = std::env::temp_dir().join(format!(
+            "cpp_ore_{name}_{}",
+            crate::clang_walker::fixture_salt()
+        ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
-        // Written inside the lock. Every fixture here has a unique name today,
-        // so the paths do not collide, but `File::create` truncates and the
-        // sibling `arms_with` helper hit exactly that race on a shared path.
+        // The path carries `fixture_salt` so two test PROCESSES never share it;
+        // the lock only serialises libclang within one process, which is all a
+        // `Mutex` can do when the runner gives every test its own process.
         let _guard = CLANG_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -1098,7 +1098,10 @@ class Recognizer : public Classify {
         let _guard = CLANG_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join("cpp_merge_body_arms");
+        let dir = std::env::temp_dir().join(format!(
+            "cpp_merge_body_arms_{}",
+            crate::clang_walker::fixture_salt()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         // `a_header.h` sorts before `b_source.cpp`, so the arm-less sighting
@@ -1189,7 +1192,10 @@ class Recognizer : public Classify {
         let _guard = CLANG_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = std::env::temp_dir().join("cpp_merge_refqual");
+        let dir = std::env::temp_dir().join(format!(
+            "cpp_merge_refqual_{}",
+            crate::clang_walker::fixture_salt()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(
@@ -1497,7 +1503,10 @@ class Recognizer : public Classify {
         let _guard = CLANG_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let base = std::env::temp_dir().join("ruff_cpp_spo_tree_fixture");
+        let base = std::env::temp_dir().join(format!(
+            "ruff_cpp_spo_tree_fixture_{}",
+            crate::clang_walker::fixture_salt()
+        ));
         let sub = base.join("sub");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&sub).expect("mkdir tree");
@@ -1543,7 +1552,10 @@ class Recognizer : public Classify {
         let _guard = CLANG_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let base = std::env::temp_dir().join("ruff_cpp_spo_symlink_fixture");
+        let base = std::env::temp_dir().join(format!(
+            "ruff_cpp_spo_symlink_fixture_{}",
+            crate::clang_walker::fixture_salt()
+        ));
         let sub = base.join("sub");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&sub).expect("mkdir");
