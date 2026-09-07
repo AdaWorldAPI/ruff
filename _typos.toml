@@ -56,3 +56,6 @@ extend-ignore-re = [
 
 [default.extend-identifiers]
 "FrIeNdLy" = "FrIeNdLy"
+# libclang's own cursor-kind spelling, surfaced by the `clang` crate as
+# `EntityKind::ParmDecl`. Renaming it does not compile.
+"ParmDecl" = "ParmDecl"
