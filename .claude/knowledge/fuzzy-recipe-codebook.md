@@ -74,17 +74,29 @@ landed.)
 
 > **This is the "DTO-arm shape" C++ / Python still need.** As of 2026-07-06
 > `ruff_ruby_spo` and `ruff_csharp_spo` emit the full quartet + helpers.
-> **[2026-09-07 correction: no longer true for C++ — the arm is now wired
-> end-to-end, see the row below and the dated note that follows the table.
-> Python is unaffected by this update and still needs it.]**
+> **[2026-09-07 correction: no longer true for EITHER. C++'s arm was wired
+> end-to-end that day (see the row below). Python's was already complete and
+> the table had simply not been updated — checking it while correcting the
+> C++ row is what turned that up. The sentence above is retained as the
+> historical claim it was, not as current state.]**
 > Coverage:
 >
 > | frontend          | writes | reads | raises | calls | helpers | verdict                                                                                                                       |
 > | ----------------- | :----: | :---: | :----: | :---: | :-----: | ----------------------------------------------------------------------------------------------------------------------------- |
 > | `ruff_ruby_spo`   |   ✅   |  ✅   |   ✅   |  ✅   |   ✅    | reference — cook here first                                                                                                   |
 > | `ruff_csharp_spo` |   ✅   |  ✅   |   ✅   |  ✅   |   ✅    | syntax-only (SemanticModel upgrade pending); helpers via `has_visibility`; tested end-to-end on a real production C# corpus (~97k triples) |
-> | `ruff_python_spo` |   ~    |  ✅   |   ✅   |   ~   |    ✗    | reads/raises only; **needs writes/calls/helpers**                                                                             |
-> | `ruff_cpp_spo`    |   ✅   |  ✅   |   ✅   |  ✅   |    ✗    | **(2026-09-07)** wired end-to-end (commit `f068a3f`): harvested from real bodies via libclang 18, same predicates/objects/tiers as `Function`, classified via the now-generic `recipe::classify`; unit- and hermetic-fixture-proven (16 guards, disable-verified) — a corpus census is now re-runnable (`examples/harvest_ladybug.rs` reports the five fact totals plus a full `RecipeCentroid` census; see `.claude/plans/cpp-spo-probes-v1.md` for the numbers) but **nothing asserts it**, so C++ has a repeatable measurement and still not a gate — a regression would print quietly and fail nothing; J1 hit-rate is still open, because that corpus contains no lazy-init writes to hit (helpers column unchanged: this commit didn't touch it, and C++ doesn't split private methods into a separate pool the way Ruby does — see the dated note below) |
+> | `ruff_python_spo` |   ✅   |  ✅   |   ✅   |  ✅   |   n/a   | **(2026-09-07 correction)** the row read `~ ✅ ✅ ~ ✗ — reads/raises only; needs writes/calls/helpers`, and was stale: `functions.rs`'s `BodyWalker` populates all five sets (writes, the J1 `guarded_writes` across three guard spellings, and `calls` over a closed `ORM_MUTATORS` set with a receiver label), asserted end-to-end by `dto_arm_writes_guarded_writes_and_calls` including the negative case that a local assignment is not a write. The crate's own `lib.rs` quotes this row as the thing it was closing. **`helpers` is n/a here, not missing**: Python has no visibility keyword, so every `Stmt::FunctionDef` in a model body already lands in `Model::functions` and there is no non-routable subset to split off (`functions.rs` module doc). |
+> | `ruff_cpp_spo`    |   ✅   |  ✅   |   ✅   |  ✅   |   n/a   | **(2026-09-07)** wired end-to-end (commit `f068a3f`): harvested from real bodies via libclang 18, same predicates/objects/tiers as `Function`, classified via the now-generic `recipe::classify`; unit- and hermetic-fixture-proven (16 guards, disable-verified) — a corpus census is now re-runnable (`examples/harvest_ladybug.rs` reports the five fact totals plus a full `RecipeCentroid` census; see `.claude/plans/cpp-spo-probes-v1.md` for the numbers) but **nothing asserts it**, so C++ has a repeatable measurement and still not a gate — a regression would print quietly and fail nothing; J1 hit-rate is still open, because that corpus contains no lazy-init writes to hit (helpers reads `n/a` for the reason the note under the table gives: C++ keeps every method in one collection with its own `access` field, so there is no separate pool to be missing) |
+>
+> **Reading the `helpers` column:** it does NOT mean the same thing in every
+> row. For Ruby it is a real capability — private defs live in a separate
+> `Model::helpers` pool and would otherwise be dropped, which is the ~80%
+> hook loss this document opens with. For Python and C++ there is nothing to
+> split: Python has no visibility keyword at all, and C++ keeps every method
+> in one `methods` collection carrying its own `access` field (and has emitted
+> `has_visibility` since before the arm landed). Those two rows read `n/a`
+> rather than `✗` as of 2026-09-07, because a `✗` there invited exactly the
+> misreading that a frontend was losing hooks when it was not.
 >
 > The fingerprint predicates are already in the shared IR
 > (`ruff_spo_triplet::Function`) and `expand()` already emits them — a frontend
