@@ -1422,13 +1422,18 @@ mod arm_tests {
         let dir = std::env::temp_dir().join(format!("cpp_arm_{name}"));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
-        let mut fh = std::fs::File::create(&path).expect("fixture file");
-        fh.write_all(src.as_bytes()).expect("write fixture");
-        drop(fh);
 
+        // The write happens INSIDE the lock. Twelve tests share the `shapes`
+        // fixture, so they share this path; `File::create` truncates, so a
+        // write outside the lock can empty the file while another thread is
+        // inside `parse()` on it. That parse then finds no methods and the
+        // caller's index panics.
         let _guard = CLANG_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut fh = std::fs::File::create(&path).expect("fixture file");
+        fh.write_all(src.as_bytes()).expect("write fixture");
+        drop(fh);
         let clang = Clang::new().expect("libclang");
         let index = Index::new(&clang, false, false);
         let tu = index

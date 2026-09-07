@@ -663,11 +663,23 @@ impl<'s> Walk<'s> {
 
             EntityKind::NewExpr | EntityKind::DeleteExpr => {
                 let is_new = e.get_kind() == EntityKind::NewExpr;
-                let ty = e
-                    .get_type()
-                    .map(|t| bare_type_name(&t.get_display_name()))
-                    .filter(|t| !t.is_empty())
-                    .map(|t| self.syms.intern(SymKind::Type, Role::None, &t, Prov::Clang));
+                // A delete-expression's OWN type is `void` -- it yields no
+                // value -- so reading it here labelled every Delete event
+                // `void`. The deleted object's type is the operand's, with one
+                // pointer layer removed: `delete p` where `p` is `Foo *` is a
+                // Delete of `Foo`. `new` is unaffected; its own type IS the
+                // allocated pointer type.
+                let ty = if is_new {
+                    e.get_type().map(|t| bare_type_name(&t.get_display_name()))
+                } else {
+                    e.get_children()
+                        .first()
+                        .and_then(Entity::get_type)
+                        .map(|t| t.get_pointee_type().unwrap_or(t))
+                        .map(|t| bare_type_name(&t.get_display_name()))
+                }
+                .filter(|t| !t.is_empty())
+                .map(|t| self.syms.intern(SymKind::Type, Role::None, &t, Prov::Clang));
                 let i = self.push(
                     if is_new {
                         EventKind::New
@@ -1072,12 +1084,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cpp_ore_{name}"));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
-        let mut fh = std::fs::File::create(&path).expect("fixture file");
-        fh.write_all(src.as_bytes()).expect("write fixture");
-        drop(fh);
+        // Written inside the lock. Every fixture here has a unique name today,
+        // so the paths do not collide, but `File::create` truncates and the
+        // sibling `arms_with` helper hit exactly that race on a shared path.
         let _guard = CLANG_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut fh = std::fs::File::create(&path).expect("fixture file");
+        fh.write_all(src.as_bytes()).expect("write fixture");
+        drop(fh);
         let mut syms = Symbols::default();
         let tu = walk_tu_events(&path, &["-std=c++17".to_string()], &mut syms).expect("walk");
         (tu.methods, syms)
@@ -1206,17 +1221,21 @@ void C::b(int n) { if (n > 0) x_ = n; else x_ = 0; }",
     fn every_scope_kind_appears_with_the_right_parent_and_depth() {
         let (ms, _) = ore(
             "scopes",
+            // A built-in array, not `std::vector`, so the range-for needs no
+            // standard library. macOS CI runs libclang without a sysroot, so
+            // `#include <vector>` fails there, `xs` gets an error type, and the
+            // range-for never parses -- the other three loops are header-free
+            // and passed, which is why only `RangeFor` went missing.
             r"
-#include <vector>
 struct C {
-  void loops(const std::vector<int>& xs, int n);
+  void loops(const int (&xs)[4], int n);
   void branches(int n);
   void protect();
   void lam(int n);
   void blk(int n);
   int x_;
 };
-void C::loops(const std::vector<int>& xs, int n) {
+void C::loops(const int (&xs)[4], int n) {
   for (int i = 0; i < n; ++i) { x_ += i; }
   while (x_ < n) { ++x_; }
   do { --x_; } while (x_ > n);
