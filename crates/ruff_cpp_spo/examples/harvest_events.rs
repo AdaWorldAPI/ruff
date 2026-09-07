@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use ruff_cpp_spo::events::{MethodOre, Symbols, walk_tu_events};
+use ruff_cpp_spo::events::{EventKind, MethodOre, Symbols, walk_tu_events};
 
 /// A TSV cell can carry no tab and no newline. C++ identifiers and type
 /// spellings contain neither, but a malformed one would silently shift every
@@ -44,7 +44,13 @@ fn cell(s: &str) -> String {
 /// flags that change what the parser SEES are kept — `-o`, `-c` and the input
 /// file itself would make libclang re-drive a compilation.
 fn args_of(cmd: &str) -> Vec<String> {
-    let toks: Vec<String> = shell_split(cmd);
+    keep_parse_flags(&shell_split(cmd))
+}
+
+/// The filter half of [`args_of`], over tokens that are ALREADY split. The
+/// `arguments` form of a compilation database is a real array, so re-joining it
+/// into a string just to re-split it could only lose information.
+fn keep_parse_flags(toks: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < toks.len() {
@@ -100,22 +106,76 @@ fn shell_split(s: &str) -> Vec<String> {
 }
 
 /// `compile_commands.json` without a JSON dependency: the file is a flat array
-/// of objects with string values, and only two keys are needed.
+/// of objects, conventionally pretty-printed one field per line, which is the
+/// shape this reads.
+///
+/// Each object is parsed INDEPENDENTLY and flushed at its closing brace. An
+/// earlier version kept `file` and `command` across objects and emitted as soon
+/// as both were set; an entry using `arguments` therefore left its `file`
+/// pending, and the NEXT object's `command` was attributed to the wrong file.
+///
+/// Both command forms defined by the JSON compilation database are read:
+/// `"command"` (one shell-escaped string) and `"arguments"` (an array of
+/// already-split strings, which the spec prefers precisely because it needs no
+/// shell unescaping). An entry carrying neither is reported rather than
+/// silently dropped.
 fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
     let mut out = Vec::new();
-    let (mut file, mut cmd) = (None::<String>, None::<String>);
+    let mut file: Option<String> = None;
+    let mut cmd: Option<String> = None;
+    let mut argv: Option<Vec<String>> = None;
+    let mut collecting: Option<Vec<String>> = None;
+    let mut malformed = 0usize;
+
     for raw in text.lines() {
         let line = raw.trim();
+
+        // Inside an `"arguments": [ ... ]` array, which may span lines.
+        if let Some(acc) = collecting.as_mut() {
+            for tok in line.split(',') {
+                if let Some(v) = json_string_field(tok.trim(), "") {
+                    acc.push(v);
+                }
+            }
+            if line.contains(']') {
+                argv = collecting.take();
+            }
+            continue;
+        }
+
         if let Some(v) = json_string_field(line, "\"file\":") {
             file = Some(v);
         } else if let Some(v) = json_string_field(line, "\"command\":") {
             cmd = Some(v);
+        } else if let Some(rest) = line.strip_prefix("\"arguments\":") {
+            let rest = rest.trim_start().trim_start_matches('[');
+            let mut acc = Vec::new();
+            for tok in rest.split(',') {
+                if let Some(v) = json_string_field(tok.trim(), "") {
+                    acc.push(v);
+                }
+            }
+            if rest.contains(']') {
+                argv = Some(acc);
+            } else {
+                collecting = Some(acc);
+            }
         }
-        if let (Some(f), Some(c)) = (&file, &cmd) {
-            out.push((PathBuf::from(f), args_of(c)));
-            file = None;
-            cmd = None;
+
+        // One object ended. Emit it, or count it, but never carry it forward.
+        if line.starts_with('}') {
+            match (file.take(), argv.take(), cmd.take()) {
+                // `arguments` wins: it is already split, so it cannot be
+                // mangled by re-splitting a shell-escaped string.
+                (Some(f), Some(a), _) => out.push((PathBuf::from(f), keep_parse_flags(&a))),
+                (Some(f), None, Some(c)) => out.push((PathBuf::from(f), args_of(&c))),
+                (Some(_), None, None) => malformed += 1,
+                (None, _, _) => {}
+            }
         }
+    }
+    if malformed > 0 {
+        eprintln!("[ore] {malformed} compile_commands entries had neither command nor arguments");
     }
     out
 }
@@ -281,7 +341,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             m.mkind,
             m.access,
             m.n_params,
-            m.overrides_target.as_deref().unwrap_or("-")
+            m.overrides_target
+                .as_deref()
+                .map_or_else(|| "-".to_string(), cell)
         )?;
     }
     let mut sy = String::new();
@@ -313,7 +375,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         syms.len(),
         out_dir.display()
     );
-    let with_events = methods.iter().filter(|m| m.events.len() > 2).count();
+    // A method scope emits ScopeEnter + ScopeExit, and each parameter emits one
+    // Param event, so `void f(int a) {}` reaches three events with an empty
+    // body. Only a non-prologue event counts as body content.
+    let with_events = methods
+        .iter()
+        .filter(|m| {
+            m.events.iter().any(|e| {
+                !matches!(
+                    e.kind,
+                    EventKind::ScopeEnter | EventKind::ScopeExit | EventKind::Param
+                )
+            })
+        })
+        .count();
     let a0_facts: u32 = methods
         .iter()
         .map(|m| m.set_reads + m.set_writes + m.set_raises + m.set_calls)
