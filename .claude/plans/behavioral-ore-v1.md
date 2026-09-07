@@ -94,3 +94,45 @@ It is not resolved by editing the expectation to match the code.
 - **No new predicate.** The closed vocabulary is untouched; the ore is TSV
   beside the manifest, not a triple.
 - The extractor is a second walk over the same cursor, in its own module.
+
+## 6. Measured — 227-TU ladybug corpus, 2026-09-07
+
+The §1 defect, quantified on real code rather than the control fixture
+(2,217 methods, 95,365 ordered events):
+
+| | |
+|---|---|
+| ordered events | 95,365 |
+| facts the shipped set arm keeps | 2,574 |
+| duplicate occurrences destroyed | 2,093 |
+| scope boundaries destroyed | 19,902 |
+| adjacency pairs destroyed | 93,148 |
+| **retained** | **2.7% of ordered events, 0 adjacency, 0 scope** |
+
+The control fixture said 11.2%; at corpus scale it is 2.7%. The gap is call
+sites — 22,748 of them, of which the configured-mutator rule keeps 171.
+
+**What the loss costs, in bits.** Charging every representation for describing
+the same held-out events (`bits/ore-event`, uncovered events costed at
+`log2|alphabet|`):
+
+| representation | bits/ore-event |
+|---|---|
+| shipped sets | 4.0987 |
+| ordered ore | 2.7455 |
+| ordered ore + behavioural BPE (256 merges) | 2.6411 |
+
+The upstream fix is 13× the tokenizer's contribution. It decomposes into two
+roughly equal, slightly sub-additive halves — **order** (same five kinds,
+duplicates and adjacency restored) +0.7776, and **alphabet** (the 13 kinds the
+set arm has no representation for, order still destroyed) +0.7001. Neither
+alone explains it, so "restoring order is the wound" is half the story.
+
+**Provenance (the §15 check).** Events are 58% libclang-answered overall, but
+`ScopeEnter` / `ScopeExit` / `Condition` / `Branch` are **0%** — they are
+walk-derived. Every high-consistency motif the tokenizer learns is built from
+those, so the recurring structure is contributed by the ordered walk, not by
+the compiler.
+
+Full write-up, ladder and falsifier verdicts live with the experiment, not in
+this repo; what belongs here is the defect and its size.
