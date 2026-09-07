@@ -290,6 +290,12 @@ pub struct MethodOre {
     pub is_static: bool,
     pub is_virtual: bool,
     pub overrides: bool,
+    /// The base overload this method overrides, as an IRI — not just a flag.
+    /// It is the one compiler-given statement of behavioral relatedness the
+    /// corpus offers for free, and a retrieval measure needs the PAIR, so a
+    /// boolean would have left the geometry half of any downstream ablation
+    /// unmeasurable.
+    pub overrides_target: Option<String>,
     pub mkind: &'static str,
     pub access: &'static str,
     pub n_params: u32,
@@ -977,6 +983,10 @@ fn method_ore(
         is_static: m.is_static_method(),
         is_virtual: m.is_virtual_method(),
         overrides: m.get_overridden_methods().is_some_and(|o| !o.is_empty()),
+        overrides_target: m
+            .get_overridden_methods()
+            .and_then(|o| o.into_iter().next())
+            .and_then(|b| method_iri(&b)),
         mkind: match m.get_kind() {
             EntityKind::Constructor => "ctor",
             EntityKind::Destructor => "dtor",
