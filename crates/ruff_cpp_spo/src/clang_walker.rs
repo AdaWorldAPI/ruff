@@ -1583,6 +1583,8 @@ struct Cfg {
     void wrong_branch(int* v) { if (ptr_ == nullptr) { } else { ptr_ = v; } }
     void other_member_guard(int* v) { if (other_ == 0) { ptr_ = v; } }
     void compound_condition(int* v, bool b) { if (ptr_ == nullptr && b) { ptr_ = v; } }
+    void nested_plain_if(int* v, bool b) { if (ptr_ == nullptr) { if (b) { ptr_ = v; } } }
+    void nested_regard(int* v) { if (ptr_ == nullptr) { if (other_ == 0) { ptr_ = v; } } }
 };
 "#;
 
@@ -1640,6 +1642,33 @@ struct Cfg {
                 a.guarded_writes
             );
         }
+    }
+
+    /// An enclosing absence guard survives a nested `if` that has no guard of
+    /// its own — the write is still only reachable when the member was absent.
+    /// It does NOT survive a nested `if` that guards on a DIFFERENT member,
+    /// because that inner condition decides its branches and the outer guard
+    /// is dropped rather than reasoned about. Both are branches of the guard
+    /// threading that no other test reaches.
+    #[test]
+    fn an_enclosing_guard_crosses_a_plain_nested_if_but_not_a_regarding_one() {
+        let all = arms("guards", GUARDS);
+
+        let crossed = &all["nested_plain_if"];
+        assert_eq!(crossed.writes, ["ptr_"]);
+        assert_eq!(
+            crossed.guarded_writes,
+            ["ptr_"],
+            "a plain nested `if` does not cancel the enclosing absence guard"
+        );
+
+        let regarded = &all["nested_regard"];
+        assert_eq!(regarded.writes, ["ptr_"]);
+        assert!(
+            regarded.guarded_writes.is_empty(),
+            "an inner guard on another member drops the outer one: {:?}",
+            regarded.guarded_writes
+        );
     }
 
     #[test]
