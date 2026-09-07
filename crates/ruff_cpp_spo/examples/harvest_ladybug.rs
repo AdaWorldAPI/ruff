@@ -1,9 +1,9 @@
 //! Harvest an arbitrary ladybug (KuzuDB-fork) header **subtree**'s C++ class
 //! manifest via libclang, recursively, and emit the SPO manifest plus a full
 //! breakdown (`inherits_from` trees, `has_function` top-25, pure-virtual
-//! classes, `virtually_overrides` count, and field, template, and
-//! static-assert counts) — the `ruff>OGAR` structure feeding the ladybug-rs
-//! transcode.
+//! classes, `virtually_overrides` count, field/template/static-assert
+//! counts, and a body-arm recipe-centroid census) — the `ruff>OGAR`
+//! structure feeding the ladybug-rs transcode.
 //!
 //! Walks every `*.h` header under `src/include/<SUBTREE>` (recursively) via
 //! [`walk_tu_with_diagnostics`] (not [`walk_tu`](ruff_cpp_spo::walk_tu)) and
@@ -13,6 +13,21 @@
 //! treating the rest of the file as best-effort, silently dropping the
 //! declaration that needed the missing header (see `examples/harvest_textord.rs`'s
 //! `src/viewer` note for the concrete failure mode this was found against).
+//!
+//! Also reports the **body arm** — `writes` / `reads` / `raises` / `calls` /
+//! `guarded_writes` fact totals plus a `RecipeCentroid` census via
+//! `ruff_spo_triplet::classify` — the cross-frontend recipe-centroid
+//! comparison the Ruby and C# legs already produce, now surfaced for C++.
+//! This example walks HEADERS only (no `.cpp` translation units), so most
+//! bodies it sees are inline accessors: expect the non-`Empty` fraction to
+//! read low relative to a whole-tree harvest — that is this example's scope,
+//! not a harvest gap.
+//!
+//! Expect `guarded_writes` to read **0** on this corpus, and read that as the
+//! corpus rather than the detector: a search of the whole `ladybug/src` tree
+//! finds three absence tests on a member, and all three are early returns or
+//! an assertion — none is the lazy-init `if (!x_) x_ = …` shape the J1 fact
+//! records. A corpus that uses that shape is what a J1 hit-rate needs.
 //!
 //! Env:
 //!   `LADYBUG_SRC`   default /home/user/ladybug
@@ -24,6 +39,14 @@
 //! LADYBUG_SRC=/home/user/ladybug LIBCLANG_PATH=/usr/lib/llvm-18/lib SUBTREE=storage \
 //!   cargo run -p ruff_cpp_spo --features libclang --example harvest_ladybug
 //! ```
+//!
+//! This corpus needs `-std=c++20` (already the value baked into the clang
+//! `args` below, not overridable via env): under `-std=c++17`,
+//! `common/assert.h` fails to parse `std::format` and libclang silently
+//! drops the declarations downstream of that failure — measured to cost
+//! roughly a third of the body-arm facts (13.0% vs 20.7% of methods
+//! reaching a non-`Empty` centroid). This is exactly the partial-AST
+//! failure the `walk_tu_with_diagnostics` warning above exists to catch.
 
 #![expect(
     clippy::print_stderr,
@@ -34,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ruff_cpp_spo::{CppClass, Declaration, NAMESPACE, model_from_class, walk_tu_with_diagnostics};
-use ruff_spo_triplet::{ModelGraph, expand, to_ndjson};
+use ruff_spo_triplet::{ModelGraph, RecipeCentroid, classify, expand, to_ndjson};
 
 fn collect_headers(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -256,6 +279,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("\n[{subtree}] top classes by template decl count:");
         for (name, n) in tmpl_counts.iter().take(10) {
             eprintln!("  {name}: {n} template decls");
+        }
+    }
+
+    // ── body arm: writes / reads / raises / calls / guarded_writes ──
+    // This example walks HEADERS only (no `.cpp` translation units), so most
+    // bodies visible here are inline accessors — a low non-Empty fraction is
+    // this example's scope, not a harvest gap (see the module doc header).
+    let all_methods: Vec<&_> = all
+        .iter()
+        .flat_map(|c| c.declarations.iter())
+        .filter_map(|d| match d {
+            Declaration::Method(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    let with_body_facts = all_methods
+        .iter()
+        .filter(|m| {
+            !m.writes.is_empty()
+                || !m.reads.is_empty()
+                || !m.raises.is_empty()
+                || !m.calls.is_empty()
+                || !m.guarded_writes.is_empty()
+        })
+        .count();
+    eprintln!(
+        "\n[{subtree}] body arm: {} methods, {with_body_facts} with at least one body fact",
+        all_methods.len(),
+    );
+
+    let n_writes: usize = all_methods.iter().map(|m| m.writes.len()).sum();
+    let n_reads: usize = all_methods.iter().map(|m| m.reads.len()).sum();
+    let n_raises: usize = all_methods.iter().map(|m| m.raises.len()).sum();
+    let n_calls: usize = all_methods.iter().map(|m| m.calls.len()).sum();
+    let n_guarded_writes: usize = all_methods.iter().map(|m| m.guarded_writes.len()).sum();
+    eprintln!(
+        "[{subtree}] body-arm fact counts: writes={n_writes} reads={n_reads} raises={n_raises} calls={n_calls} guarded_writes={n_guarded_writes}"
+    );
+
+    // Recipe-centroid census — the headline: the same classifier the Ruby and
+    // C# legs already run against `Function`, here run against `CppMethod`
+    // via the shared `BodyFacts` trait (`ruff_spo_triplet::recipe`).
+    let centroids = [
+        RecipeCentroid::Compensate,
+        RecipeCentroid::Cascade,
+        RecipeCentroid::Guard,
+        RecipeCentroid::WriteRaise,
+        RecipeCentroid::Default,
+        RecipeCentroid::Compute,
+        RecipeCentroid::Normalize,
+        RecipeCentroid::Observe,
+        RecipeCentroid::Empty,
+    ];
+    let classified: Vec<RecipeCentroid> = all_methods.iter().map(|m| classify(*m)).collect();
+    let mut census: Vec<(RecipeCentroid, usize)> = centroids
+        .iter()
+        .map(|&c| (c, classified.iter().filter(|&&x| x == c).count()))
+        .collect();
+    census.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    eprintln!("\n[{subtree}] recipe-centroid census (most common first):");
+    for (centroid, n) in &census {
+        eprintln!("  {centroid:?}: {n}");
+    }
+
+    // top-10 classes by body-fact count (same shape as the template-decl list
+    // above — sum of writes/reads/raises/calls/guarded_writes per class).
+    let mut body_fact_counts: Vec<(String, usize)> = all
+        .iter()
+        .map(|c| {
+            let methods: Vec<&_> = c
+                .declarations
+                .iter()
+                .filter_map(|d| match d {
+                    Declaration::Method(m) => Some(m),
+                    _ => None,
+                })
+                .collect();
+            let n: usize = methods
+                .iter()
+                .map(|m| {
+                    m.writes.len()
+                        + m.reads.len()
+                        + m.raises.len()
+                        + m.calls.len()
+                        + m.guarded_writes.len()
+                })
+                .sum();
+            (c.qualified_name(), n)
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    body_fact_counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    if !body_fact_counts.is_empty() {
+        eprintln!("\n[{subtree}] top classes by body-fact count:");
+        for (name, n) in body_fact_counts.iter().take(10) {
+            eprintln!("  {name}: {n} body facts");
         }
     }
 
