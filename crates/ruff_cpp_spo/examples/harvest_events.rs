@@ -262,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         writeln!(
             me,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             cell(&m.iri),
             cell(&m.tu),
             cell(&m.class),
@@ -280,7 +280,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             u8::from(m.overrides),
             m.mkind,
             m.access,
-            m.n_params
+            m.n_params,
+            m.overrides_target.as_deref().unwrap_or("-")
         )?;
     }
     let mut sy = String::new();
