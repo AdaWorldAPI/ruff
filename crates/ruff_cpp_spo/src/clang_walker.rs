@@ -802,8 +802,20 @@ fn build_method(m: &Entity, arm: Option<&BodyArmConfig>) -> CppMethod {
                 .flatten()
                 .filter_map(|a| a.get_type().map(|t| t.get_display_name()))
                 .collect();
+            // The ref qualifier is part of method identity, so it has to be
+            // part of the override TARGET too. Without it `Base::f() &` and
+            // `Base::f() &&` both point at `Base.f()`, and neither joins to
+            // the base node the IRI actually names.
+            let refq = base_m
+                .get_type()
+                .and_then(|t| t.get_ref_qualifier())
+                .map(|q| match q {
+                    RefQualifier::LValue => " &",
+                    RefQualifier::RValue => " &&",
+                })
+                .unwrap_or("");
             Some(format!(
-                "{}.{mname}({}){}",
+                "{}.{mname}({}){}{refq}",
                 qualified_name(&parent),
                 params.join(","),
                 if base_m.is_const_method() {
@@ -1010,7 +1022,23 @@ enum GuardedBranch {
 #[cfg(feature = "libclang")]
 pub(crate) fn method_body_arm(method: &Entity, cfg: &BodyArmConfig) -> BodyArm {
     let mut arm = BodyArm::default();
-    walk_body(method, &mut arm, cfg, None);
+    // Parameters are skipped rather than selecting the CompoundStmt, because a
+    // constructor's member-initialiser list is a SIBLING of the body, not a
+    // child of it — narrowing to the body would silently drop ctor-init facts.
+    //
+    // This is SCOPING, not a bug fix, and the difference is measured: with this
+    // skip removed, `void put(int v = C::fallback() + C::s_)` still contributed
+    // no calls and no reads, because the call arm only records specific
+    // receiver shapes and reads only cover own non-static members. A default
+    // argument is not something the body executes, so it has no business being
+    // walked — but no leak is reachable through it today, and a test asserting
+    // otherwise would pass whether or not this line is here.
+    for child in method.get_children() {
+        if child.get_kind() == EntityKind::ParmDecl {
+            continue;
+        }
+        walk_node(&child, &mut arm, cfg, None);
+    }
     for facts in [
         &mut arm.writes,
         &mut arm.reads,
@@ -1030,6 +1058,70 @@ pub(crate) fn method_body_arm(method: &Entity, cfg: &BodyArmConfig) -> BodyArm {
 fn walk_body(node: &Entity, arm: &mut BodyArm, cfg: &BodyArmConfig, guard: Option<&str>) {
     for child in node.get_children() {
         walk_node(&child, arm, cfg, guard);
+    }
+}
+
+/// The LHS of an assignment, minus the member reference that IS the target.
+///
+/// `arr_[i] = v` must record the subscript `i` as a read and `arr_` only as a
+/// write; the naive child walk records `arr_` twice, once through each role.
+#[cfg(feature = "libclang")]
+fn walk_lhs_skipping_target(
+    lhs: &Entity,
+    arm: &mut BodyArm,
+    cfg: &BodyArmConfig,
+    guard: Option<&str>,
+) {
+    let target = assignment_target(lhs);
+    for child in lhs.get_children() {
+        // Compared through `assignment_target`, not `own_member_name`: the
+        // subscript's base arrives wrapped in an UnexposedExpr, so a bare
+        // member-reference test never matches it and the array is re-read.
+        if target.is_some() && assignment_target(&child) == target {
+            walk_past_target(&child, arm, cfg, guard);
+            continue;
+        }
+        walk_node(&child, arm, cfg, guard);
+    }
+}
+
+/// Walk everything under the write target EXCEPT the target's own reference.
+///
+/// Descending with `walk_body` is not enough: the reference arrives wrapped in
+/// an `UnexposedExpr`, so walking the wrapper's children lands straight back on
+/// the `MemberRefExpr` and records the read this exists to avoid. Follow the
+/// same descent `assignment_target` uses, and walk only what QUALIFIES the
+/// member (`this`, or `p` in `p.x_`) plus any subscript indices passed on the
+/// way down.
+#[cfg(feature = "libclang")]
+fn walk_past_target(e: &Entity, arm: &mut BodyArm, cfg: &BodyArmConfig, guard: Option<&str>) {
+    let mut cur = *e;
+    for _ in 0..32 {
+        match cur.get_kind() {
+            EntityKind::MemberRefExpr => {
+                walk_body(&cur, arm, cfg, guard);
+                return;
+            }
+            EntityKind::UnexposedExpr | EntityKind::ParenExpr => {
+                let Some(next) = cur.get_children().into_iter().next() else {
+                    return;
+                };
+                cur = next;
+            }
+            // A nested subscript (`a_[i][j]`): the base continues the descent,
+            // and every index is a real read that must not be lost with it.
+            EntityKind::ArraySubscriptExpr => {
+                let mut children = cur.get_children().into_iter();
+                let Some(base) = children.next() else {
+                    return;
+                };
+                for idx in children {
+                    walk_node(&idx, arm, cfg, guard);
+                }
+                cur = base;
+            }
+            _ => return,
+        }
     }
 }
 
@@ -1054,8 +1146,11 @@ fn walk_node(node: &Entity, arm: &mut BodyArm, cfg: &BodyArmConfig, guard: Optio
                 record_write(arm, lhs, guard);
                 // The LHS's own member reference is the write TARGET, not a
                 // read, so descend past it — but keep whatever it contains
-                // (`arr_[i]`'s subscript, `p` in `p.x_`).
-                walk_body(lhs, arm, cfg, guard);
+                // (`arr_[i]`'s subscript, `p` in `p.x_`). Walking the children
+                // blindly re-reads the target through the nested member
+                // reference, which is how `arr_[i] = v` recorded `arr_` as
+                // both a write and a read.
+                walk_lhs_skipping_target(lhs, arm, cfg, guard);
                 for r in rest {
                     walk_node(r, arm, cfg, guard);
                 }
@@ -1210,12 +1305,13 @@ pub(crate) fn assignment_target(lhs: &Entity) -> Option<String> {
     for _ in 0..32 {
         match cur.get_kind() {
             EntityKind::MemberRefExpr => return own_member_name(&cur),
-            EntityKind::UnexposedExpr
-            | EntityKind::ParenExpr
-            | EntityKind::ArraySubscriptExpr
-            | EntityKind::UnaryOperator => {
+            EntityKind::UnexposedExpr | EntityKind::ParenExpr | EntityKind::ArraySubscriptExpr => {
                 cur = cur.get_children().into_iter().next()?;
             }
+            // NOT UnaryOperator. `*ptr_ = v` changes the POINTEE; the member
+            // `ptr_` itself is unchanged, so recording it as a write is wrong.
+            // Increment/decrement reaches this function with the operand
+            // already unwrapped, so it is unaffected.
             _ => return None,
         }
     }
@@ -1493,6 +1589,94 @@ struct Patient {
             a.reads.is_empty(),
             "the assignment target is not a read: {:?}",
             a.reads
+        );
+    }
+
+    /// `arr_[idx_] = v` writes `arr_` and reads `idx_`. Walking the LHS's
+    /// children blindly also re-read `arr_` through the nested member
+    /// reference, so one assignment reported the array as both written and
+    /// read — and a read the method never performs changes its recipe.
+    #[test]
+    fn a_subscripted_assignment_reads_the_index_but_not_the_array() {
+        let a = &arms(
+            "subscript",
+            r"
+struct C {
+  void put(int v) { arr_[idx_] = v; }
+  int arr_[8];
+  int idx_;
+};",
+        )["put"];
+        assert_eq!(a.writes, ["arr_"]);
+        assert_eq!(a.reads, ["idx_"], "the write target must not be a read too");
+    }
+
+    /// `*ptr_ = v` changes the POINTEE. The member `ptr_` still holds the same
+    /// address afterwards, so recording it as a write claims a mutation that
+    /// did not happen.
+    #[test]
+    fn a_dereference_assignment_does_not_write_the_pointer_member() {
+        let a = &arms(
+            "deref",
+            r"
+struct C {
+  void put(int v) { *ptr_ = v; }
+  int* ptr_;
+};",
+        )["put"];
+        assert!(
+            !a.writes.iter().any(|w| w == "ptr_"),
+            "the pointer member is unchanged: {:?}",
+            a.writes
+        );
+    }
+
+    /// The override TARGET must carry the ref qualifier, because the method
+    /// IRI does. Without it `Base::f() &` and `Base::f() &&` both point at
+    /// `Base.f()`, so neither joins to the base node it actually overrides —
+    /// and that pair is the only compiler-given statement of behavioural
+    /// relatedness the corpus offers for free.
+    #[test]
+    fn an_override_target_distinguishes_the_ref_qualified_overloads() {
+        let src = r"
+struct Base {
+    virtual void f() & ;
+    virtual void f() && ;
+};
+struct D : Base {
+    void f() & override {}
+    void f() && override {}
+};
+";
+        let dir = std::env::temp_dir().join("cpp_refq_override");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("f.cpp");
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::fs::write(&path, src).expect("write fixture");
+        let (classes, _) = walk_tu_configured(
+            &path,
+            &["-std=c++17".to_string()],
+            Some(&BodyArmConfig::default()),
+        )
+        .expect("walk");
+        let d = classes.iter().find(|c| c.name == "D").expect("class D");
+        let targets: Vec<&str> = d
+            .declarations
+            .iter()
+            .filter_map(|decl| match decl {
+                Declaration::Method(m) if m.name == "f" => m.overrides.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            targets.contains(&"Base.f() &"),
+            "the lvalue overload must name its own base overload: {targets:?}"
+        );
+        assert!(
+            targets.contains(&"Base.f() &&"),
+            "the rvalue overload must name its own base overload: {targets:?}"
         );
     }
 

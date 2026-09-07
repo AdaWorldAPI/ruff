@@ -55,7 +55,10 @@ fn keep_parse_flags(toks: &[String]) -> Vec<String> {
     let mut i = 0;
     while i < toks.len() {
         let t = &toks[i];
-        if t == "-isystem" || t == "-include" {
+        // `-I` can be written joined (`-Iinc`) or as two tokens (`-I inc`);
+        // clang accepts both. Keeping only the bare `-I` would hand libclang an
+        // incomplete flag and lose the include path.
+        if matches!(t.as_str(), "-I" | "-isystem" | "-include") {
             if let Some(v) = toks.get(i + 1) {
                 out.push(t.clone());
                 out.push(v.clone());
@@ -124,21 +127,21 @@ fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
     let mut file: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut argv: Option<Vec<String>> = None;
-    let mut collecting: Option<Vec<String>> = None;
+    let mut collecting: Option<String> = None;
     let mut malformed = 0usize;
 
     for raw in text.lines() {
         let line = raw.trim();
 
-        // Inside an `"arguments": [ ... ]` array, which may span lines.
+        // Inside an `"arguments": [ ... ]` array, which may span lines. The
+        // raw text is accumulated and scanned for quoted runs at the closing
+        // bracket, NEVER split on commas: `-DPAIR=std::pair<int,int>` is one
+        // valid argument, and splitting it would silently drop the flag.
         if let Some(acc) = collecting.as_mut() {
-            for tok in line.split(',') {
-                if let Some(v) = json_string_field(tok.trim(), "") {
-                    acc.push(v);
-                }
-            }
+            acc.push_str(line);
             if line.contains(']') {
-                argv = collecting.take();
+                argv = Some(json_string_array(acc));
+                collecting = None;
             }
             continue;
         }
@@ -148,17 +151,11 @@ fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
         } else if let Some(v) = json_string_field(line, "\"command\":") {
             cmd = Some(v);
         } else if let Some(rest) = line.strip_prefix("\"arguments\":") {
-            let rest = rest.trim_start().trim_start_matches('[');
-            let mut acc = Vec::new();
-            for tok in rest.split(',') {
-                if let Some(v) = json_string_field(tok.trim(), "") {
-                    acc.push(v);
-                }
-            }
+            let rest = rest.trim_start();
             if rest.contains(']') {
-                argv = Some(acc);
+                argv = Some(json_string_array(rest));
             } else {
-                collecting = Some(acc);
+                collecting = Some(rest.to_string());
             }
         }
 
@@ -176,6 +173,43 @@ fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
     }
     if malformed > 0 {
         eprintln!("[ore] {malformed} compile_commands entries had neither command nor arguments");
+    }
+    out
+}
+
+/// Every quoted run in a JSON array of strings, in order.
+///
+/// Scans for unescaped `"` delimiters rather than splitting on `,`, because a
+/// comma inside a string is CONTENT: `["-DPAIR=std::pair<int,int>"]` is one
+/// argument, and a comma split turns it into two invalid fragments that are
+/// then dropped, silently changing the flags a translation unit is parsed with.
+fn json_string_array(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut inside, mut esc) = (false, false);
+    for c in text.chars() {
+        if !inside {
+            if c == '"' {
+                inside = true;
+                cur.clear();
+            }
+            continue;
+        }
+        if esc {
+            cur.push(match c {
+                'n' => '\n',
+                't' => '\t',
+                other => other,
+            });
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            inside = false;
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
     }
     out
 }
@@ -404,4 +438,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  {k:<11} {n:>8}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{json_string_array, keep_parse_flags, parse_cc_json};
+
+    /// A comma INSIDE a JSON string is content, not a separator. Splitting on
+    /// commas turns one valid flag into two invalid fragments and drops both,
+    /// silently changing the flags a translation unit is parsed with.
+    #[test]
+    fn an_argument_containing_a_comma_survives_the_array_parse() {
+        let got = json_string_array(r#"["c++", "-DPAIR=std::pair<int,int>", "-c"]"#);
+        assert_eq!(got, ["c++", "-DPAIR=std::pair<int,int>", "-c"]);
+        // The whole point: the comma-bearing flag is ONE element, not two.
+        assert_eq!(got.len(), 3, "a comma inside a string must not split it");
+    }
+
+    /// clang accepts `-I dir` as two tokens. Keeping the bare `-I` and dropping
+    /// the directory hands libclang an incomplete flag and loses the include
+    /// path, which shows up as a partial AST rather than an error.
+    #[test]
+    fn a_standalone_include_flag_keeps_its_directory() {
+        let toks: Vec<String> = ["-I", "/opt/incdir", "-c", "a.cpp", "-Ijoined"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(keep_parse_flags(&toks), ["-I", "/opt/incdir", "-Ijoined"]);
+    }
+
+    /// Both command forms are read, each entry is flushed at its own closing
+    /// brace, and an entry carrying neither form never steals a later command.
+    #[test]
+    fn each_compilation_database_entry_is_parsed_independently() {
+        let db = r#"[
+{
+  "directory": "/tmp",
+  "arguments": ["c++", "-std=c++17", "-DPAIR=std::pair<int,int>", "-I", "/opt/incdir", "-c", "a.cpp"],
+  "file": "/tmp/a.cpp"
+},
+{
+  "directory": "/tmp",
+  "file": "/tmp/no_command.cpp"
+},
+{
+  "directory": "/tmp",
+  "command": "c++ -std=c++17 -I/other -c b.cpp",
+  "file": "/tmp/b.cpp"
+}
+]"#;
+        let got = parse_cc_json(db);
+        let files: Vec<String> = got.iter().map(|(f, _)| f.display().to_string()).collect();
+        // The entry with neither form is dropped, and crucially it does NOT
+        // pair with the next entry's command.
+        assert_eq!(files, ["/tmp/a.cpp", "/tmp/b.cpp"]);
+        assert_eq!(
+            got[0].1,
+            [
+                "-std=c++17",
+                "-DPAIR=std::pair<int,int>",
+                "-I",
+                "/opt/incdir"
+            ]
+        );
+        assert_eq!(got[1].1, ["-std=c++17", "-I/other"]);
+    }
+
+    /// A multiline `arguments` array is accumulated before it is scanned, so a
+    /// comma-bearing flag survives that layout too.
+    #[test]
+    fn a_multiline_arguments_array_is_parsed_as_one_unit() {
+        let db = "[\n{\n  \"file\": \"/tmp/c.cpp\",\n  \"arguments\": [\n    \"c++\",\n    \"-DPAIR=std::pair<int,int>\",\n    \"-Iinc\"\n  ]\n}\n]";
+        let got = parse_cc_json(db);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, ["-DPAIR=std::pair<int,int>", "-Iinc"]);
+    }
 }
