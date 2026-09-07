@@ -14,6 +14,12 @@
 //! `virtually_overrides`, `defines_operator`, `is_pure_virtual`, and
 //! `is_noexcept` predicates from real parsing.
 //!
+//! It also harvests each method's **body arm** — the recipe fingerprint
+//! (`writes_field` / `reads_field` / `raises` / `calls` / `writes_if_blank`)
+//! the fuzzy recipe codebook classifies on, in the same shape the Ruby and C#
+//! frontends produce. See the BODY ARM section below for the measured cursor
+//! shapes it matches, and [`walk_tu_configured`] to opt out of it.
+//!
 //! **Walker follow-ups** (the IR + predicates already exist from PR #8; only
 //! the walker does not populate them yet): `constexpr`/`consteval` and
 //! C++20 `requires` clauses (not surfaced by the high-level `clang` API —
@@ -66,10 +72,12 @@ impl std::error::Error for WalkError {}
 /// **definition** found (forward declarations are skipped).
 ///
 /// `args` are passed verbatim to clang (e.g. `["-std=c++17", "-x", "c++",
-/// "-I/path/to/includes"]`). Function bodies are skipped for speed — only
-/// declarations are needed for SPO extraction. Parsing tolerates errors
-/// (missing includes still yield a partial AST), matching how libclang is
-/// used on large real corpora.
+/// "-I/path/to/includes"]`). Function bodies ARE parsed, because each method's
+/// body arm (the recipe fingerprint: what it writes, reads, throws and
+/// dispatches) is harvested alongside its signature; [`walk_tu_configured`]
+/// with `None` skips them for a faster signature-only walk. Parsing tolerates
+/// errors (missing includes still yield a partial AST), matching how libclang
+/// is used on large real corpora.
 ///
 /// A **partial** AST is silently possible even when this returns `Ok`: see
 /// [`walk_tu_with_diagnostics`] for the visibility this function alone does
@@ -118,12 +126,37 @@ pub fn walk_tu_with_diagnostics(
     path: &Path,
     args: &[String],
 ) -> Result<(Vec<CppClass>, Vec<ParseDiagnostic>), WalkError> {
+    walk_tu_configured(path, args, Some(&BodyArmConfig::default()))
+}
+
+/// [`walk_tu_with_diagnostics`] with explicit control over the body arm.
+///
+/// `arm` decides BOTH what is harvested and how the TU is parsed:
+///
+/// - `Some(cfg)` — parse WITH function bodies and fill each [`CppMethod`]'s
+///   `writes` / `reads` / `raises` / `calls` / `guarded_writes` from the body,
+///   using `cfg`'s mutator vocabulary. This is what [`walk_tu`] and
+///   [`walk_tu_with_diagnostics`] do.
+/// - `None` — skip function bodies (a faster parse) and leave the arm empty.
+///   The signature plane is identical either way, so a consumer that only
+///   reconstructs declarations (`ruff_cpp_codegen`) loses nothing by asking
+///   for this.
+///
+/// # Errors
+///
+/// [`WalkError::Libclang`] if libclang fails to initialise;
+/// [`WalkError::Parse`] if the TU fails to parse.
+pub fn walk_tu_configured(
+    path: &Path,
+    args: &[String],
+    arm: Option<&BodyArmConfig>,
+) -> Result<(Vec<CppClass>, Vec<ParseDiagnostic>), WalkError> {
     let clang = Clang::new().map_err(WalkError::Libclang)?;
     let index = Index::new(&clang, false, false);
     let tu = index
         .parser(path)
         .arguments(args)
-        .skip_function_bodies(true)
+        .skip_function_bodies(arm.is_none())
         .parse()
         .map_err(|e| WalkError::Parse(e.to_string()))?;
 
@@ -137,7 +170,7 @@ pub fn walk_tu_with_diagnostics(
         .collect();
 
     let mut out = Vec::new();
-    collect_classes(&tu.get_entity(), &mut out);
+    collect_classes(&tu.get_entity(), &mut out, arm);
     Ok((out, diagnostics))
 }
 
@@ -482,7 +515,7 @@ fn tally_class_bodies(entity: &Entity, hist: &mut BTreeMap<String, usize>) {
 
 /// Recurse the AST, emitting a [`CppClass`] for every class/struct
 /// definition (recursing into namespaces and nested classes).
-fn collect_classes(entity: &Entity, out: &mut Vec<CppClass>) {
+fn collect_classes(entity: &Entity, out: &mut Vec<CppClass>, arm: Option<&BodyArmConfig>) {
     for child in entity.get_children() {
         match child.get_kind() {
             // Plain classes/structs AND templated classes. libclang FLATTENS a
@@ -502,14 +535,14 @@ fn collect_classes(entity: &Entity, out: &mut Vec<CppClass>) {
                 // SPO harvest of a project wants the project's own classes,
                 // never the standard library's internals.
                 if child.is_definition() && !in_system_header(&child) {
-                    if let Some(cls) = build_class(&child) {
+                    if let Some(cls) = build_class(&child, arm) {
                         out.push(cls);
                     }
                 }
                 // Recurse for nested classes regardless of definition state.
-                collect_classes(&child, out);
+                collect_classes(&child, out, arm);
             }
-            EntityKind::Namespace => collect_classes(&child, out),
+            EntityKind::Namespace => collect_classes(&child, out, arm),
             _ => {}
         }
     }
@@ -518,7 +551,7 @@ fn collect_classes(entity: &Entity, out: &mut Vec<CppClass>) {
 /// Build a [`CppClass`] from a class/struct definition cursor by reading its
 /// DIRECT member children (bases, fields, methods). Nested class decls are
 /// ignored here — [`collect_classes`] emits them separately.
-fn build_class(e: &Entity) -> Option<CppClass> {
+fn build_class(e: &Entity, arm: Option<&BodyArmConfig>) -> Option<CppClass> {
     // A `ClassTemplatePartialSpecialization` shares its primary's `get_name()`
     // (libclang spells it as the bare template name, e.g. `Foo` for
     // `template<class T> class Foo<T*>`); using that as-is collides with the
@@ -574,7 +607,7 @@ fn build_class(e: &Entity) -> Option<CppClass> {
             | EntityKind::Destructor
             | EntityKind::ConversionFunction
             | EntityKind::FunctionTemplate => {
-                declarations.push(Declaration::Method(build_method(&m)));
+                declarations.push(Declaration::Method(build_method(&m, arm)));
                 collect_signature_instantiations(&m, &mut declarations);
             }
             // `friend class Foo;` / `friend Ret fn(...);` — the befriended
@@ -729,7 +762,12 @@ fn build_base(m: &Entity) -> Option<CppBase> {
     })
 }
 
-fn build_method(m: &Entity) -> CppMethod {
+/// Build a [`CppMethod`] from a member-function cursor. `arm` is `Some` when
+/// the translation unit was parsed WITH bodies, in which case the body arm is
+/// harvested from the method's DEFINITION — which for a method declared in a
+/// header and defined in a `.cpp` is a different cursor from `m`, and is the
+/// only one that has a body to read.
+fn build_method(m: &Entity, arm: Option<&BodyArmConfig>) -> CppMethod {
     let name = m.get_name().unwrap_or_default();
     let is_noexcept = matches!(
         m.get_exception_specification(),
@@ -784,6 +822,9 @@ fn build_method(m: &Entity) -> CppMethod {
         .flatten()
         .filter_map(|a| a.get_type().map(|t| t.get_display_name()))
         .collect();
+    let body = arm.map_or_else(BodyArm::default, |cfg| {
+        method_body_arm(&m.get_definition().unwrap_or(*m), cfg)
+    });
     CppMethod {
         name,
         is_pure_virtual: m.is_pure_virtual_method(),
@@ -803,164 +844,484 @@ fn build_method(m: &Entity) -> CppMethod {
             // Public, or unreported (e.g. free function) — default Public.
             _ => CppAccess::Public,
         },
+        writes: body.writes,
+        reads: body.reads,
+        raises: body.raises,
+        calls: body.calls,
+        guarded_writes: body.guarded_writes,
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// DTO ARM (DRAFT — libclang-gated, untested in this checkout: no libclang).
+// BODY ARM
 //
 // The body-fact fingerprint the fuzzy recipe-codebook needs
-// (ruff/.claude/knowledge/fuzzy-recipe-codebook.md §2), for C++ member
+// (`ruff/.claude/knowledge/fuzzy-recipe-codebook.md` §2), for C++ member
 // functions — so the SAME language-agnostic recipe centroids that classify
 // Rails hooks and C# handlers classify C++ setters / lifecycle overrides.
 //
-// STATUS: reviewed draft. The clang-crate cursor kinds below are correct, but
-// this has NOT been run against a real TU (this checkout has no libclang; the
-// whole crate is behind the `libclang` feature). A future session with
-// LIBCLANG_PATH set should: (1) wire `BodyArm` into `CppMethod` as four
-// `Vec<String>` fields + `guarded_writes` (mirroring ruff_spo_triplet::Function),
-// (2) emit them in the C++ expand path as writes_field / reads_field / raises /
-// calls / writes_if_blank, (3) add a probe on a real corpus (Tesseract) — same
-// env-gate + pre-register + drift-fuse discipline as the Ruby/C# legs.
+// The arm rides on [`CppMethod`]'s five body fields and expands to the same
+// five predicates as a Ruby/Python `Function` body, with the same objects and
+// the same truth tiers: `writes_field` / `raises` / `writes_if_blank` are
+// Authoritative (the lvalue, the throw type and the guard shape are all
+// machine-readable), `reads_field` / `calls` are Inferred (heuristic receiver,
+// no scope analysis).
 //
-// Provenance mapping (matches Function): writes_field / raises / writes_if_blank
-// = Authoritative (the lvalue / throw-type / guard shape are machine-readable);
-// reads_field / calls = Inferred (heuristic receiver + no scope analysis).
-#[allow(dead_code)] // TESTED via arm_tests; wired into CppMethod+expand is the follow-up
-#[cfg(feature = "libclang")]
-#[derive(Debug, Default, Clone)]
-pub(crate) struct BodyArm {
-    pub writes: Vec<String>,         // `this->x = …` / `x = …` member assignment
-    pub reads: Vec<String>,          // `this->x` / bare member read
-    pub raises: Vec<String>,         // `throw XError(…)`
-    pub calls: Vec<String>,          // `obj.SaveChanges()` / persistence mutator
-    pub guarded_writes: Vec<String>, // J1: write under `if (x == nullptr)` etc.
-}
+// Every cursor shape matched below was measured against libclang 18 on a
+// fixture carrying each construct, not inferred from the AST documentation —
+// several are counter-intuitive and the tests in `arm_tests` pin them:
+//
+//   `x_ = v`          BinaryOperator[ MemberRefExpr(x_), … ]
+//   `p.x_ = v`        BinaryOperator[ MemberRefExpr(x_)[ DeclRefExpr(p) ], … ]
+//   `this->x_ = v`    BinaryOperator[ MemberRefExpr(x_)[ ThisExpr ], … ]
+//   `x_ += v`         CompoundAssignOperator[ MemberRefExpr(x_), … ]
+//   `++x_`            UnaryOperator[ MemberRefExpr(x_) ]
+//   `arr_[i] = v`     BinaryOperator[ ArraySubscriptExpr[ …(arr_), …(i) ], … ]
+//   `repo_.Save()`    CallExpr(Save)[ MemberRefExpr(Save)[ MemberRefExpr(repo_) ] ]
+//   `name_ = s`       CallExpr(operator=)[ MemberRefExpr(name_), …(operator=), …(s) ]
+//                     (a class-typed member assigns through its operator, so it
+//                      is a CallExpr and NOT a BinaryOperator)
+//   `throw E()`       ThrowExpr[ CallExpr(E)[ TypeRef(struct E) ] ]
+//
+// The two shapes that make the difference between a correct fingerprint and a
+// plausible-looking wrong one:
+//
+//   * **The operator is not on the cursor.** libclang exposes no
+//     binary-operator kind, so the draft this replaces treated the LHS of
+//     ANY binary operator as a write — `if (status_ == v)` recorded a write of
+//     `status_`. [`binary_operator_spelling`] reads the operator from the
+//     token stream instead.
+//   * **An own member is one with no base cursor.** A member of another
+//     object (`p.x_`) carries its base as a child, and so does a method
+//     reference (`repo_.Save`), which is why neither is mistaken for this
+//     class's state.
 
-// The closed persistence-mutator set — the C++ analogue of Ruby's AR_MUTATORS
-// and the C# EF set. A `calls` fact fires only for these (the triage needs
-// "does it call a writer", not every call). Extend per ORM/framework.
-#[allow(dead_code)] // TESTED via arm_tests; wired into CppMethod+expand is the follow-up
-#[cfg(feature = "libclang")]
-fn is_cpp_mutator(name: &str) -> bool {
-    matches!(
-        name,
-        "save"
-            | "Save"
-            | "update"
-            | "Update"
-            | "insert"
-            | "Insert"
-            | "remove"
-            | "Remove"
-            | "erase"
-            | "commit"
-            | "Commit"
-            | "flush"
-            | "Flush"
-    )
-}
-
-/// Walk a member-function body cursor and extract the recipe fingerprint.
+/// Which set of calls counts as a lifecycle mutator for the `calls` fact.
 ///
-/// Call with the `Method`/`Constructor`/… entity; it recurses the body via
-/// `get_children()`. Local-only J1 guard detection (an `IfStmt` whose condition
-/// is a null/empty test on member `X`, containing a write of `X`) — no
-/// dominator analysis, keeping `writes_if_blank` Authoritative, exactly as the
-/// Ruby `detect_guarded_default` does.
-#[allow(dead_code)] // TESTED via arm_tests; wired into CppMethod+expand is the follow-up
+/// The C++ analogue of the Ruby `AR_MUTATORS` / C# EF sets, and configurable
+/// for the same reason those are: the mutator vocabulary belongs to the
+/// framework being harvested, not to the harvester. A `calls` fact fires only
+/// for a match, because the signal the triage needs is "does this method
+/// dispatch a writer", not a full call graph.
+///
+/// [`Self::default`] is the closed set that ships; a corpus with its own
+/// persistence vocabulary supplies it through [`Self::with_mutators`] /
+/// [`Self::with_mutator_prefixes`].
 #[cfg(feature = "libclang")]
-pub(crate) fn method_body_arm(method: &Entity) -> BodyArm {
-    let mut arm = BodyArm::default();
-    walk_body(method, &mut arm, None);
-    arm.writes.sort();
-    arm.writes.dedup();
-    arm.reads.sort();
-    arm.reads.dedup();
-    arm.raises.sort();
-    arm.raises.dedup();
-    arm.calls.sort();
-    arm.calls.dedup();
-    arm.guarded_writes.sort();
-    arm.guarded_writes.dedup();
-    arm
+#[derive(Debug, Clone)]
+pub struct BodyArmConfig {
+    mutators: Vec<String>,
+    mutator_prefixes: Vec<String>,
 }
 
-// `guard` = the member name the enclosing branch is null/empty-guarded on (J1),
-// threaded down only into that branch.
-#[allow(dead_code)] // TESTED via arm_tests; wired into CppMethod+expand is the follow-up
 #[cfg(feature = "libclang")]
-fn walk_body(node: &Entity, arm: &mut BodyArm, guard: Option<&str>) {
-    for child in node.get_children() {
-        match child.get_kind() {
-            // `throw XError("…")` — the exception type name is the throw's
-            // sub-expression type. `CXXThrowExpr` wraps the constructed value.
-            EntityKind::ThrowExpr => {
-                if let Some(ty) = thrown_type_name(&child) {
-                    arm.raises.push(format!("exc:{ty}"));
-                }
-            }
-            // `a = b` — a BinaryOperator whose operator is `=`. The clang crate
-            // does not expose the operator token directly on stable, so the
-            // idiom is: the first child is the lvalue. If it is a member ref
-            // (`this->x` / `x`), it is a write of that member; a J1 guard makes
-            // it a guarded (default) write.
-            EntityKind::BinaryOperator => {
-                if let Some(member) = child
-                    .get_children()
-                    .first()
-                    .filter(|c| c.get_kind() == EntityKind::MemberRefExpr)
-                    .and_then(Entity::get_name)
-                {
-                    arm.writes.push(member.clone());
-                    if guard == Some(member.as_str()) {
-                        arm.guarded_writes.push(member);
-                    }
-                }
-                // Recurse into the RHS for nested reads/calls/raises.
-                walk_body(&child, arm, guard);
-            }
-            // `obj.method(...)` — a persistence-mutator dispatch → `calls`.
-            EntityKind::CallExpr => {
-                if let Some(name) = child.get_name()
-                    && is_cpp_mutator(&name)
-                {
-                    // "receiver.method": the receiver display name if resolvable,
-                    // else `self`. (Heuristic — Inferred tier, like Ruby.)
-                    let recv = call_receiver(&child).unwrap_or_else(|| "self".to_string());
-                    arm.calls.push(format!("{recv}.{name}"));
-                }
-                walk_body(&child, arm, guard);
-            }
-            // `this->x` / bare `x` as a value → a member read. (The lvalue of an
-            // assignment is handled above and NOT double-counted here, because
-            // this arm only fires for a MemberRefExpr that is not the direct
-            // first child of a BinaryOperator — see the C# LHS-exclusion note.)
-            EntityKind::MemberRefExpr => {
-                if let Some(name) = child.get_name() {
-                    arm.reads.push(name);
-                }
-            }
-            // Structural wrappers (incl. `IfStmt`, `CompoundStmt`,
-            // `UnexposedExpr`) — recurse so facts inside them are matched as
-            // children. NOTE: unlike Ruby/C#, C++ J1 (`writes_if_blank`) is a
-            // documented FOLLOW-UP here: the libclang AST wraps the guard cond
-            // and the guarded write in `UnexposedExpr` nodes (see the cursor
-            // dump in `examples/`), so robust `if (x == nullptr) x = v` guard
-            // detection needs an UnexposedExpr-aware pass. Until then C++
-            // `guarded_writes` stays empty (a write-if-blank is recorded as a
-            // plain write → classified Compute/Normalize, never a false
-            // essential — the safe direction). `null_guarded_member` is the
-            // seed for that follow-up.
-            _ => walk_body(&child, arm, guard),
+impl Default for BodyArmConfig {
+    fn default() -> Self {
+        Self {
+            mutators: [
+                "save", "Save", "update", "Update", "insert", "Insert", "remove", "Remove",
+                "erase", "Erase", "commit", "Commit", "flush", "Flush", "destroy", "Destroy",
+                "clear", "Clear", "write", "Write",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+            mutator_prefixes: Vec::new(),
         }
     }
 }
 
-// The thrown exception's type name. `throw X(...)` nests the operand under
-// UnexposedExpr/ConstructExpr wrappers, so recurse for the first node yielding
-// a concrete, non-void type name.
-#[allow(dead_code)] // TESTED via arm_tests; wired into CppMethod+expand is the follow-up
+#[cfg(feature = "libclang")]
+impl BodyArmConfig {
+    /// Replace the exact-match mutator set.
+    #[must_use]
+    pub fn with_mutators(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.mutators = names.into_iter().collect();
+        self
+    }
+
+    /// Add prefixes that make any method name starting with one a mutator
+    /// (e.g. `"Set"` to treat every `SetFoo` as a writer).
+    #[must_use]
+    pub fn with_mutator_prefixes(mut self, prefixes: impl IntoIterator<Item = String>) -> Self {
+        self.mutator_prefixes = prefixes.into_iter().collect();
+        self
+    }
+
+    /// Does a call to `name` count as a lifecycle mutator?
+    #[must_use]
+    pub fn is_mutator(&self, name: &str) -> bool {
+        self.mutators.iter().any(|m| m == name)
+            || self.mutator_prefixes.iter().any(|p| name.starts_with(p))
+    }
+}
+
+/// The recipe fingerprint of one method body, before it is folded into
+/// [`CppMethod`]'s own fields.
+#[cfg(feature = "libclang")]
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BodyArm {
+    /// `x_ = …` / `x_ += …` / `++x_` — an assignment to an OWN data member.
+    pub writes: Vec<String>,
+    /// `x_` read as a value (and the target of a compound assignment).
+    pub reads: Vec<String>,
+    /// `throw E(…)` — the BARE type name; the expander adds the `exc:`
+    /// namespace, exactly as it does for a `Function`.
+    pub raises: Vec<String>,
+    /// `repo_.Save()` — a configured lifecycle mutator, as `receiver.method`.
+    pub calls: Vec<String>,
+    /// J1: a write under an absence test on that same member.
+    pub guarded_writes: Vec<String>,
+}
+
+/// Which branch of an `if` a condition guards.
+#[cfg(feature = "libclang")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardedBranch {
+    /// The condition tests for ABSENCE (`x == nullptr`, `!x`, `x.empty()`),
+    /// so the THEN branch is where the default is written.
+    Then,
+    /// The condition tests for PRESENCE (`x != nullptr`, `x`, `!x.empty()`),
+    /// so the ELSE branch is where the default is written.
+    Else,
+}
+
+/// Extract the recipe fingerprint from a member function's body.
+///
+/// Call with the entity that HAS the body — [`Entity::get_definition`] where
+/// the definition is out of line, the declaration cursor where it is inline.
+/// Guard detection is deliberately local (an `IfStmt` whose condition is an
+/// absence test on member `X`, threaded into the branch that writes `X`) — no
+/// dominator analysis, which is what keeps `writes_if_blank` Authoritative,
+/// exactly as the Ruby `detect_guarded_default` does.
+#[cfg(feature = "libclang")]
+pub(crate) fn method_body_arm(method: &Entity, cfg: &BodyArmConfig) -> BodyArm {
+    let mut arm = BodyArm::default();
+    walk_body(method, &mut arm, cfg, None);
+    for facts in [
+        &mut arm.writes,
+        &mut arm.reads,
+        &mut arm.raises,
+        &mut arm.calls,
+        &mut arm.guarded_writes,
+    ] {
+        facts.sort();
+        facts.dedup();
+    }
+    arm
+}
+
+/// Walk every CHILD of `node`. `guard` is the member the enclosing branch is
+/// absence-guarded on (J1), threaded down only into that branch.
+#[cfg(feature = "libclang")]
+fn walk_body(node: &Entity, arm: &mut BodyArm, cfg: &BodyArmConfig, guard: Option<&str>) {
+    for child in node.get_children() {
+        walk_node(&child, arm, cfg, guard);
+    }
+}
+
+/// Walk ONE node, matching it before descending.
+#[cfg(feature = "libclang")]
+fn walk_node(node: &Entity, arm: &mut BodyArm, cfg: &BodyArmConfig, guard: Option<&str>) {
+    match node.get_kind() {
+        EntityKind::ThrowExpr => {
+            if let Some(ty) = thrown_type_name(node) {
+                arm.raises.push(ty);
+            }
+            walk_body(node, arm, cfg, guard);
+        }
+        // Only `=` is an assignment. Every other binary operator (`==`, `+`,
+        // `<<`, …) reads both sides — which is why the operator has to be read
+        // off the tokens rather than assumed from the cursor kind.
+        EntityKind::BinaryOperator => {
+            let children = node.get_children();
+            if let Some((lhs, rest)) = children.split_first()
+                && binary_operator_spelling(node).as_deref() == Some("=")
+            {
+                record_write(arm, lhs, guard);
+                // The LHS's own member reference is the write TARGET, not a
+                // read, so descend past it — but keep whatever it contains
+                // (`arr_[i]`'s subscript, `p` in `p.x_`).
+                walk_body(lhs, arm, cfg, guard);
+                for r in rest {
+                    walk_node(r, arm, cfg, guard);
+                }
+            } else {
+                walk_body(node, arm, cfg, guard);
+            }
+        }
+        // `x_ += v` is both a write and a read of `x_` — a read-modify-write.
+        EntityKind::CompoundAssignOperator => {
+            let children = node.get_children();
+            if let Some((lhs, rest)) = children.split_first() {
+                record_write(arm, lhs, guard);
+                if let Some(m) = assignment_target(lhs) {
+                    arm.reads.push(m);
+                }
+                walk_body(lhs, arm, cfg, guard);
+                for r in rest {
+                    walk_node(r, arm, cfg, guard);
+                }
+            }
+        }
+        // `++x_` / `x_--` are read-modify-writes too; every other unary
+        // operator (`!x_`, `*x_`, `-x_`) only reads.
+        EntityKind::UnaryOperator => {
+            let is_inc_dec = unary_operator_is_inc_dec(node);
+            let children = node.get_children();
+            if let Some(operand) = children.first()
+                && is_inc_dec
+            {
+                record_write(arm, operand, guard);
+                if let Some(m) = assignment_target(operand) {
+                    arm.reads.push(m);
+                }
+                walk_body(operand, arm, cfg, guard);
+            } else {
+                walk_body(node, arm, cfg, guard);
+            }
+        }
+        EntityKind::CallExpr => call_expr(node, arm, cfg, guard),
+        EntityKind::IfStmt => if_stmt(node, arm, cfg, guard),
+        // A member reference that is not an assignment target is a read — but
+        // only when it names an OWN data member. `p.x_` and `repo_.Save` both
+        // carry their base as a child and are therefore not own members;
+        // descending still finds `repo_` inside the latter.
+        EntityKind::MemberRefExpr => {
+            if let Some(name) = own_member_name(node) {
+                arm.reads.push(name);
+            }
+            walk_body(node, arm, cfg, guard);
+        }
+        _ => walk_body(node, arm, cfg, guard),
+    }
+}
+
+/// A call: either an overloaded-operator assignment (a write), a configured
+/// lifecycle mutator (a `calls` fact), or an ordinary call walked for its
+/// arguments.
+#[cfg(feature = "libclang")]
+fn call_expr(node: &Entity, arm: &mut BodyArm, cfg: &BodyArmConfig, guard: Option<&str>) {
+    let name = node.get_name().unwrap_or_default();
+    let children = node.get_children();
+
+    // A class-typed member assigns through `operator=`, so `name_ = s` arrives
+    // as a CallExpr whose FIRST child is the assigned object (not a callee
+    // reference, which is the shape an ordinary method call has).
+    if let Some(op) = name.strip_prefix("operator")
+        && op.ends_with('=')
+        && !matches!(op, "==" | "!=" | "<=" | ">=")
+        && let Some((lhs, rest)) = children.split_first()
+    {
+        record_write(arm, lhs, guard);
+        // A compound form (`+=`, `|=`, …) also reads its target.
+        if op != "="
+            && let Some(m) = assignment_target(lhs)
+        {
+            arm.reads.push(m);
+        }
+        walk_body(lhs, arm, cfg, guard);
+        for r in rest {
+            walk_node(r, arm, cfg, guard);
+        }
+        return;
+    }
+
+    if cfg.is_mutator(&name) {
+        arm.calls.push(format!(
+            "{}.{name}",
+            call_receiver(node).as_deref().unwrap_or("this")
+        ));
+    }
+    for child in &children {
+        // The callee reference names the METHOD, not a data member — walking
+        // it as an ordinary node would record `Save` as a read of a field that
+        // does not exist. Its children (the receiver) still matter.
+        if child.get_kind() == EntityKind::MemberRefExpr && child.get_name().as_ref() == Some(&name)
+        {
+            walk_body(child, arm, cfg, guard);
+        } else {
+            walk_node(child, arm, cfg, guard);
+        }
+    }
+}
+
+/// An `if`: walk the condition for its reads, then each branch — threading the
+/// J1 guard into whichever branch the condition proves the member ABSENT in.
+#[cfg(feature = "libclang")]
+fn if_stmt(node: &Entity, arm: &mut BodyArm, cfg: &BodyArmConfig, guard: Option<&str>) {
+    let children = node.get_children();
+    let Some((cond, branches)) = children.split_first() else {
+        return;
+    };
+    walk_node(cond, arm, cfg, None);
+    // `branches` is [then] or [then, else].
+    let detected = absence_guard(cond);
+    for (i, branch) in branches.iter().enumerate() {
+        let branch_guard = match &detected {
+            // This `if` decides the guard for both of its branches: the one
+            // the condition proves the member absent in gets it, the other
+            // gets nothing (an enclosing guard is dropped rather than
+            // reasoned about — the safe direction, since a missed guard only
+            // records a plain write).
+            Some((member, GuardedBranch::Then)) => (i == 0).then_some(member.as_str()),
+            Some((member, GuardedBranch::Else)) => (i == 1).then_some(member.as_str()),
+            // No guard here — an enclosing one still holds in both branches.
+            None => guard,
+        };
+        walk_node(branch, arm, cfg, branch_guard);
+    }
+}
+
+/// Record an assignment to `lhs` as a write, and as a J1 guarded write when
+/// the enclosing branch is absence-guarded on that same member.
+#[cfg(feature = "libclang")]
+fn record_write(arm: &mut BodyArm, lhs: &Entity, guard: Option<&str>) {
+    if let Some(member) = assignment_target(lhs) {
+        if guard == Some(member.as_str()) {
+            arm.guarded_writes.push(member.clone());
+        }
+        arm.writes.push(member);
+    }
+}
+
+/// The own data member an assignment's left-hand side ultimately names, seeing
+/// through the wrappers libclang inserts plus subscripting and dereference
+/// (`arr_[i] = v` and `*ptr_ = v` both write the member). `None` when the
+/// target is anything else — a local, a parameter, or another object's member.
+#[cfg(feature = "libclang")]
+fn assignment_target(lhs: &Entity) -> Option<String> {
+    let mut cur = *lhs;
+    // Bounded: each step descends one AST level, and the depth of an lvalue
+    // expression is finite. The cap only guards against a cyclic cursor graph.
+    for _ in 0..32 {
+        match cur.get_kind() {
+            EntityKind::MemberRefExpr => return own_member_name(&cur),
+            EntityKind::UnexposedExpr
+            | EntityKind::ParenExpr
+            | EntityKind::ArraySubscriptExpr
+            | EntityKind::UnaryOperator => {
+                cur = cur.get_children().into_iter().next()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The member name when `e` references a data member of THIS object.
+///
+/// An implicit `this` base is not a visited child, and an explicit one is a
+/// [`EntityKind::ThisExpr`]; any other base (`p.x_`, `repo_.Save`) means the
+/// reference belongs to something else.
+#[cfg(feature = "libclang")]
+fn own_member_name(e: &Entity) -> Option<String> {
+    if e.get_kind() != EntityKind::MemberRefExpr {
+        return None;
+    }
+    match e.get_children().first().map(Entity::get_kind) {
+        None | Some(EntityKind::ThisExpr) => e.get_name(),
+        _ => None,
+    }
+}
+
+/// The operator spelling of a binary operator, read off the token stream.
+///
+/// libclang exposes no binary-operator kind, so the operator is the first
+/// punctuation token that starts at or after the end of the left operand.
+#[cfg(feature = "libclang")]
+fn binary_operator_spelling(node: &Entity) -> Option<String> {
+    let lhs_end = node
+        .get_children()
+        .first()?
+        .get_range()?
+        .get_end()
+        .get_file_location()
+        .offset;
+    node.get_range()?
+        .tokenize()
+        .into_iter()
+        .find(|t| {
+            t.get_kind() == clang::token::TokenKind::Punctuation
+                && t.get_location().get_file_location().offset >= lhs_end
+        })
+        .map(|t| t.get_spelling())
+}
+
+/// Is this unary operator an increment or decrement (prefix or postfix)?
+#[cfg(feature = "libclang")]
+fn unary_operator_is_inc_dec(node: &Entity) -> bool {
+    let Some(range) = node.get_range() else {
+        return false;
+    };
+    let tokens = range.tokenize();
+    let is_inc_dec = |t: Option<&clang::token::Token<'_>>| {
+        t.map(clang::token::Token::get_spelling)
+            .is_some_and(|s| s == "++" || s == "--")
+    };
+    is_inc_dec(tokens.first()) || is_inc_dec(tokens.last())
+}
+
+/// The J1 fact's condition half: does this `if` condition test ONE own member
+/// for absence or presence, and which branch does that make the guarded one?
+///
+/// Deliberately conservative — a compound condition (`&&` / `||`), a condition
+/// naming more than one own member, or a shape not in the table below yields
+/// `None`, so the write is recorded as a plain write. That is the safe
+/// direction: a missed guard classifies the method as `Compute`/`Normalize`,
+/// never as a false schema default.
+#[cfg(feature = "libclang")]
+fn absence_guard(cond: &Entity) -> Option<(String, GuardedBranch)> {
+    let mut members = Vec::new();
+    collect_own_members(cond, &mut members);
+    members.sort();
+    members.dedup();
+    let [member] = members.as_slice() else {
+        return None;
+    };
+
+    let tokens: Vec<String> = cond
+        .get_range()?
+        .tokenize()
+        .into_iter()
+        .map(|t| t.get_spelling())
+        .collect();
+    let has = |t: &str| tokens.iter().any(|s| s == t);
+    if has("&&") || has("||") {
+        return None;
+    }
+    let null_literal = has("nullptr") || has("NULL") || has("0") || has("false");
+    let empty_test = has("empty") || has("isEmpty") || has("IsEmpty");
+    let leading_bang = tokens.first().is_some_and(|t| t == "!");
+    let comparison = ["==", "!=", "<", ">", "<=", ">="].iter().any(|t| has(t));
+
+    let branch = match () {
+        () if has("==") && null_literal => GuardedBranch::Then,
+        () if has("!=") && null_literal => GuardedBranch::Else,
+        () if leading_bang && empty_test => GuardedBranch::Else,
+        () if leading_bang => GuardedBranch::Then,
+        () if empty_test => GuardedBranch::Then,
+        // A bare `if (x_)` is a presence test.
+        () if !comparison && !empty_test => GuardedBranch::Else,
+        () => return None,
+    };
+    Some((member.clone(), branch))
+}
+
+/// Every own data member referenced anywhere under `node`.
+#[cfg(feature = "libclang")]
+fn collect_own_members(node: &Entity, out: &mut Vec<String>) {
+    if let Some(name) = own_member_name(node) {
+        out.push(name);
+    }
+    for child in node.get_children() {
+        collect_own_members(&child, out);
+    }
+}
+
+/// The thrown exception's type name. `throw X(...)` nests the operand under
+/// wrapper cursors, so recurse for the first node yielding a concrete,
+/// non-void type name.
 #[cfg(feature = "libclang")]
 fn thrown_type_name(throw: &Entity) -> Option<String> {
     fn first_typed(e: &Entity) -> Option<String> {
@@ -975,41 +1336,28 @@ fn thrown_type_name(throw: &Entity) -> Option<String> {
     throw.get_children().iter().find_map(first_typed)
 }
 
-// `x == nullptr` / `x == 0` / `x.empty()` → the guarded member `X`. Retained as
-// the SEED for the C++ J1 follow-up (see the IfStmt note in `walk_body`); not
-// yet wired, hence `dead_code`.
-#[allow(dead_code)]
-// Draft: the
-// clang crate surfaces the operator via the child token stream; a full impl
-// inspects `get_children()` for a MemberRefExpr paired with a null literal.
-#[cfg(feature = "libclang")]
-fn null_guarded_member(cond: &Entity) -> Option<String> {
-    // Look for a MemberRefExpr anywhere in the condition whose sibling is a
-    // null/zero literal or whose parent call is `.empty()`. Kept deliberately
-    // conservative (only the clear cases) so the fact stays Authoritative.
-    cond.get_children()
-        .iter()
-        .find(|c| c.get_kind() == EntityKind::MemberRefExpr)
-        .and_then(Entity::get_name)
-}
-
-// Best-effort receiver label for a call (`obj` in `obj.save()`), else None.
-#[allow(dead_code)] // TESTED via arm_tests; wired into CppMethod+expand is the follow-up
+/// The receiver of a method call (`repo_` in `repo_.Save()`), or `None` for an
+/// implicit-`this` call — the callee reference's own base.
 #[cfg(feature = "libclang")]
 fn call_receiver(call: &Entity) -> Option<String> {
-    call.get_children()
-        .iter()
-        .find(|c| {
-            matches!(
-                c.get_kind(),
-                EntityKind::MemberRefExpr | EntityKind::DeclRefExpr
-            )
-        })
-        .and_then(Entity::get_name)
+    let name = call.get_name()?;
+    let callee = call.get_children().into_iter().find(|c| {
+        c.get_kind() == EntityKind::MemberRefExpr && c.get_name() == Some(name.clone())
+    })?;
+    let mut cur = callee.get_children().into_iter().next()?;
+    for _ in 0..32 {
+        match cur.get_kind() {
+            EntityKind::MemberRefExpr | EntityKind::DeclRefExpr => return cur.get_name(),
+            EntityKind::UnexposedExpr | EntityKind::ParenExpr => {
+                cur = cur.get_children().into_iter().next()?;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
-// `List<Foo>` / `foo::Bar` → a stable bare type name for the `exc:` object.
-#[allow(dead_code)] // TESTED via arm_tests; wired into CppMethod+expand is the follow-up
+/// `List<Foo>` / `foo::Bar` → a stable bare type name for the `raises` object.
 #[cfg(feature = "libclang")]
 fn bare_type_name(display: &str) -> String {
     let s = display
@@ -1034,94 +1382,374 @@ mod arm_tests {
     use super::*;
     use std::io::Write;
 
-    fn find_method<'a>(e: &Entity<'a>, name: &str) -> Option<Entity<'a>> {
+    /// Every method under `e`, by name.
+    fn methods<'a>(e: &Entity<'a>, out: &mut BTreeMap<String, Entity<'a>>) {
         for c in e.get_children() {
-            if c.get_kind() == EntityKind::Method && c.get_name().as_deref() == Some(name) {
-                return Some(c);
+            if matches!(
+                c.get_kind(),
+                EntityKind::Method | EntityKind::Constructor | EntityKind::Destructor
+            ) && let Some(name) = c.get_name()
+            {
+                // A method seen twice (header declaration + out-of-line
+                // definition) keeps the DEFINITION, which is the cursor the
+                // arm needs — `build_method` resolves the same way.
+                if c.is_definition() || !out.contains_key(&name) {
+                    out.insert(name, c);
+                }
             }
-            if let Some(f) = find_method(&c, name) {
-                return Some(f);
-            }
+            methods(&c, out);
         }
-        None
     }
 
-    // Parse an inline C++ fixture WITH function bodies (walk_tu skips them),
-    // find one method by name, and return its recipe fingerprint.
-    fn arm_of(src: &str, method: &str) -> BodyArm {
-        let dir = std::env::temp_dir().join(format!("cpp_arm_{method}"));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// Parse one inline C++ fixture WITH bodies and return every method's arm.
+    ///
+    /// One parse per fixture, not one per method: `Clang` is a process
+    /// singleton, so each parse serialises on [`CLANG_TEST_LOCK`].
+    fn arms_with(name: &str, src: &str, cfg: &BodyArmConfig) -> BTreeMap<String, BodyArm> {
+        let dir = std::env::temp_dir().join(format!("cpp_arm_{name}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("f.cpp");
-        let mut fh = std::fs::File::create(&path).unwrap();
-        fh.write_all(src.as_bytes()).unwrap();
+        let mut fh = std::fs::File::create(&path).expect("fixture file");
+        fh.write_all(src.as_bytes()).expect("write fixture");
         drop(fh);
+
         let _guard = CLANG_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let clang = Clang::new().unwrap();
+        let clang = Clang::new().expect("libclang");
         let index = Index::new(&clang, false, false);
         let tu = index
             .parser(&path)
             .arguments(&["-std=c++17".to_string()])
-            .skip_function_bodies(false) // ← the arm needs bodies
+            .skip_function_bodies(false)
             .parse()
-            .unwrap();
-        let m = find_method(&tu.get_entity(), method).expect("method not found");
-        method_body_arm(&m)
+            .expect("parse");
+        let mut found = BTreeMap::new();
+        methods(&tu.get_entity(), &mut found);
+        found
+            .into_iter()
+            .map(|(n, e)| (n, method_body_arm(&e, cfg)))
+            .collect()
+    }
+
+    fn arms(name: &str, src: &str) -> BTreeMap<String, BodyArm> {
+        arms_with(name, src, &BodyArmConfig::default())
+    }
+
+    /// A class exercising every write/read shape the arm must tell apart.
+    /// Declaration order matters: a type must be complete before a member
+    /// uses it, or the operand's type is unresolved and the arm sees nothing.
+    const SHAPES: &str = r#"
+struct BadStatus {};
+struct Repo { void Save(); void Peek() const; };
+struct Str { bool empty() const; };
+struct Patient {
+    int status_;
+    int arr_[4];
+    int* ptr_;
+    Repo repo_;
+    Str name_;
+    void set(int v) { status_ = v; }
+    void compare(int v) { if (status_ == v) { } }
+    void compound(int v) { status_ += v; }
+    void increment() { ++status_; }
+    void decrement() { status_--; }
+    void assign_object(Str s) { name_ = s; }
+    void other_object(Patient& p, int v) { p.status_ = v; }
+    void explicit_this(int v) { this->status_ = v; }
+    void subscript(int i, int v) { arr_[i] = v; }
+    void read_only(int& out) { out = status_; }
+    void persist() { repo_.Save(); }
+    void peek() { repo_.Peek(); }
+    void call_self() { reset(); }
+    void reset() { status_ = 0; }
+    void thrower() { throw BadStatus(); }
+};
+"#;
+
+    #[test]
+    fn a_plain_setter_writes_its_member_without_reading_it() {
+        let a = &arms("shapes", SHAPES)["set"];
+        assert_eq!(a.writes, ["status_"]);
+        assert!(
+            a.reads.is_empty(),
+            "the assignment target is not a read: {:?}",
+            a.reads
+        );
+    }
+
+    /// The defect the token-based operator lookup exists to fix: without it
+    /// every binary operator's left operand read as a write, so a pure
+    /// comparison reported a mutation.
+    #[test]
+    fn a_comparison_is_a_read_and_never_a_write() {
+        let a = &arms("shapes", SHAPES)["compare"];
+        assert!(a.writes.is_empty(), "comparison wrote {:?}", a.writes);
+        assert_eq!(a.reads, ["status_"]);
     }
 
     #[test]
-    fn cpp_body_arm_extracts_the_fingerprint() {
-        // Declaration order matters: `BadStatus` and `Repo` must be complete
-        // types before `Patient` uses them (a forward-ref leaves the throw
-        // operand unresolved and the arm sees no type).
-        let src = r#"
-struct BadStatus {};
-struct Repo { void save(); };
-struct Patient {
-    int status_;
-    Repo repo_;
-    // normalize: unconditional self-write
-    void tidy() { status_ = status_ + 1; }
-    // guard: throw only
-    void validate() { if (status_ == 0) throw BadStatus(); }
-    // cascade: mutator dispatch
-    void persist() { repo_.save(); }
+    fn a_read_modify_write_is_both() {
+        let all = arms("shapes", SHAPES);
+        for name in ["compound", "increment", "decrement"] {
+            let a = &all[name];
+            assert_eq!(a.writes, ["status_"], "{name} writes");
+            assert_eq!(a.reads, ["status_"], "{name} reads");
+        }
+    }
+
+    /// A class-typed member assigns through `operator=`, so libclang reports
+    /// the assignment as a call — a shape a BinaryOperator-only walker misses
+    /// entirely.
+    #[test]
+    fn an_overloaded_assignment_is_still_a_write() {
+        let a = &arms("shapes", SHAPES)["assign_object"];
+        assert_eq!(a.writes, ["name_"]);
+        assert!(a.reads.is_empty(), "copy-assign read {:?}", a.reads);
+    }
+
+    #[test]
+    fn another_objects_member_is_not_state_of_this_class() {
+        let a = &arms("shapes", SHAPES)["other_object"];
+        assert!(a.writes.is_empty(), "wrote {:?}", a.writes);
+        assert!(a.reads.is_empty(), "read {:?}", a.reads);
+    }
+
+    #[test]
+    fn an_explicit_this_is_the_same_member_as_an_implicit_one() {
+        let all = arms("shapes", SHAPES);
+        assert_eq!(all["explicit_this"].writes, all["set"].writes);
+        assert_eq!(all["explicit_this"].reads, all["set"].reads);
+    }
+
+    #[test]
+    fn a_subscripted_assignment_writes_the_array_member() {
+        let a = &arms("shapes", SHAPES)["subscript"];
+        assert_eq!(a.writes, ["arr_"]);
+    }
+
+    #[test]
+    fn a_value_use_is_a_read() {
+        let a = &arms("shapes", SHAPES)["read_only"];
+        assert_eq!(a.reads, ["status_"]);
+        assert!(a.writes.is_empty(), "wrote {:?}", a.writes);
+    }
+
+    /// The receiver is the object the mutator is called ON — not the method
+    /// name, which is what the callee cursor carries.
+    #[test]
+    fn a_mutator_call_names_its_receiver() {
+        let a = &arms("shapes", SHAPES)["persist"];
+        assert_eq!(a.calls, ["repo_.Save"]);
+        assert_eq!(a.reads, ["repo_"], "the receiver is read");
+    }
+
+    #[test]
+    fn a_non_mutator_call_is_not_a_calls_fact() {
+        let a = &arms("shapes", SHAPES)["peek"];
+        assert!(a.calls.is_empty(), "calls {:?}", a.calls);
+    }
+
+    /// A method reference is not a data member, so calling one on this object
+    /// must not manufacture a read of a field that does not exist.
+    #[test]
+    fn calling_own_method_does_not_read_a_field_named_after_it() {
+        let a = &arms("shapes", SHAPES)["call_self"];
+        assert!(a.reads.is_empty(), "read {:?}", a.reads);
+        assert!(a.writes.is_empty(), "wrote {:?}", a.writes);
+    }
+
+    /// The IR carries the BARE type name; the `exc:` namespace is the
+    /// expander's job, exactly as it is for a `Function`.
+    #[test]
+    fn a_throw_records_the_bare_exception_type() {
+        let a = &arms("shapes", SHAPES)["thrower"];
+        assert_eq!(a.raises, ["BadStatus"]);
+    }
+
+    const GUARDS: &str = r#"
+struct Str { bool empty() const; };
+struct Cfg {
+    int* ptr_;
+    Str name_;
+    int other_;
+    void null_guard(int* v) { if (ptr_ == nullptr) { ptr_ = v; } }
+    void bang_guard(int* v) { if (!ptr_) { ptr_ = v; } }
+    void empty_guard(Str s) { if (name_.empty()) { name_ = s; } }
+    void present_guard(int* v) { if (ptr_ != nullptr) { } else { ptr_ = v; } }
+    void bare_truth_guard(int* v) { if (ptr_) { } else { ptr_ = v; } }
+    void not_empty_guard(Str s) { if (!name_.empty()) { } else { name_ = s; } }
+    void unguarded(int* v) { ptr_ = v; }
+    void wrong_branch(int* v) { if (ptr_ == nullptr) { } else { ptr_ = v; } }
+    void other_member_guard(int* v) { if (other_ == 0) { ptr_ = v; } }
+    void compound_condition(int* v, bool b) { if (ptr_ == nullptr && b) { ptr_ = v; } }
 };
 "#;
-        let tidy = arm_of(src, "tidy");
-        assert!(
-            tidy.writes.contains(&"status_".to_string()),
-            "writes {:?}",
-            tidy.writes
-        );
-        assert!(
-            tidy.reads.contains(&"status_".to_string()),
-            "reads {:?}",
-            tidy.reads
-        );
 
-        let validate = arm_of(src, "validate");
-        assert!(
-            validate.writes.is_empty(),
-            "guard writes nothing: {:?}",
-            validate.writes
-        );
-        assert!(
-            validate.raises.iter().any(|r| r.contains("BadStatus")),
-            "raises {:?}",
-            validate.raises
-        );
+    #[test]
+    fn an_absence_test_makes_the_then_branch_write_a_guarded_write() {
+        let all = arms("guards", GUARDS);
+        for name in ["null_guard", "bang_guard", "empty_guard"] {
+            let a = &all[name];
+            assert_eq!(a.guarded_writes.len(), 1, "{name}: {:?}", a.guarded_writes);
+            assert!(
+                a.writes.contains(&a.guarded_writes[0]),
+                "{name}: a guarded write is always a write too"
+            );
+        }
+    }
 
-        let persist = arm_of(src, "persist");
-        assert!(
-            persist
-                .calls
+    /// The mirror image: when the condition proves the member PRESENT, the
+    /// default is written in the `else`, so that is the guarded branch.
+    #[test]
+    fn a_presence_test_makes_the_else_branch_write_a_guarded_write() {
+        let all = arms("guards", GUARDS);
+        for (name, member) in [
+            ("present_guard", "ptr_"),
+            ("bare_truth_guard", "ptr_"),
+            ("not_empty_guard", "name_"),
+        ] {
+            let a = &all[name];
+            assert_eq!(a.guarded_writes, [member], "{name} guarded writes");
+            assert_eq!(a.writes, [member], "{name} writes");
+        }
+    }
+
+    /// The silence half. Each of these writes the member and must NOT be
+    /// recorded as a schema default — a guard that fires on everything
+    /// carries exactly as much information as one that never fires.
+    #[test]
+    fn a_write_that_is_not_absence_guarded_stays_a_plain_write() {
+        let all = arms("guards", GUARDS);
+        for name in [
+            // No conditional at all.
+            "unguarded",
+            // Guarded, but the write is in the branch where the member is
+            // known PRESENT.
+            "wrong_branch",
+            // The condition tests a DIFFERENT member.
+            "other_member_guard",
+            // A compound condition is not analysed.
+            "compound_condition",
+        ] {
+            let a = &all[name];
+            assert!(!a.writes.is_empty(), "{name} should still write");
+            assert!(
+                a.guarded_writes.is_empty(),
+                "{name} claimed a guarded write: {:?}",
+                a.guarded_writes
+            );
+        }
+    }
+
+    #[test]
+    fn the_mutator_vocabulary_is_configurable() {
+        let src = r#"
+struct Repo { void Persist(); void Save(); };
+struct Svc { Repo repo_; void go() { repo_.Persist(); repo_.Save(); } };
+"#;
+        // The shipped set does not know `Persist`.
+        let default = &arms("mutator_default", src)["go"];
+        assert_eq!(default.calls, ["repo_.Save"]);
+
+        // …and a corpus with its own vocabulary can say so.
+        let custom = BodyArmConfig::default().with_mutators(["Persist".to_string()]);
+        let configured = &arms_with("mutator_custom", src, &custom)["go"];
+        assert_eq!(configured.calls, ["repo_.Persist"]);
+
+        // Prefixes work too, and compose with the exact set.
+        let prefixed = BodyArmConfig::default().with_mutator_prefixes(["Per".to_string()]);
+        let both = &arms_with("mutator_prefix", src, &prefixed)["go"];
+        assert_eq!(both.calls, ["repo_.Persist", "repo_.Save"]);
+    }
+
+    /// The reason `build_method` resolves through [`Entity::get_definition`]:
+    /// a method declared in a class and defined out of line has NO body on the
+    /// declaration cursor, which is the one `build_class` walks.
+    #[test]
+    fn an_out_of_line_definition_is_harvested_through_the_declaration() {
+        let src = r#"
+struct Repo { void Save(); };
+struct Svc {
+    int status_;
+    Repo repo_;
+    void finish(int v);
+};
+void Svc::finish(int v) { status_ = v; repo_.Save(); }
+"#;
+        let dir = std::env::temp_dir().join("cpp_arm_outofline");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("f.cpp");
+        std::fs::write(&path, src).expect("write fixture");
+
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (classes, _) = walk_tu_configured(
+            &path,
+            &["-std=c++17".to_string()],
+            Some(&BodyArmConfig::default()),
+        )
+        .expect("walk");
+
+        let svc = classes.iter().find(|c| c.name == "Svc").expect("Svc");
+        let finish = svc
+            .declarations
+            .iter()
+            .find_map(|d| match d {
+                Declaration::Method(m) if m.name == "finish" => Some(m),
+                _ => None,
+            })
+            .expect("finish");
+        assert_eq!(finish.writes, ["status_"]);
+        assert_eq!(finish.calls, ["repo_.Save"]);
+    }
+
+    /// The opt-out: a signature-only walk parses no bodies, so every arm is
+    /// empty while the signature plane is unchanged.
+    ///
+    /// The opt-out is enforced TWICE — the TU is parsed with
+    /// `skip_function_bodies`, and `build_method` does not harvest — so
+    /// disabling either mechanism alone leaves this test green. That is
+    /// redundancy, not a vacuous assertion: it goes red when the parse flag is
+    /// forced on, and red again when both are forced on. Anyone tempted to
+    /// drop one of the two as dead weight should expect no test to notice.
+    #[test]
+    fn a_signature_only_walk_leaves_the_arm_empty() {
+        let src = r#"
+struct Svc { int status_; void set(int v) { status_ = v; } };
+"#;
+        let dir = std::env::temp_dir().join("cpp_arm_sigonly");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("f.cpp");
+        std::fs::write(&path, src).expect("write fixture");
+        let args = ["-std=c++17".to_string()];
+
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let method_of = |arm: Option<&BodyArmConfig>| {
+            let (classes, _) = walk_tu_configured(&path, &args, arm).expect("walk");
+            classes
                 .iter()
-                .any(|c| c.split('.').next_back() == Some("save")),
-            "calls {:?}",
-            persist.calls
-        );
+                .find(|c| c.name == "Svc")
+                .and_then(|c| {
+                    c.declarations.iter().find_map(|d| match d {
+                        Declaration::Method(m) if m.name == "set" => Some(m.clone()),
+                        _ => None,
+                    })
+                })
+                .expect("set")
+        };
+        let with_arm = method_of(Some(&BodyArmConfig::default()));
+        let without = method_of(None);
+
+        assert_eq!(with_arm.writes, ["status_"], "the arm is the default");
+        assert!(without.writes.is_empty(), "opting out harvests no body");
+        // The signature plane is identical either way.
+        assert_eq!(with_arm.param_types, without.param_types);
+        assert_eq!(with_arm.is_const, without.is_const);
+        assert_eq!(with_arm.access, without.access);
     }
 }
 

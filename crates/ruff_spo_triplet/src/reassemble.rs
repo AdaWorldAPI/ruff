@@ -75,6 +75,14 @@ struct MethodAcc {
     is_const: bool,
     is_static: bool,
     access: CppAccess,
+    /// Body arm — recovered from the same five predicates `expand` emits for
+    /// a `Function` body (`writes_field` / `reads_field` / `raises` / `calls`
+    /// / `writes_if_blank`), objects stripped back to the bare IR spelling.
+    writes: Vec<String>,
+    reads: Vec<String>,
+    raises: Vec<String>,
+    calls: Vec<String>,
+    guarded_writes: Vec<String>,
 }
 
 /// Reassemble the C++ machine-plane projection of a triple set into a
@@ -192,6 +200,35 @@ pub fn reassemble(triples: &[Triple]) -> ModelGraph {
                     };
                 }
             }
+            // Body arm. Own-member objects are `{class_iri}.{member}` — the
+            // owner comes from the `has_function` seed, never from splitting
+            // the method IRI (anchor-first attribution, same as everything
+            // else here). `raises` drops the `exc:` namespace `expand` added;
+            // `calls` is a verbatim `"receiver.method"` string on both sides.
+            "writes_field" | "reads_field" | "writes_if_blank" => {
+                if let Some(class_iri) = method_owner.get(&t.s)
+                    && let Some(acc) = method_acc.get_mut(&t.s)
+                {
+                    let prefix = format!("{class_iri}.");
+                    let member = t.o.strip_prefix(&prefix).unwrap_or(&t.o).to_string();
+                    match t.p.as_str() {
+                        "writes_field" => acc.writes.push(member),
+                        "reads_field" => acc.reads.push(member),
+                        _ => acc.guarded_writes.push(member),
+                    }
+                }
+            }
+            "raises" => {
+                if let Some(acc) = method_acc.get_mut(&t.s) {
+                    let exc = t.o.strip_prefix("exc:").unwrap_or(&t.o).to_string();
+                    acc.raises.push(exc);
+                }
+            }
+            "calls" => {
+                if let Some(acc) = method_acc.get_mut(&t.s) {
+                    acc.calls.push(t.o.clone());
+                }
+            }
             "has_field" => {
                 if let Some(model) = classes.get_mut(&t.s) {
                     let prefix = format!("{}.", t.s);
@@ -293,6 +330,11 @@ pub fn reassemble(triples: &[Triple]) -> ModelGraph {
             is_const: acc.is_const,
             is_static: acc.is_static,
             access: acc.access,
+            writes: acc.writes,
+            reads: acc.reads,
+            raises: acc.raises,
+            calls: acc.calls,
+            guarded_writes: acc.guarded_writes,
         });
     }
 
@@ -354,6 +396,21 @@ fn canonicalize_cpp(graph: &mut ModelGraph) {
         // must sort deterministically (non-const before const) on both the
         // reassembled and the projected side; without it the stable sort
         // preserves two different pre-sort orders and the pair compares unequal.
+        // The body arm is a set of facts on both sides (the harvester sorts +
+        // dedups; `expand` dedups `(s, p, o)`), so canonicalise each Vec
+        // before the method-level sort/dedup compares whole methods.
+        for method in &mut model.methods {
+            for arm in [
+                &mut method.writes,
+                &mut method.reads,
+                &mut method.raises,
+                &mut method.calls,
+                &mut method.guarded_writes,
+            ] {
+                arm.sort_unstable();
+                arm.dedup();
+            }
+        }
         model.methods.sort_by(|a, b| {
             (a.name.as_str(), &a.param_types, a.is_const).cmp(&(
                 b.name.as_str(),
@@ -431,6 +488,17 @@ mod tests {
             is_const: true,
             is_static: false,
             access: CppAccess::Public,
+            // Deliberately unsorted + duplicated: the projection must
+            // canonicalise the arm exactly as `expand`'s dedup does.
+            writes: vec![
+                "status_".to_string(),
+                "recognizer_".to_string(),
+                "status_".to_string(),
+            ],
+            reads: vec!["recognizer_".to_string()],
+            raises: vec!["BadStatus".to_string()],
+            calls: vec!["repo_.Save".to_string()],
+            guarded_writes: vec!["recognizer_".to_string()],
         });
         rec.methods.push(CppMethod {
             name: "Clear".to_string(),
@@ -445,6 +513,11 @@ mod tests {
             is_const: false,
             is_static: false,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
         });
         rec.methods.push(CppMethod {
             name: "kMaxRating".to_string(),
@@ -459,6 +532,11 @@ mod tests {
             is_const: false,
             is_static: true,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
         });
         rec.methods.push(CppMethod {
             name: "operator==".to_string(),
@@ -473,6 +551,11 @@ mod tests {
             is_const: false,
             is_static: false,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
         });
         rec.templates.push(CppTemplate {
             kind: CppTemplateKind::Specialisation,
@@ -506,6 +589,84 @@ mod tests {
         let g = cpp_fixture();
         let got = reassemble(&expand(&g));
         assert_eq!(got, projected(&g));
+    }
+
+    /// The body arm survives the round-trip on the per-overload node it was
+    /// harvested from: own members recover bare (the `{class}.` prefix
+    /// stripped), `raises` recovers bare (the `exc:` namespace stripped),
+    /// `calls` recovers verbatim, and a duplicated source fact collapses to
+    /// one — the same `(s, p, o)` dedup `expand` applies. The arm-less
+    /// overloads recover empty, so a body fact can never bleed across
+    /// overloads through the accumulator.
+    #[test]
+    fn body_arm_round_trips_on_its_own_overload() {
+        let g = cpp_fixture();
+        let got = reassemble(&expand(&g));
+        assert_eq!(got, projected(&g));
+
+        let rec = got
+            .models
+            .iter()
+            .find(|m| m.name == "Tesseract::Recognizer")
+            .unwrap();
+        let recognize = rec.methods.iter().find(|m| m.name == "Recognize").unwrap();
+        assert_eq!(recognize.writes, vec!["recognizer_", "status_"]);
+        assert_eq!(recognize.reads, vec!["recognizer_"]);
+        assert_eq!(recognize.raises, vec!["BadStatus"]);
+        assert_eq!(recognize.calls, vec!["repo_.Save"]);
+        assert_eq!(recognize.guarded_writes, vec!["recognizer_"]);
+        for other in rec.methods.iter().filter(|m| m.name != "Recognize") {
+            assert!(other.writes.is_empty(), "{} gained writes", other.name);
+            assert!(other.reads.is_empty(), "{} gained reads", other.name);
+            assert!(other.raises.is_empty(), "{} gained raises", other.name);
+            assert!(other.calls.is_empty(), "{} gained calls", other.name);
+            assert!(
+                other.guarded_writes.is_empty(),
+                "{} gained guarded_writes",
+                other.name
+            );
+        }
+    }
+
+    /// A const/non-const overload pair with DIFFERENT body arms must keep
+    /// each arm on its own node — the cv-qualified IRI is what makes the two
+    /// accumulators distinct, so this is the body-arm reading of
+    /// [`const_and_nonconst_overload_stay_distinct`].
+    #[test]
+    fn body_arms_do_not_merge_across_a_const_overload_pair() {
+        let mut g = ModelGraph::new("cpp");
+        let mut m = Model::new("GenericVector");
+        m.methods.push(CppMethod {
+            name: "at".to_string(),
+            return_type: Some("T &".to_string()),
+            param_types: vec!["int".to_string()],
+            is_const: false,
+            writes: vec!["data_".to_string()],
+            reads: vec!["data_".to_string()],
+            ..Default::default()
+        });
+        m.methods.push(CppMethod {
+            name: "at".to_string(),
+            return_type: Some("const T &".to_string()),
+            param_types: vec!["int".to_string()],
+            is_const: true,
+            reads: vec!["data_".to_string()],
+            ..Default::default()
+        });
+        g.models.push(m);
+
+        let got = reassemble(&expand(&g));
+        assert_eq!(got, projected(&g));
+        let methods = &got.models[0].methods;
+        assert_eq!(methods.len(), 2);
+        let non_const = methods.iter().find(|m| !m.is_const).unwrap();
+        let const_ = methods.iter().find(|m| m.is_const).unwrap();
+        assert_eq!(non_const.writes, vec!["data_"]);
+        assert!(
+            const_.writes.is_empty(),
+            "the const accessor gained a write"
+        );
+        assert_eq!(const_.reads, vec!["data_"]);
     }
 
     /// Two classes that declare an identically-named, identically-signatured

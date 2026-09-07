@@ -9,7 +9,67 @@
 //! methods alike. A frontend "adds the arm" purely by populating those
 //! `Vec`s from its own AST; this module runs unchanged on the result.
 
-use crate::ir::Function;
+use crate::ir::{CppMethod, Function};
+
+/// The body fact-set a centroid is computed from — the `(W, R, X, C)`
+/// fingerprint plus the J1 guard, borrowed from whichever IR struct carries
+/// it.
+///
+/// This trait is what makes the module's claim ("the identical ladder
+/// classifies Ruby hooks, Odoo `_compute_*` methods, C# handlers, and C++
+/// methods alike") true rather than aspirational: [`classify`] is written
+/// once against these five slices, and a frontend joins by populating them.
+/// Two IR structs implement it today — [`Function`] (the Ruby/Python/C#
+/// plane) and [`CppMethod`] (the C++ machine plane) — and they classify
+/// identically because the ladder never sees which one it was handed.
+pub trait BodyFacts {
+    /// Fields the body assigns.
+    fn writes(&self) -> &[String];
+    /// Fields the body reads.
+    fn reads(&self) -> &[String];
+    /// Exception/error type names the body raises.
+    fn raises(&self) -> &[String];
+    /// Lifecycle-mutator calls the body dispatches.
+    fn calls(&self) -> &[String];
+    /// The J1 subset of [`Self::writes`] guarded by an absence test.
+    fn guarded_writes(&self) -> &[String];
+}
+
+impl BodyFacts for Function {
+    fn writes(&self) -> &[String] {
+        &self.writes
+    }
+    fn reads(&self) -> &[String] {
+        &self.reads
+    }
+    fn raises(&self) -> &[String] {
+        &self.raises
+    }
+    fn calls(&self) -> &[String] {
+        &self.calls
+    }
+    fn guarded_writes(&self) -> &[String] {
+        &self.guarded_writes
+    }
+}
+
+impl BodyFacts for CppMethod {
+    fn writes(&self) -> &[String] {
+        &self.writes
+    }
+    fn reads(&self) -> &[String] {
+        &self.reads
+    }
+    fn raises(&self) -> &[String] {
+        &self.raises
+    }
+    fn calls(&self) -> &[String] {
+        &self.calls
+    }
+    fn guarded_writes(&self) -> &[String] {
+        &self.guarded_writes
+    }
+}
 
 /// The nearest declarative recipe a method body correlates to, or one of
 /// the two irreducible "essential" kinds that stay hand-ported.
@@ -55,11 +115,11 @@ pub enum RecipeCentroid {
 /// [`RecipeCentroid::Compute`] / [`RecipeCentroid::Normalize`] are checked,
 /// per the J1 finding recorded there.
 #[must_use]
-pub fn classify(f: &Function) -> RecipeCentroid {
-    let writes = !f.writes.is_empty();
-    let reads = !f.reads.is_empty();
-    let raises = !f.raises.is_empty();
-    let calls = !f.calls.is_empty();
+pub fn classify<F: BodyFacts + ?Sized>(f: &F) -> RecipeCentroid {
+    let writes = !f.writes().is_empty();
+    let reads = !f.reads().is_empty();
+    let raises = !f.raises().is_empty();
+    let calls = !f.calls().is_empty();
 
     if calls && raises {
         return RecipeCentroid::Compensate;
@@ -73,13 +133,13 @@ pub fn classify(f: &Function) -> RecipeCentroid {
     if writes && raises {
         return RecipeCentroid::WriteRaise;
     }
-    if writes && is_subset(&f.writes, &f.guarded_writes) {
+    if writes && is_subset(f.writes(), f.guarded_writes()) {
         return RecipeCentroid::Default;
     }
-    if writes && !is_subset(&f.writes, &f.reads) {
+    if writes && !is_subset(f.writes(), f.reads()) {
         return RecipeCentroid::Compute;
     }
-    if writes && is_subset(&f.writes, &f.reads) {
+    if writes && is_subset(f.writes(), f.reads()) {
         return RecipeCentroid::Normalize;
     }
     if !writes && !raises && !calls && reads {
@@ -242,5 +302,128 @@ mod tests {
         f.guarded_writes = vec!["Flag".to_string()];
         assert!(f.reads.is_empty());
         assert_eq!(classify(&f), RecipeCentroid::Default);
+    }
+
+    /// The trait's whole claim, measured: a C++ method and a Ruby/Python
+    /// function carrying the SAME facts land on the SAME centroid, across
+    /// every branch of the ladder. A frontend joins the classifier by
+    /// populating five `Vec`s — it does not get its own ladder.
+    ///
+    /// The fact-sets below are chosen to reach each centroid in turn, so a
+    /// ladder that agreed only on the common cases could not pass.
+    #[test]
+    fn a_cpp_method_and_a_function_with_the_same_facts_classify_alike() {
+        /// One row of the ladder: the five fact-sets, and the centroid they
+        /// must reach on either frontend's struct.
+        struct Case {
+            writes: &'static [&'static str],
+            reads: &'static [&'static str],
+            raises: &'static [&'static str],
+            calls: &'static [&'static str],
+            guarded: &'static [&'static str],
+            expected: RecipeCentroid,
+        }
+        let cases = [
+            Case {
+                writes: &["s"],
+                reads: &[],
+                raises: &["E"],
+                calls: &["r.save"],
+                guarded: &[],
+                expected: RecipeCentroid::Compensate,
+            },
+            Case {
+                writes: &[],
+                reads: &[],
+                raises: &[],
+                calls: &["r.save"],
+                guarded: &[],
+                expected: RecipeCentroid::Cascade,
+            },
+            Case {
+                writes: &[],
+                reads: &["s"],
+                raises: &["E"],
+                calls: &[],
+                guarded: &[],
+                expected: RecipeCentroid::Guard,
+            },
+            Case {
+                writes: &["s"],
+                reads: &[],
+                raises: &["E"],
+                calls: &[],
+                guarded: &[],
+                expected: RecipeCentroid::WriteRaise,
+            },
+            Case {
+                writes: &["s"],
+                reads: &[],
+                raises: &[],
+                calls: &[],
+                guarded: &["s"],
+                expected: RecipeCentroid::Default,
+            },
+            Case {
+                writes: &["s"],
+                reads: &[],
+                raises: &[],
+                calls: &[],
+                guarded: &[],
+                expected: RecipeCentroid::Compute,
+            },
+            Case {
+                writes: &["s"],
+                reads: &["s"],
+                raises: &[],
+                calls: &[],
+                guarded: &[],
+                expected: RecipeCentroid::Normalize,
+            },
+            Case {
+                writes: &[],
+                reads: &["s"],
+                raises: &[],
+                calls: &[],
+                guarded: &[],
+                expected: RecipeCentroid::Observe,
+            },
+            Case {
+                writes: &[],
+                reads: &[],
+                raises: &[],
+                calls: &[],
+                guarded: &[],
+                expected: RecipeCentroid::Empty,
+            },
+        ];
+        let own = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        for c in cases {
+            let function = Function {
+                name: "f".to_string(),
+                writes: own(c.writes),
+                reads: own(c.reads),
+                raises: own(c.raises),
+                calls: own(c.calls),
+                guarded_writes: own(c.guarded),
+                ..Function::default()
+            };
+            let method = CppMethod {
+                name: "f".to_string(),
+                writes: own(c.writes),
+                reads: own(c.reads),
+                raises: own(c.raises),
+                calls: own(c.calls),
+                guarded_writes: own(c.guarded),
+                ..CppMethod::default()
+            };
+            let want = c.expected;
+            assert_eq!(classify(&function), want, "Function should be {want:?}");
+            assert_eq!(
+                classify(&method),
+                classify(&function),
+                "C++ should match {want:?}"
+            );
+        }
     }
 }
