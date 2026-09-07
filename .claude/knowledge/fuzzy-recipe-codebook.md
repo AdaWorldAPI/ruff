@@ -52,7 +52,10 @@ on code:
 
 ## 2. The fingerprint — the DTO arm (this is what every frontend must emit)
 
-The fingerprint is FOUR fact sets per method, on `ruff_spo_triplet::Function`:
+The fingerprint is FOUR fact sets per method, on `ruff_spo_triplet::Function`
+(and, since 2026-09-07, on `ruff_spo_triplet::CppMethod` too — see the dated
+note beneath the coverage table below for why C++ needed its own copy of
+these fields rather than reusing `Function`'s):
 
 | field            | predicate emitted | provenance        | what it captures                                                                                                      |
 | ---------------- | ----------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------- |
@@ -71,6 +74,9 @@ landed.)
 
 > **This is the "DTO-arm shape" C++ / Python still need.** As of 2026-07-06
 > `ruff_ruby_spo` and `ruff_csharp_spo` emit the full quartet + helpers.
+> **[2026-09-07 correction: no longer true for C++ — the arm is now wired
+> end-to-end, see the row below and the dated note that follows the table.
+> Python is unaffected by this update and still needs it.]**
 > Coverage:
 >
 > | frontend          | writes | reads | raises | calls | helpers | verdict                                                                                                                       |
@@ -78,12 +84,24 @@ landed.)
 > | `ruff_ruby_spo`   |   ✅   |  ✅   |   ✅   |  ✅   |   ✅    | reference — cook here first                                                                                                   |
 > | `ruff_csharp_spo` |   ✅   |  ✅   |   ✅   |  ✅   |   ✅    | syntax-only (SemanticModel upgrade pending); helpers via `has_visibility`; tested end-to-end on a real production C# corpus (~97k triples) |
 > | `ruff_python_spo` |   ~    |  ✅   |   ✅   |   ~   |    ✗    | reads/raises only; **needs writes/calls/helpers**                                                                             |
-> | `ruff_cpp_spo`    |   ~    |   ~   |   ~    |   ~   |    ✗    | scaffolded; **needs the arm populated** (setters/virtuals)                                                                    |
+> | `ruff_cpp_spo`    |   ✅   |  ✅   |   ✅   |  ✅   |    ✗    | **(2026-09-07)** wired end-to-end (commit `f068a3f`): harvested from real bodies via libclang 18, same predicates/objects/tiers as `Function`, classified via the now-generic `recipe::classify`; unit- and hermetic-fixture-proven (16 guards, disable-verified) — a one-off corpus census exists (ladybug `src/catalog`, 2794 methods, 20.7% reaching a non-`Empty` centroid; see `.claude/plans/cpp-spo-probes-v1.md`) but **nothing re-runs it**, so C++ has a measurement and not yet a gate; J1 hit-rate is still open, because that corpus contains no lazy-init writes to hit (helpers column unchanged: this commit didn't touch it, and C++ doesn't split private methods into a separate pool the way Ruby does — see the dated note below) |
 >
 > The fingerprint predicates are already in the shared IR
 > (`ruff_spo_triplet::Function`) and `expand()` already emits them — a frontend
 > "adds the arm" purely by *populating* those Vecs from its AST. Zero IR change.
 > Do it per-frontend, then this codebook runs unchanged on that language.
+> **[2026-09-07 correction: "zero IR change" held for Ruby/Python/C# only
+> because those three frontends already route their methods through
+> `ruff_spo_triplet::Function` itself — there was nothing to add a field to
+> but the one struct all three share. `ruff_cpp_spo` does NOT share it: its
+> methods are a distinct IR struct, `CppMethod`, so wiring its arm required a
+> real (additive) IR change — the same five fields added a second time, by
+> name, on `CppMethod` (`ir.rs`) — plus a new `BodyFacts` trait so
+> `recipe::classify` could stay a single function generic over either struct
+> instead of forking into a `classify_function`/`classify_cpp_method` pair.
+> Read "populate the Vecs, zero IR change" as the fast path for a frontend
+> that already reuses `Function`; a frontend with its own method type pays a
+> one-time IR/trait-impl cost instead, then joins the same classifier.]**
 >
 > **`ruff_csharp_spo` also needed a configurability step the reference
 > frontend didn't**: Ruby's `AR_MUTATORS` is a closed, ORM-shaped set, but a
@@ -92,7 +110,27 @@ landed.)
 > `--mutator-prefixes`/`--mutator-receivers` generalise the mutator predicate
 > from "closed name set" to "name set OR prefix, optionally receiver-scoped"
 > — the same recipe centroids then classify EF Core (`SaveChanges`) and
-> bespoke ADO.NET (`main.mysql.add_x`) call sites identically.
+> bespoke ADO.NET (`main.mysql.add_x`) call sites identically. **`ruff_cpp_spo`
+> got the same generalization on 2026-09-07**: `BodyArmConfig::with_mutators`/
+> `with_mutator_prefixes` replace the shipped closed set (`Save`/`Update`/
+> `Commit`/…) for a corpus with its own persistence vocabulary — unit-tested,
+> not yet measured against a real non-STL-shaped C++ DAL.
+>
+> **On the `helpers` column for C++, specifically:** unlike Ruby (which keeps
+> routable actions and private hook targets in two separate `Model` slots,
+> `functions` vs `helpers`) or C# (one slot, `has_visibility` distinguishes),
+> `ruff_cpp_spo` has always kept EVERY method — public, protected, and
+> private alike — in the ONE `CppMethod`/`methods` collection, carrying its
+> own `access: CppAccess` field and already emitting a `has_visibility`
+> predicate before this commit. So the "a frontend without helpers loses
+> ~80% of its hooks to no-facts" failure mode this doc opens with may simply
+> not apply to C++ in the same shape — a private method's body facts were
+> never at risk of being dropped the way Ruby's private defs originally were.
+> This is an observation about the existing (pre-2026-09-07) shape of the
+> walker, not something this commit changed or measured; the ✗ is left as-is
+> above rather than reinterpreted, and a real corpus run (the next probe,
+> `.claude/plans/cpp-spo-probes-v1.md`) would be the way to confirm private
+> C++ methods actually resolve as hook targets in practice.
 
 ## 3. The recipe codebook — the centroids (pure fact-set predicates, GENERIC)
 
