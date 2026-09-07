@@ -4,8 +4,11 @@
 //! Walks a C++ corpus (Tesseract first; LLVM / Boost / `OpenCV` next) via
 //! libclang and produces a [`ModelGraph`] populated with the C++ machine-
 //! plane `Declaration` siblings the shared `ruff_spo_triplet` crate expands
-//! into the 13 C++ predicates (`inherits_from`, `template_specialises`,
-//! `virtually_overrides`, `is_pure_virtual`, …).
+//! into the C++ machine-plane predicates (`inherits_from`,
+//! `template_specialises`, `virtually_overrides`, `is_pure_virtual`, …).
+//! The exact set is whatever `expand::tests::cpp_emits_every_cpp_predicate`
+//! asserts — deliberately not restated here, because a count in prose goes
+//! stale the first time a predicate is minted and is then cited as evidence.
 //!
 //! # The harvester family
 //!
@@ -32,21 +35,26 @@
 //!   semantic transform, no re-parsing.
 //! - `walk_tu` (feature `libclang`) walks ONE translation unit via real
 //!   libclang and returns [`CppClass`] definitions (classes/bases/fields/
-//!   methods with their flags, system-header classes filtered out).
-//!   [`extract`] — the corpus-TREE orchestration over `walk_tu` — remains
-//!   `todo!()` (per-TU include resolution + cross-TU dedup). The target
-//!   triple shape is locked by `tests::locked_shape_expands_to_expected_triples`.
+//!   methods with their flags and body arm, system-header classes filtered
+//!   out). `extract_dir` / `extract_tree` walk a directory and a whole tree,
+//!   dedup classes by qualified name across translation units, and fold each
+//!   method's body arm in from whichever unit had the definition. [`extract`]
+//!   is still `todo!()`: what it adds over `extract_tree` is per-TU include
+//!   auto-detection, not the tree walk or the dedup. The target triple shape
+//!   is locked by `tests::locked_shape_expands_to_expected_triples`.
 //!
 //! # Iron rules this frontend respects
 //!
 //! - **`ruff_spo_triplet` stays serde-only.** The libclang dependency lives
-//!   here (behind a `libclang` feature, when wired), never in the shared
-//!   core.
+//!   here, behind the `libclang` feature, never in the shared core.
 //! - **No C++ source vendored into a `*-rs` target.** The corpus stays
 //!   upstream; `extract` walks it from a configurable path.
 //! - **Closed-vocab gate.** The C++ predicates are in
-//!   `ruff_spo_triplet::Predicate` under the `predicate_count_locked_at_47`
-//!   gate. A new C++ predicate is a deliberate ontology change there.
+//!   `ruff_spo_triplet::Predicate` under the `predicate_count_locked_at_79`
+//!   gate in `triple.rs` (the number moves with the vocabulary; the gate is
+//!   the test). A new C++ predicate is a deliberate ontology change there —
+//!   the method body arm added none, because it reuses the five predicates
+//!   the Ruby/Python `Function` body already emits.
 
 use std::path::Path;
 
