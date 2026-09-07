@@ -48,7 +48,7 @@ use std::collections::BTreeMap;
 
 use crate::ir::{
     ConstexprKind, CppAccess, CppBase, CppField, CppFriend, CppMacroUse, CppMethod,
-    CppStaticAssert, CppTemplate, CppTemplateKind, Model, ModelGraph,
+    CppRefQualifier, CppStaticAssert, CppTemplate, CppTemplateKind, Model, ModelGraph,
 };
 use crate::triple::Triple;
 
@@ -302,14 +302,30 @@ pub fn reassemble(triples: &[Triple]) -> ModelGraph {
             continue;
         };
         let param_types: Vec<String> = acc.params.into_values().collect();
+        // Read the ref-qualifier off the IRI's tail rather than from a
+        // triple: it is part of the identity `expand` encodes there, and
+        // minting a predicate for it would be an ontology change for a fact
+        // the IRI already carries unambiguously. That is also why it is not a
+        // `MethodAcc` field — nothing routes into it during the triple pass. Everything after the
+        // closing paren is `expand`'s own suffix, so ` &&` / ` &` there can
+        // only be the qualifier: a parameter type ending in `&` sits INSIDE
+        // the parens and leaves the IRI ending in `)`.
+        let ref_qualifier = if method_iri.ends_with(" &&") {
+            Some(CppRefQualifier::RValue)
+        } else if method_iri.ends_with(" &") {
+            Some(CppRefQualifier::LValue)
+        } else {
+            None
+        };
         // Reconstruct the exact suffix `expand` built — including the ` const`
         // cv-qualifier when the method is const — so the prefix/suffix strip
         // recovers the bare name. `is_const` was collected from the property
         // triple in pass 3, so it is available here at finalize.
         let suffix = format!(
-            "({}){}",
+            "({}){}{}",
             param_types.join(","),
-            if acc.is_const { " const" } else { "" }
+            if acc.is_const { " const" } else { "" },
+            ref_qualifier.map_or_else(String::new, |q| format!(" {}", q.spelling()))
         );
         let class_prefix = format!("{class_iri}.");
         let name = method_iri
@@ -335,6 +351,7 @@ pub fn reassemble(triples: &[Triple]) -> ModelGraph {
             raises: acc.raises,
             calls: acc.calls,
             guarded_writes: acc.guarded_writes,
+            ref_qualifier,
         });
     }
 
@@ -411,12 +428,22 @@ fn canonicalize_cpp(graph: &mut ModelGraph) {
                 arm.dedup();
             }
         }
+        // The sort key mirrors the method IRI's identity exactly — name,
+        // params, cv-qualifier, ref-qualifier — so an overload set orders
+        // deterministically on both the reassembled and the projected side.
         model.methods.sort_by(|a, b| {
-            (a.name.as_str(), &a.param_types, a.is_const).cmp(&(
-                b.name.as_str(),
-                &b.param_types,
-                b.is_const,
-            ))
+            (
+                a.name.as_str(),
+                &a.param_types,
+                a.is_const,
+                a.ref_qualifier.map(CppRefQualifier::spelling),
+            )
+                .cmp(&(
+                    b.name.as_str(),
+                    &b.param_types,
+                    b.is_const,
+                    b.ref_qualifier.map(CppRefQualifier::spelling),
+                ))
         });
         model.methods.dedup();
         model.templates.sort_by(|a, b| {
@@ -499,6 +526,7 @@ mod tests {
             raises: vec!["BadStatus".to_string()],
             calls: vec!["repo_.Save".to_string()],
             guarded_writes: vec!["recognizer_".to_string()],
+            ref_qualifier: None,
         });
         rec.methods.push(CppMethod {
             name: "Clear".to_string(),
@@ -518,6 +546,7 @@ mod tests {
             raises: Vec::new(),
             calls: Vec::new(),
             guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.methods.push(CppMethod {
             name: "kMaxRating".to_string(),
@@ -537,6 +566,7 @@ mod tests {
             raises: Vec::new(),
             calls: Vec::new(),
             guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.methods.push(CppMethod {
             name: "operator==".to_string(),
@@ -556,6 +586,7 @@ mod tests {
             raises: Vec::new(),
             calls: Vec::new(),
             guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.templates.push(CppTemplate {
             kind: CppTemplateKind::Specialisation,

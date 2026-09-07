@@ -63,9 +63,18 @@ fn collect_headers(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        // Ask the ENTRY for its type rather than the path: `Path::is_dir`
+        // follows symlinks, so a directory symlink pointing at an ancestor
+        // recurses forever and the harvest never finishes. Symlinks are
+        // skipped entirely — a header tree's translation units are real
+        // files. This is the same guard, for the same reason, that
+        // `ruff_cpp_spo::collect_cpp_files` already carries.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             collect_headers(&path, out)?;
-        } else if path.extension().is_some_and(|x| x == "h") {
+        } else if file_type.is_file() && path.extension().is_some_and(|x| x == "h") {
             out.push(path);
         }
     }

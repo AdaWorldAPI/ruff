@@ -52,7 +52,7 @@ on code:
 
 ## 2. The fingerprint — the DTO arm (this is what every frontend must emit)
 
-The fingerprint is FOUR fact sets per method, on `ruff_spo_triplet::Function`
+The fingerprint is FIVE fact sets per method, on `ruff_spo_triplet::Function`
 (and, since 2026-09-07, on `ruff_spo_triplet::CppMethod` too — see the dated
 note beneath the coverage table below for why C++ needed its own copy of
 these fields rather than reusing `Function`'s):
@@ -64,6 +64,13 @@ these fields rather than reusing `Function`'s):
 | `raises`         | `raises`          | Authoritative     | `raise X` / `errors.add` abort signals                                                                                |
 | `calls`          | `calls`           | Inferred          | mutator dispatches `"receiver.method"`                                                                                |
 | `guarded_writes` | `writes_if_blank` | **Authoritative** | writes guarded by a blank/nil test on the same field — the **J1** fact (§5), splits SelfMap into default vs normalize |
+
+The count above read FOUR until 2026-09-07, while the table under it listed
+five rows. That is not a cosmetic slip: `recipe::classify` tests
+`guarded_writes` BEFORE `Compute` and `Normalize`, so a frontend that read the
+sentence rather than the table and harvested only the quartet would classify
+every guarded default as a compute or a normalize. A frontend joins this
+codebook by populating five sets, not four.
 
 Plus the **visibility split**: hook targets are conventionally *private*, so a
 frontend that drops private defs cannot resolve most hooks. `ruff_ruby_spo`

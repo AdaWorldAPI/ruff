@@ -792,6 +792,41 @@ pub struct CppMethod {
     /// (Authoritative). Sorted, deduped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guarded_writes: Vec<String>,
+    /// `void f() &` / `void f() &&` — the ref-qualifier, part of the method's
+    /// identity rather than a property. `None` for the unqualified case. It
+    /// rides the method IRI's suffix alongside the cv-qualifier; see
+    /// [`CppRefQualifier`] for why leaving it out silently merges two
+    /// different functions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_qualifier: Option<CppRefQualifier>,
+}
+
+/// The ref-qualifier of a member function (`void f() &` / `void f() &&`).
+///
+/// Part of a method's IDENTITY, not merely a property: a class may declare
+/// both `f() &` and `f() &&` with the same name, parameter types and
+/// cv-qualifier, and they are different functions with different bodies.
+/// Without this in the method IRI the two collapse onto one node under the
+/// `(s, p, o)` dedup, and a body-arm merge then copies one overload's facts
+/// onto the other. `None` is the unqualified case, which is almost every
+/// method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CppRefQualifier {
+    /// `void f() &` — callable on an lvalue.
+    LValue,
+    /// `void f() &&` — callable on an rvalue.
+    RValue,
+}
+
+impl CppRefQualifier {
+    /// The C++ spelling, as it appears in a method IRI's suffix.
+    #[must_use]
+    pub fn spelling(self) -> &'static str {
+        match self {
+            Self::LValue => "&",
+            Self::RValue => "&&",
+        }
+    }
 }
 
 /// `constexpr` vs `consteval` compile-time markers.
@@ -937,6 +972,7 @@ mod dto_surface_tests {
         "param_types",
         "raises",
         "reads",
+        "ref_qualifier",
         "requires_clause",
         "return_type",
         "writes",
@@ -1010,6 +1046,7 @@ mod dto_surface_tests {
             raises: vec!["E".into()],
             calls: vec!["repo_.Save".into()],
             guarded_writes: vec!["w_".into()],
+            ref_qualifier: Some(CppRefQualifier::LValue),
         }
     }
 
