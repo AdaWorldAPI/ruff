@@ -136,3 +136,43 @@ the compiler.
 
 Full write-up, ladder and falsifier verdicts live with the experiment, not in
 this repo; what belongs here is the defect and its size.
+
+## 7. Re-measured on the whole corpus — 1,081 TUs, 2026-09-07
+
+§6 was the 227-TU sample. The full harvest supersedes its figures: **14,106
+methods, 646,411 ordered events, 36,224 symbols.**
+
+The defect gets WORSE with scale, because call sites dominate and the
+configured-mutator rule keeps almost none of them:
+
+| | 227 TUs | 1,081 TUs |
+|---|---|---|
+| ordered events | 95,365 | 646,411 |
+| facts the set arm keeps | 2,574 | 12,062 |
+| call sites (kept) | 22,748 (171) | 109,603 (745) |
+| adjacency pairs destroyed | 93,148 | 632,305 |
+| **retained** | 2.7% | **1.9%** |
+
+The bits cost, same common denominator:
+
+| representation | 227 TUs | 1,081 TUs |
+|---|---|---|
+| shipped sets | 4.0987 | 4.2684 |
+| ordered ore | 2.7455 | 2.7181 |
+| + BPE (256 merges) | 2.6411 | 2.4721 |
+
+The two-halves decomposition holds at 6.8× the data — order +0.8254, alphabet
++0.6651, together +1.5503 — so neither alone explains the gap, and the upstream
+fix remains several times the tokenizer's contribution.
+
+**Provenance, re-checked:** 54.1% of events are libclang-answered overall, and
+`ScopeEnter` / `ScopeExit` / `Branch` / `Condition` / `Return` / `Cast` are still
+exactly **0%**. The recurring structure is contributed by the ordered walk.
+
+**One measurement the sample got wrong.** At 227 TUs the ordered ore's
+override-pair retrieval looked like a tie among representations, because only 5
+of 291 declared override targets had both sides present. At 1,081 TUs there are
+**446** usable pairs, and the shipped set arm retrieves **0 of 446** while the
+ordered ore retrieves 26 — a 5.3σ separation. A representation that cannot find
+a method's override partner even once is the sharpest single statement of what
+sort+dedup costs.
