@@ -735,7 +735,7 @@ fn enclosing_scopes(e: &Entity) -> Vec<String> {
 }
 
 /// The fully-qualified name of a class-like cursor (`Namespace::Outer::Name`).
-fn qualified_name(e: &Entity) -> String {
+pub(crate) fn qualified_name(e: &Entity) -> String {
     let mut parts = enclosing_scopes(e);
     if let Some(n) = e.get_name() {
         parts.push(n);
@@ -1203,7 +1203,7 @@ fn record_write(arm: &mut BodyArm, lhs: &Entity, guard: Option<&str>) {
 /// (`arr_[i] = v` and `*ptr_ = v` both write the member). `None` when the
 /// target is anything else — a local, a parameter, or another object's member.
 #[cfg(feature = "libclang")]
-fn assignment_target(lhs: &Entity) -> Option<String> {
+pub(crate) fn assignment_target(lhs: &Entity) -> Option<String> {
     let mut cur = *lhs;
     // Bounded: each step descends one AST level, and the depth of an lvalue
     // expression is finite. The cap only guards against a cyclic cursor graph.
@@ -1228,7 +1228,7 @@ fn assignment_target(lhs: &Entity) -> Option<String> {
 /// [`EntityKind::ThisExpr`]; any other base (`p.x_`, `repo_.Save`) means the
 /// reference belongs to something else.
 #[cfg(feature = "libclang")]
-fn own_member_name(e: &Entity) -> Option<String> {
+pub(crate) fn own_member_name(e: &Entity) -> Option<String> {
     if e.get_kind() != EntityKind::MemberRefExpr {
         return None;
     }
@@ -1243,7 +1243,7 @@ fn own_member_name(e: &Entity) -> Option<String> {
 /// libclang exposes no binary-operator kind, so the operator is the first
 /// punctuation token that starts at or after the end of the left operand.
 #[cfg(feature = "libclang")]
-fn binary_operator_spelling(node: &Entity) -> Option<String> {
+pub(crate) fn binary_operator_spelling(node: &Entity) -> Option<String> {
     let lhs_end = node
         .get_children()
         .first()?
@@ -1263,7 +1263,7 @@ fn binary_operator_spelling(node: &Entity) -> Option<String> {
 
 /// Is this unary operator an increment or decrement (prefix or postfix)?
 #[cfg(feature = "libclang")]
-fn unary_operator_is_inc_dec(node: &Entity) -> bool {
+pub(crate) fn unary_operator_is_inc_dec(node: &Entity) -> bool {
     let Some(range) = node.get_range() else {
         return false;
     };
@@ -1336,7 +1336,7 @@ fn collect_own_members(node: &Entity, out: &mut Vec<String>) {
 /// wrapper cursors, so recurse for the first node yielding a concrete,
 /// non-void type name.
 #[cfg(feature = "libclang")]
-fn thrown_type_name(throw: &Entity) -> Option<String> {
+pub(crate) fn thrown_type_name(throw: &Entity) -> Option<String> {
     fn first_typed(e: &Entity) -> Option<String> {
         if let Some(t) = e.get_type() {
             let name = bare_type_name(&t.get_display_name());
@@ -1352,7 +1352,7 @@ fn thrown_type_name(throw: &Entity) -> Option<String> {
 /// The receiver of a method call (`repo_` in `repo_.Save()`), or `None` for an
 /// implicit-`this` call — the callee reference's own base.
 #[cfg(feature = "libclang")]
-fn call_receiver(call: &Entity) -> Option<String> {
+pub(crate) fn call_receiver(call: &Entity) -> Option<String> {
     let name = call.get_name()?;
     let callee = call.get_children().into_iter().find(|c| {
         c.get_kind() == EntityKind::MemberRefExpr && c.get_name() == Some(name.clone())
@@ -1372,7 +1372,7 @@ fn call_receiver(call: &Entity) -> Option<String> {
 
 /// `List<Foo>` / `foo::Bar` → a stable bare type name for the `raises` object.
 #[cfg(feature = "libclang")]
-fn bare_type_name(display: &str) -> String {
+pub(crate) fn bare_type_name(display: &str) -> String {
     let s = display
         .trim_start_matches("class ")
         .trim_start_matches("struct ");

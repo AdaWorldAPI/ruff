@@ -65,6 +65,12 @@ use ruff_spo_triplet::{
 
 #[cfg(feature = "libclang")]
 mod clang_walker;
+// The ordered behavioral ore — a SECOND walk that preserves the sequence,
+// duplicates and scope structure the five-set body arm collapses. Additive:
+// nothing in `clang_walker`'s output changes. See `events`'s module doc and
+// `.claude/plans/behavioral-ore-v1.md`.
+#[cfg(feature = "libclang")]
+pub mod events;
 #[cfg(feature = "libclang")]
 pub use clang_walker::{
     BodyArmConfig, MAPPED_CURSOR_KINDS, ParseDiagnostic, WalkError, class_body_cursor_histogram,
