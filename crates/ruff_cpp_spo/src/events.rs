@@ -45,10 +45,12 @@
 //!
 //! There is **no CFG** in libclang's C API. `control` therefore carries only
 //! structurally-certain relations (which construct a condition belongs to,
-//! which arm a branch is, and a loop's back edge). Successor/predecessor
-//! edges are not available and are never fabricated. Every event also carries
-//! its source byte `anchor`, so lexical order stays checkable against
-//! traversal order rather than being silently conflated with it.
+//! which arm a branch is, a loop's back edge, and — for `for` headers whose
+//! own tokens spell exactly two semicolons — which of init/cond/inc a header
+//! child belongs to). Successor/predecessor edges are not available and are
+//! never fabricated. Every event also carries its source byte `anchor`, so
+//! lexical order stays checkable against traversal order rather than being
+//! silently conflated with it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -390,6 +392,49 @@ impl<'s> Walk<'s> {
             .unwrap_or(0)
     }
 
+    /// A `for` statement's own tokens, walked with a paren-depth counter
+    /// starting at 0 — the first `(` (the header's own opening paren, since
+    /// the entity's range starts at the `for` keyword) takes depth to 1 — to
+    /// find the byte offsets of the two `;` tokens that separate
+    /// init/cond/inc. Only `Punctuation`-kind tokens are inspected, so a `;`
+    /// lexed inside a string or character literal (always one token, never
+    /// split) can never be mistaken for a header separator, and a nested
+    /// call's own parens in `cond` or `inc` (`pred(i)`) never confuse the
+    /// depth count — the walk stops at the `)` that returns depth to 0,
+    /// before the body's own tokens are ever read.
+    ///
+    /// `Some((s1, s2))` only when EXACTLY two such semicolons are found: a
+    /// `for(init; cond; inc)` header, whichever parts are elided. Anything
+    /// else (a macro-spelled header, a tokenize failure) yields `None` —
+    /// callers must never guess a slot from a partial count.
+    fn for_header_semicolons(e: &Entity<'_>) -> Option<(u32, u32)> {
+        let tokens = e.get_range()?.tokenize();
+        let mut depth = 0i32;
+        let mut semis = Vec::new();
+        for t in &tokens {
+            if t.get_kind() != clang::token::TokenKind::Punctuation {
+                continue;
+            }
+            match t.get_spelling().as_str() {
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                ";" if depth == 1 => {
+                    semis.push(t.get_location().get_file_location().offset);
+                }
+                _ => {}
+            }
+        }
+        match semis[..] {
+            [s1, s2] => Some((s1, s2)),
+            _ => None,
+        }
+    }
+
     fn push(&mut self, kind: EventKind, e: &Entity<'_>) -> usize {
         let seq = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
         self.events.push(OreEvent {
@@ -505,6 +550,17 @@ impl<'s> Walk<'s> {
                     _ => (ScopeKind::RangeFor, "rangefor"),
                 };
                 let is_do = sk == ScopeKind::Do;
+                // For `for` ONLY, the header's parts ARE now individually
+                // distinguished — via real tokens, not a guess. See
+                // `for_header_semicolons`: `Some((s1, s2))` gives the two
+                // semicolon offsets a `for(init; cond; inc)` header spells;
+                // `None` (a macro-spelled header, or tokenize failure) tags
+                // nothing, leaving this arm's behaviour byte-identical.
+                // `while` / `do` / range-`for` headers are UNCHANGED — their
+                // parts stay undistinguished exactly as before.
+                let for_slots = (sk == ScopeKind::For)
+                    .then(|| Self::for_header_semicolons(e))
+                    .flatten();
                 self.scoped(sk, e, |w| {
                     // libclang labels no sub-part of a loop header, and a
                     // `for(;;)` simply has fewer children — so for `for` /
@@ -514,9 +570,15 @@ impl<'s> Walk<'s> {
                     // FIRST and its condition is evaluated after the body, so
                     // treating the last child as the body would walk the
                     // condition as a statement and open a spurious Block
-                    // around the real one. The header's parts are not
-                    // individually distinguished; `anchor` keeps their
-                    // source positions.
+                    // around the real one. `anchor` keeps every head child's
+                    // source position regardless of loop shape; for `for`
+                    // specifically, `for_slots` (computed above, once) places
+                    // each head child in `for_init` / `for_cond` / `for_inc`
+                    // by comparing that anchor against the header's real
+                    // semicolon offsets — additive: it only ever fills an
+                    // event's `control` when that event's `control` is still
+                    // `None`, so a nested scope marker, branch tag, or
+                    // `back_edge` an inner walk already stamped is untouched.
                     let ch = e.get_children();
                     if is_do {
                         if let Some((body, rest)) = ch.split_first() {
@@ -530,7 +592,22 @@ impl<'s> Walk<'s> {
                     } else {
                         let (head, body) = ch.split_at(ch.len().saturating_sub(1));
                         for c in head {
+                            let before = w.events.len();
                             w.node(c);
+                            if let Some((s1, s2)) = for_slots {
+                                let slot = if Self::anchor(c) < s1 {
+                                    "for_init"
+                                } else if Self::anchor(c) < s2 {
+                                    "for_cond"
+                                } else {
+                                    "for_inc"
+                                };
+                                for ev in &mut w.events[before..] {
+                                    if ev.control.is_none() {
+                                        ev.control = Some(slot.to_string());
+                                    }
+                                }
+                            }
                         }
                         let i = w.push(EventKind::Condition, e);
                         w.events[i].control = Some(tag.to_string());
@@ -1528,5 +1605,281 @@ void C::f(B* p) { p->v(); p->nv(); }",
             calls.contains(&("member", Prov::Clang)),
             "and the non-virtual one distinguished: {calls:?}"
         );
+    }
+
+    /// Fixture for the `for` header's slot tags. One class, ten methods —
+    /// every header shape the semicolon rule must handle, plus the two loop
+    /// kinds (`while`, range-`for`) it must never touch.
+    const FOR_SLOTS: &str = r#"
+struct S {
+  int n_; int acc_; int arr_[8];
+  void full()   { for (int i = 0; i < n_; ++i) { acc_ += arr_[i]; } }
+  void bare()   { for (;;) { if (acc_ > n_) break; acc_++; } }
+  void no_cond(){ for (int i = 0;; ++i) { if (i > n_) break; acc_ += i; } }
+  void no_inc() { for (int i = 0; i < n_;) { acc_ += i; i += 2; } }
+  void comma()  { for (int i = 0, j = n_; i < j; ++i, --j) { acc_ += arr_[i]; } }
+  bool pred(int x) const { return x < n_; }
+  void call_cond() { for (int i = 0; pred(i); ++i) { acc_ += i; } }
+  void str_semi() { const char* s = "a;b"; for (int i = 0; s[i] != ';'; ++i) { acc_++; } }
+  void wloop()  { int i = 0; while (i < n_) { acc_ += i; ++i; } }
+  void rloop()  { for (int v : arr_) { acc_ += v; } }
+};"#;
+
+    /// The `subj`'s interned name, resolved through `syms` — the same
+    /// join every other test here does by hand.
+    fn subj_name<'a>(syms: &'a Symbols, e: &OreEvent) -> Option<&'a str> {
+        e.subj
+            .as_deref()
+            .and_then(|id| syms.rows().find(|r| r.0 == id))
+            .map(|r| r.3)
+    }
+
+    /// `full`: a complete `for(init; cond; inc)` header. Every part is
+    /// present, so this is the one fixture where all three slots — and the
+    /// synthetic `Condition` marker's position relative to them — can be
+    /// checked at once.
+    #[test]
+    fn for_full_header_slots_are_tagged_from_real_tokens() {
+        let (ms, syms) = ore("for_full", FOR_SLOTS);
+        let m = find(&ms, "S.full()");
+
+        // init: the Decl for `i`, and nothing else.
+        let init: Vec<&OreEvent> = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_init"))
+            .collect();
+        assert_eq!(init.len(), 1, "exactly the Decl for i: {init:?}");
+        assert_eq!(init[0].kind, EventKind::Decl);
+        assert_eq!(subj_name(&syms, init[0]), Some("i"));
+
+        // cond: the Reads of `i` and `n_` in `i < n_`.
+        let cond: Vec<&OreEvent> = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_cond"))
+            .collect();
+        for e in &cond {
+            assert_eq!(e.kind, EventKind::Read, "cond here is two plain reads");
+        }
+        let mut cond_names: Vec<Option<&str>> = cond.iter().map(|e| subj_name(&syms, e)).collect();
+        cond_names.sort_unstable();
+        assert_eq!(
+            cond_names,
+            vec![Some("i"), Some("n_")],
+            "both i and n_ read in the condition"
+        );
+
+        // inc: the ReadWrite of `i` in `++i`, and nothing else.
+        let inc: Vec<&OreEvent> = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_inc"))
+            .collect();
+        assert_eq!(inc.len(), 1, "exactly the ReadWrite for ++i: {inc:?}");
+        assert_eq!(inc[0].kind, EventKind::ReadWrite);
+        assert_eq!(subj_name(&syms, inc[0]), Some("i"));
+
+        // The synthetic Condition marker keeps control=Some("for") — the
+        // slot tagging never touches an event that already carries a
+        // control value — and sits after every inc event and before the
+        // body's first event, checked by seq.
+        let cond_marker = m
+            .events
+            .iter()
+            .find(|e| e.kind == EventKind::Condition && e.control.as_deref() == Some("for"))
+            .expect("the for's own Condition marker");
+        assert!(
+            inc.iter().all(|e| e.seq < cond_marker.seq),
+            "condition marker must come after every inc event"
+        );
+        // `{ acc_ += arr_[i]; }` is walked THROUGH (braces open no separate
+        // scope, same as everywhere else in this walker), so the body's
+        // events share the For scope's own id — the position check is by
+        // seq, not by a nested scope.
+        let body: Vec<&OreEvent> = m
+            .events
+            .iter()
+            .filter(|e| e.seq > cond_marker.seq)
+            .collect();
+        assert!(!body.is_empty(), "the body has events to check");
+        assert!(
+            body.iter().all(|e| e.seq > cond_marker.seq),
+            "condition marker must come before the body's first event"
+        );
+        for e in &body {
+            assert!(
+                !matches!(
+                    e.control.as_deref(),
+                    Some("for_init" | "for_cond" | "for_inc")
+                ),
+                "a body event must never carry a for-header slot tag: {e:?}"
+            );
+        }
+
+        // Anti-vacuity: a version that tags nothing must fail loudly, not
+        // pass on an empty set. Measured on this fixture: 1 init + 2 cond +
+        // 1 inc = 4 tagged events (never zero).
+        let tagged = init.len() + cond.len() + inc.len();
+        assert!(
+            tagged >= 4,
+            "expected at least 4 slot-tagged events in full(), got {tagged}"
+        );
+    }
+
+    /// `bare`: `for(;;)` has zero head children — nothing before the body —
+    /// so the semicolon rule finding exactly two semicolons must still tag
+    /// nothing, because there is nothing to tag.
+    #[test]
+    fn for_bare_has_no_head_children_and_gets_no_slot_tags() {
+        let (ms, _) = ore("for_bare", FOR_SLOTS);
+        let m = find(&ms, "S.bare()");
+        let tagged = m
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.control.as_deref(),
+                    Some("for_init" | "for_cond" | "for_inc")
+                )
+            })
+            .count();
+        assert_eq!(tagged, 0, "for(;;) has no head children to tag");
+    }
+
+    /// `no_cond`: `for(init;; inc)` — the cond part is elided, so its slot
+    /// must never appear, while init and inc still get real events.
+    #[test]
+    fn for_no_cond_tags_init_and_inc_but_never_cond() {
+        let (ms, _) = ore("for_no_cond", FOR_SLOTS);
+        let m = find(&ms, "S.no_cond()");
+        let count = |tag: &str| {
+            m.events
+                .iter()
+                .filter(|e| e.control.as_deref() == Some(tag))
+                .count()
+        };
+        assert_eq!(count("for_init"), 1, "the Decl for i");
+        assert_eq!(count("for_inc"), 1, "the ReadWrite for ++i");
+        assert_eq!(count("for_cond"), 0, "no cond child exists to tag");
+    }
+
+    /// `no_inc`: `for(init; cond;)` — the inc part is elided.
+    #[test]
+    fn for_no_inc_tags_init_and_cond_but_never_inc() {
+        let (ms, _) = ore("for_no_inc", FOR_SLOTS);
+        let m = find(&ms, "S.no_inc()");
+        let count = |tag: &str| {
+            m.events
+                .iter()
+                .filter(|e| e.control.as_deref() == Some(tag))
+                .count()
+        };
+        assert_eq!(count("for_init"), 1, "the Decl for i");
+        assert_eq!(count("for_cond"), 2, "the Reads of i and n_");
+        assert_eq!(count("for_inc"), 0, "no inc child exists to tag");
+    }
+
+    /// `comma`: a multi-declarator init and a comma-operator inc. Both
+    /// declarators, and both comma operands, must carry the same slot — one
+    /// head child can still hold more than one event.
+    #[test]
+    fn for_comma_tags_every_declarator_and_every_comma_operand() {
+        let (ms, syms) = ore("for_comma", FOR_SLOTS);
+        let m = find(&ms, "S.comma()");
+        let init_decls: Vec<Option<&str>> = m
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::Decl && e.control.as_deref() == Some("for_init"))
+            .map(|e| subj_name(&syms, e))
+            .collect();
+        assert!(
+            init_decls.contains(&Some("i")) && init_decls.contains(&Some("j")),
+            "both declarators tagged for_init: {init_decls:?}"
+        );
+        let inc_names: Vec<Option<&str>> = m
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::ReadWrite && e.control.as_deref() == Some("for_inc"))
+            .map(|e| subj_name(&syms, e))
+            .collect();
+        assert_eq!(inc_names.len(), 2, "both ++i and --j: {inc_names:?}");
+        assert!(inc_names.contains(&Some("i")) && inc_names.contains(&Some("j")));
+    }
+
+    /// `call_cond`: the condition is a call, `pred(i)` — the call's OWN
+    /// parens must not be mistaken for the header's closing paren, nor its
+    /// argument's semicolon-free contents confuse anything.
+    #[test]
+    fn for_call_cond_tags_the_call_and_survives_nested_parens() {
+        let (ms, _) = ore("for_call_cond", FOR_SLOTS);
+        let m = find(&ms, "S.call_cond()");
+        let call = m
+            .events
+            .iter()
+            .find(|e| e.kind == EventKind::Call)
+            .expect("the call to pred");
+        assert_eq!(
+            call.control.as_deref(),
+            Some("for_cond"),
+            "the call itself is the condition"
+        );
+        let inc = m
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::ReadWrite && e.control.as_deref() == Some("for_inc"))
+            .count();
+        assert_eq!(
+            inc, 1,
+            "++i is still recovered as for_inc despite pred(i)'s own parens"
+        );
+    }
+
+    /// `str_semi`: the condition contains a character literal, `';'`, whose
+    /// spelling contains a semicolon byte. A single non-punctuation token
+    /// must never be counted as a header separator.
+    #[test]
+    fn for_str_semi_ignores_the_semicolon_inside_the_char_literal() {
+        let (ms, _) = ore("for_str_semi", FOR_SLOTS);
+        let m = find(&ms, "S.str_semi()");
+        let cond = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_cond"))
+            .count();
+        assert_eq!(
+            cond, 2,
+            "the Reads of s and i in `s[i] != ';'`: exactly two real semicolons found"
+        );
+        let init = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_init"))
+            .count();
+        assert_eq!(
+            init, 1,
+            "init still tagged despite the earlier string-literal statement"
+        );
+    }
+
+    /// `wloop` / `rloop`: the rule is `for` only. Neither a `while` nor a
+    /// range-`for` header may ever receive a slot tag.
+    #[test]
+    fn while_and_range_for_headers_never_get_slot_tags() {
+        let (ms, _) = ore("for_wloop_rloop", FOR_SLOTS);
+        for name in ["S.wloop()", "S.rloop()"] {
+            let m = find(&ms, name);
+            let tagged = m
+                .events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.control.as_deref(),
+                        Some("for_init" | "for_cond" | "for_inc")
+                    )
+                })
+                .count();
+            assert_eq!(tagged, 0, "{name} must never receive a for-slot tag");
+        }
     }
 }
