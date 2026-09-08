@@ -406,14 +406,22 @@ impl<'s> Walk<'s> {
     /// call's own parens in `cond` or `inc` (`pred(i)`) never confuse the
     /// paren count — the walk stops at the `)` that returns it to 0.
     ///
-    /// Every separator must be spelled INSIDE this statement's expansion
-    /// range — strictly between the `for` keyword's file offset and the
-    /// body's. A loop emitted whole by a function-like macro
-    /// (`#define LOOP(I, C, N) for (I; C; N)`) tokenizes as the macro
-    /// DEFINITION's tokens, whose `;` offsets sit before every
-    /// expansion-site anchor: comparing those against the head children
-    /// would file all of them under `for_inc`, so such a header is rejected
-    /// outright rather than mis-tagged.
+    /// Both endpoints are materialised as FILE locations in the `for`
+    /// keyword's own file (`File::get_offset_location`), never reused as the
+    /// raw cursor locations. A body that is itself a macro invocation
+    /// (`for (...) LOG(ERROR) << x;`) carries a macro-expansion location, and
+    /// a range that ends in one is degenerate: libclang tokenizes it to a
+    /// single token, so every slot tag on an otherwise ordinary header is
+    /// silently dropped. That false negative untagged 32 real loops across
+    /// re2 and miniz before it was measured.
+    ///
+    /// Materialising the range is also what rejects a loop emitted whole by a
+    /// function-like macro (`#define LOOP(I, C, N) for (I; C; N)`): the range
+    /// then spans the CALL SITE (`LOOP(int i = 0, i < n_, ++i)`), whose tokens
+    /// carry no `;` at header depth at all, so the count is not two and the
+    /// header is rejected outright rather than tagged wrongly. Reading each
+    /// separator's own file location instead would read the macro
+    /// DEFINITION's offsets and file all three slots under `for_inc`.
     ///
     /// `Some((s1, s2))` only when EXACTLY two such semicolons are found: a
     /// `for(init; cond; inc)` header, whichever parts are elided. Anything
@@ -422,10 +430,21 @@ impl<'s> Walk<'s> {
     fn for_header_semicolons(e: &Entity<'_>) -> Option<(u32, u32)> {
         let range = e.get_range()?;
         let body = e.get_children().into_iter().last()?;
-        let header =
-            clang::source::SourceRange::new(range.get_start(), body.get_range()?.get_start());
-        // Expansion-site bounds every separator must fall strictly inside.
-        let (lo, hi) = (Self::anchor(e), Self::anchor(&body));
+        let head = range.get_start().get_file_location();
+        let tail = body.get_range()?.get_start().get_file_location();
+        let file = head.file?;
+        // Well-formedness of the range handed to libclang, not a behavioural
+        // guard: no fixture reaches it, because a header that would violate it
+        // (both `for` and body emitted by one macro, so the two cursor extents
+        // normalise to the same expansion offset) already fails the
+        // exactly-two-semicolons rule below.
+        if tail.file != Some(file) || tail.offset <= head.offset {
+            return None;
+        }
+        let header = clang::source::SourceRange::new(
+            file.get_offset_location(head.offset),
+            file.get_offset_location(tail.offset),
+        );
         let mut paren = 0i32;
         let mut brace = 0i32;
         let mut semis = Vec::new();
@@ -444,11 +463,7 @@ impl<'s> Walk<'s> {
                 "{" => brace += 1,
                 "}" => brace -= 1,
                 ";" if paren == 1 && brace == 0 => {
-                    let off = t.get_location().get_file_location().offset;
-                    if off <= lo || off >= hi {
-                        return None;
-                    }
-                    semis.push(off);
+                    semis.push(t.get_location().get_file_location().offset);
                 }
                 _ => {}
             }
@@ -1915,10 +1930,14 @@ struct S {
     /// not a header separator.
     const FOR_SLOTS_EDGES: &str = r#"
 #define LOOP(I, C, N) for (I; C; N)
+#define EMIT(X) do { acc_ += (X); } while (0)
+#define WHOLE for (int i = 0; i < n_; ++i) { acc_ += arr_[i]; }
 struct M {
   int n_; int acc_; int arr_[8];
   void macro_loop() { LOOP(int i = 0, i < n_, ++i) { acc_ += arr_[i]; } }
   void lambda_init() { for (auto f = [] { return 1; }; f() < n_; ++acc_) { acc_ += n_; } }
+  void macro_body() { for (int i = 0; i < n_; ++i) EMIT(arr_[i]); }
+  void macro_whole() { WHOLE }
 };"#;
 
     /// `macro_loop`: the header is spelled inside a macro definition; its
@@ -1938,6 +1957,61 @@ struct M {
             tagged.is_empty(),
             "a macro-emitted header must stay untagged, got {tagged:?}"
         );
+    }
+
+    /// `macro_whole`: header AND body emitted by one object-like macro, the
+    /// shape `LOOP` does not cover (there the body is written at the call
+    /// site). Both cursor extents normalise to the same expansion offset, so
+    /// the materialised range is empty and no separator is ever seen.
+    #[test]
+    fn for_emitted_whole_with_its_body_gets_no_slot_tags() {
+        let (ms, _) = ore("for_macro_whole", FOR_SLOTS_EDGES);
+        let m = find(&ms, "M.macro_whole()");
+        let tagged: Vec<&str> = m
+            .events
+            .iter()
+            .filter_map(|e| e.control.as_deref())
+            .filter(|c| matches!(*c, "for_init" | "for_cond" | "for_inc"))
+            .collect();
+        assert!(
+            tagged.is_empty(),
+            "a wholly macro-emitted loop must stay untagged, got {tagged:?}"
+        );
+        assert!(
+            m.events.iter().any(|e| e.kind == EventKind::ScopeEnter),
+            "the loop itself is still walked, so the pin is not vacuous"
+        );
+    }
+
+    /// `macro_body`: the header is spelled in ordinary source but the BODY is
+    /// a macro invocation. libclang resolves that body's file location into
+    /// the macro DEFINITION, so bounding the header by it rejects a perfectly
+    /// good header — the false negative that dropped every slot tag from
+    /// `for (...) LOG(ERROR) << ...;` in re2 and `for (...) TDEFL_PUT_BITS(...);`
+    /// in miniz. The header's own tokens decide; the body never does.
+    #[test]
+    fn for_with_a_macro_body_still_tags_all_three_slots() {
+        let (ms, syms) = ore("for_macro_body", FOR_SLOTS_EDGES);
+        let m = find(&ms, "M.macro_body()");
+        let init: Vec<&OreEvent> = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_init") && e.kind == EventKind::Decl)
+            .collect();
+        assert_eq!(init.len(), 1, "the Decl for i: {init:?}");
+        assert_eq!(subj_name(&syms, init[0]), Some("i"));
+        let cond = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_cond"))
+            .count();
+        assert!(cond >= 2, "the Reads of i and n_ in `i < n_`, got {cond}");
+        let inc = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_inc"))
+            .count();
+        assert!(inc >= 1, "the ReadWrite of i in `++i`, got {inc}");
     }
 
     /// `lambda_init`: the braced lambda body's `;` must not count as a header
