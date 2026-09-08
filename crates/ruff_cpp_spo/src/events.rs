@@ -392,39 +392,63 @@ impl<'s> Walk<'s> {
             .unwrap_or(0)
     }
 
-    /// A `for` statement's own tokens, walked with a paren-depth counter
-    /// starting at 0 — the first `(` (the header's own opening paren, since
-    /// the entity's range starts at the `for` keyword) takes depth to 1 — to
-    /// find the byte offsets of the two `;` tokens that separate
+    /// A `for` statement's HEADER tokens — the range from the `for` keyword
+    /// to the body's first token, never the body itself (tokenizing the whole
+    /// `ForStmt` extent re-lexes every nested loop's body once per ancestor,
+    /// quadratic in nesting depth) — walked with a paren-depth counter
+    /// starting at 0 (the header's own `(` takes it to 1) and a brace-depth
+    /// counter, to find the byte offsets of the two `;` tokens that separate
     /// init/cond/inc. Only `Punctuation`-kind tokens are inspected, so a `;`
     /// lexed inside a string or character literal (always one token, never
-    /// split) can never be mistaken for a header separator, and a nested
+    /// split) can never be mistaken for a header separator; a `;` inside a
+    /// braced expression in the header (a lambda body in `init`) is a
+    /// statement terminator at brace depth ≥ 1 and is skipped; a nested
     /// call's own parens in `cond` or `inc` (`pred(i)`) never confuse the
-    /// depth count — the walk stops at the `)` that returns depth to 0,
-    /// before the body's own tokens are ever read.
+    /// paren count — the walk stops at the `)` that returns it to 0.
+    ///
+    /// Every separator must be spelled INSIDE this statement's expansion
+    /// range — strictly between the `for` keyword's file offset and the
+    /// body's. A loop emitted whole by a function-like macro
+    /// (`#define LOOP(I, C, N) for (I; C; N)`) tokenizes as the macro
+    /// DEFINITION's tokens, whose `;` offsets sit before every
+    /// expansion-site anchor: comparing those against the head children
+    /// would file all of them under `for_inc`, so such a header is rejected
+    /// outright rather than mis-tagged.
     ///
     /// `Some((s1, s2))` only when EXACTLY two such semicolons are found: a
     /// `for(init; cond; inc)` header, whichever parts are elided. Anything
     /// else (a macro-spelled header, a tokenize failure) yields `None` —
     /// callers must never guess a slot from a partial count.
     fn for_header_semicolons(e: &Entity<'_>) -> Option<(u32, u32)> {
-        let tokens = e.get_range()?.tokenize();
-        let mut depth = 0i32;
+        let range = e.get_range()?;
+        let body = e.get_children().into_iter().last()?;
+        let header =
+            clang::source::SourceRange::new(range.get_start(), body.get_range()?.get_start());
+        // Expansion-site bounds every separator must fall strictly inside.
+        let (lo, hi) = (Self::anchor(e), Self::anchor(&body));
+        let mut paren = 0i32;
+        let mut brace = 0i32;
         let mut semis = Vec::new();
-        for t in &tokens {
+        for t in &header.tokenize() {
             if t.get_kind() != clang::token::TokenKind::Punctuation {
                 continue;
             }
             match t.get_spelling().as_str() {
-                "(" => depth += 1,
+                "(" => paren += 1,
                 ")" => {
-                    depth -= 1;
-                    if depth == 0 {
+                    paren -= 1;
+                    if paren == 0 && brace == 0 {
                         break;
                     }
                 }
-                ";" if depth == 1 => {
-                    semis.push(t.get_location().get_file_location().offset);
+                "{" => brace += 1,
+                "}" => brace -= 1,
+                ";" if paren == 1 && brace == 0 => {
+                    let off = t.get_location().get_file_location().offset;
+                    if off <= lo || off >= hi {
+                        return None;
+                    }
+                    semis.push(off);
                 }
                 _ => {}
             }
@@ -1881,5 +1905,68 @@ struct S {
                 .count();
             assert_eq!(tagged, 0, "{name} must never receive a for-slot tag");
         }
+    }
+    /// Two header shapes a token walk over the WHOLE `ForStmt` extent gets
+    /// wrong (Codex review on PR #116). `MACRO_FOR`: a loop emitted entirely
+    /// by a function-like macro — the tokens libclang hands back for the
+    /// cursor's extent are the macro DEFINITION's (`for (I; C; N)`), whose two
+    /// `;` sit before every expansion-site anchor. `LAMBDA_FOR`: a `;` inside
+    /// a braced lambda body in the init clause is a statement terminator,
+    /// not a header separator.
+    const FOR_SLOTS_EDGES: &str = r#"
+#define LOOP(I, C, N) for (I; C; N)
+struct M {
+  int n_; int acc_; int arr_[8];
+  void macro_loop() { LOOP(int i = 0, i < n_, ++i) { acc_ += arr_[i]; } }
+  void lambda_init() { for (auto f = [] { return 1; }; f() < n_; ++acc_) { acc_ += n_; } }
+};"#;
+
+    /// `macro_loop`: the header is spelled inside a macro definition; its
+    /// separators are NOT in the expansion, so no slot may be assigned —
+    /// the conservative `None` path, never three `for_inc`s.
+    #[test]
+    fn for_macro_emitted_loop_gets_no_slot_tags() {
+        let (ms, _) = ore("for_macro_loop", FOR_SLOTS_EDGES);
+        let m = find(&ms, "M.macro_loop()");
+        let tagged: Vec<&str> = m
+            .events
+            .iter()
+            .filter_map(|e| e.control.as_deref())
+            .filter(|c| matches!(*c, "for_init" | "for_cond" | "for_inc"))
+            .collect();
+        assert!(
+            tagged.is_empty(),
+            "a macro-emitted header must stay untagged, got {tagged:?}"
+        );
+    }
+
+    /// `lambda_init`: the braced lambda body's `;` must not count as a header
+    /// separator — all three slots are still recovered.
+    #[test]
+    fn for_lambda_in_init_still_tags_all_three_slots() {
+        let (ms, syms) = ore("for_lambda_init", FOR_SLOTS_EDGES);
+        let m = find(&ms, "M.lambda_init()");
+        let init: Vec<&OreEvent> = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_init") && e.kind == EventKind::Decl)
+            .collect();
+        assert_eq!(init.len(), 1, "the Decl for f: {init:?}");
+        assert_eq!(subj_name(&syms, init[0]), Some("f"));
+        let cond = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_cond"))
+            .count();
+        assert!(
+            cond >= 2,
+            "the call of f and the Read of n_ in `f() < n_`, got {cond}"
+        );
+        let inc = m
+            .events
+            .iter()
+            .filter(|e| e.control.as_deref() == Some("for_inc"))
+            .count();
+        assert!(inc >= 1, "the write to acc_ in `++acc_`, got {inc}");
     }
 }
