@@ -762,6 +762,19 @@ impl Expander {
         );
     }
 
+    /// Expands a C++ method into its function, signature, property, and body-action triples.
+    ///
+    /// Overloaded methods receive distinct identities based on their parameter types,
+    /// const qualification, and ref-qualification.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// expander.cpp_method("cpp", "cpp:Widget", &method);
+    /// ```
+    ///
+    /// `ns` identifies the namespace used for overridden methods, `model_iri` identifies
+    /// the owning C++ model, and `method` supplies the method declaration and body facts.
     fn cpp_method(&mut self, ns: &str, model_iri: &str, method: &CppMethod) {
         // Per-overload identity: append `(<comma-joined-param-types>)` so
         // overloaded methods (`void f(int)` + `void f(double)`) get distinct
@@ -2417,9 +2430,15 @@ mod tests {
 
     // ────────────────── C++ machine-plane tests ──────────────────
 
-    /// A `Tesseract::Recognizer`-shaped model exercising every C++ match
-    /// arm. The expand half of the `CppClass → Triple` round-trip the
-    /// `ruff_cpp_spo` locked-shape test mirrors.
+    /// Builds a C++ model graph containing representative class, method, template, and declaration metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let graph = cpp_fixture();
+    /// assert_eq!(graph.namespace, "cpp");
+    /// assert_eq!(graph.models.len(), 1);
+    /// ```
     fn cpp_fixture() -> ModelGraph {
         let mut rec = Model::new("Tesseract::Recognizer");
         rec.bases.push(CppBase {

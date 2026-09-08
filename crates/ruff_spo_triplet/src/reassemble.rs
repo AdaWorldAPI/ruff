@@ -85,15 +85,18 @@ struct MethodAcc {
     guarded_writes: Vec<String>,
 }
 
-/// Reassemble the C++ machine-plane projection of a triple set into a
-/// [`ModelGraph`].
+/// Reassembles a canonical C++ model graph from expanded triples.
 ///
-/// See the module docs for the scope, the round-trip property, and why
-/// method identity is recovered from `has_param_type` rather than the IRI
-/// suffix. The returned graph is canonicalised (collections sorted, the
-/// three never-emitted fields blanked to their defaults) so it compares
-/// equal to `expand`'s emitted projection of the source graph.
-#[must_use]
+/// Method identities and qualifiers are recovered from the emitted triples and
+/// method IRIs. Unrelated or incomplete triples are ignored.
+///
+/// # Examples
+///
+/// ```
+/// let graph = reassemble(&[]);
+/// assert!(graph.models.is_empty());
+/// ```
+pub fn reassemble(triples: &[Triple]) -> ModelGraph {
 pub fn reassemble(triples: &[Triple]) -> ModelGraph {
     // The namespace is the prefix of any class anchor's subject IRI.
     let namespace = triples
@@ -382,19 +385,18 @@ pub fn cpp_projection(graph: &ModelGraph) -> ModelGraph {
     projected
 }
 
-/// Sort and de-duplicate every C++ collection, and blank the three fields
-/// [`crate::expand`] never emits, so a reassembled graph and a source graph's
-/// emitted projection compare equal regardless of source declaration order.
+/// Canonicalizes the C++ representation so equivalent graphs compare deterministically.
 ///
-/// De-duplication mirrors `expand`'s `(s, p, o)` dedup: a source graph can
-/// carry the same fact twice (e.g. a template-id instantiated in several method
-/// signatures yields several identical `template_instantiates`, or a member
-/// harvested twice), but `expand` collapses identical triples, so `reassemble`
-/// recovers each fact once. The projection must therefore collapse exact
-/// duplicates too — otherwise a benign duplicate would read as a round-trip
-/// difference. Real collisions (two entries sharing a sort key but differing in
-/// content — the genuine overload-collision residual) are NOT equal, so dedup
-/// keeps them and they still surface.
+/// This clears properties that [`crate::expand`] does not emit, then sorts and
+/// de-duplicates fields, bases, methods, method body relations, templates,
+/// friends, macro uses, static assertions, and models.
+///
+/// # Examples
+///
+/// ```
+/// let mut graph = ModelGraph::default();
+/// canonicalize_cpp(&mut graph);
+/// ```
 fn canonicalize_cpp(graph: &mut ModelGraph) {
     for model in &mut graph.models {
         for field in &mut model.member_fields {

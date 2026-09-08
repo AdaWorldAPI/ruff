@@ -59,6 +59,19 @@ use std::path::{Path, PathBuf};
 use ruff_cpp_spo::{CppClass, Declaration, NAMESPACE, model_from_class, walk_tu_with_diagnostics};
 use ruff_spo_triplet::{ModelGraph, RecipeCentroid, classify, expand, to_ndjson};
 
+/// Recursively collects regular `.h` files beneath a directory, skipping symlinks.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// let mut headers = Vec::new();
+/// collect_headers(Path::new("src/include"), &mut headers)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+///
+/// Returns an error if a directory entry cannot be read or traversed.
 fn collect_headers(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -81,6 +94,24 @@ fn collect_headers(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Harvests C++ class metadata from the configured Ladybug include subtree and writes an NDJSON SPO manifest.
+///
+/// The source root, subtree, and manifest path are configured with `LADYBUG_SRC`, `SUBTREE`, and
+/// `MANIFEST_OUT`. Missing or unreadable input directories and manifest-write failures are reported
+/// as errors; individual header parse failures are collected and reported without aborting the
+/// harvest.
+///
+/// # Examples
+///
+/// ```no_run
+/// let result = main();
+/// assert!(result.is_ok());
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if the configured subtree does not exist, header traversal fails, or the
+/// manifest cannot be written.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::var("LADYBUG_SRC").unwrap_or_else(|_| "/home/user/ladybug".to_string());
     let root = Path::new(&root);

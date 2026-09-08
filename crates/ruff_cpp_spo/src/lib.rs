@@ -314,11 +314,25 @@ fn collect_cpp_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// The shared dedup loop behind [`extract_dir`] / [`extract_tree`]: walk each
-/// file as its own TU, dedup classes by fully-qualified name into a
-/// deterministic `BTreeMap`, skip per-TU [`WalkError::Parse`] failures, and
-/// propagate a non-recoverable [`WalkError::Libclang`] (codex P2, PR #13).
-#[cfg(feature = "libclang")]
+/// Walks translation-unit files and builds a deterministic model graph.
+///
+/// Parse failures for individual files are skipped. Libclang failures stop processing
+/// and are returned. Classes with the same fully qualified name are merged, including
+/// method body information from later translation units.
+///
+/// # Examples
+///
+/// ```no_run
+/// let files = vec![std::path::PathBuf::from("example.cpp")];
+/// let args = vec!["-std=c++17".to_owned()];
+/// let graph = walk_files(&files, &args)?;
+/// # let _: ruff_spo_triplet::ModelGraph = graph;
+/// # Ok::<(), WalkError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns [`WalkError::Libclang`] when libclang cannot process the files.
 fn walk_files(files: &[std::path::PathBuf], args: &[String]) -> Result<ModelGraph, WalkError> {
     let mut seen: std::collections::BTreeMap<String, Model> = std::collections::BTreeMap::new();
     for f in files {
@@ -344,24 +358,18 @@ fn walk_files(files: &[std::path::PathBuf], args: &[String]) -> Result<ModelGrap
     Ok(graph)
 }
 
-/// Fold a later TU's view of an already-seen class into the kept one, taking
-/// the body arm from whichever TU actually had the body.
+/// Fills empty method behavior data in an existing model from a later translation unit.
 ///
-/// A class is normally declared once in a header and seen again in every TU
-/// that includes it, so first-wins is right for the signature plane — every
-/// sighting agrees. The body arm does NOT agree: a method declared in the
-/// header and DEFINED in a `.cpp` has an empty arm in every TU but that one,
-/// and the header is usually walked first. Without this fold the out-of-line
-/// definitions — which in a real C++ corpus is most of the interesting
-/// behaviour — would silently harvest nothing.
+/// Methods are matched by name, parameter types, constness, and ref qualifier. Existing
+/// behavior data is preserved, while empty data is populated from the matching method.
 ///
-/// Methods are matched on `(name, param_types, is_const, ref_qualifier)`: the
-/// same identity the method IRI encodes, so a merge can never move one
-/// overload's body onto another. The ref-qualifier is load-bearing here and
-/// not decoration — `value() &` and `value() &&` agree on the first three, and
-/// without the fourth this function would copy whichever body it found first
-/// onto both. Only an EMPTY arm is filled; a non-empty one is never
-/// overwritten, so the result does not depend on which TU came first.
+/// # Examples
+///
+/// ```
+/// let mut kept = Model::default();
+/// let incoming = Model::default();
+/// merge_body_arms(&mut kept, &incoming);
+/// ```
 #[cfg(feature = "libclang")]
 fn merge_body_arms(kept: &mut Model, incoming: &Model) {
     for method in &mut kept.methods {
@@ -432,11 +440,15 @@ mod tests {
     use super::*;
     use ruff_spo_triplet::{ConstexprKind, CppAccess, CppTemplateKind, expand};
 
-    /// Locked target shape: a hand-built [`ModelGraph`] matching what a
-    /// finished [`extract`] MUST produce for the `Tesseract::Recognizer`
-    /// representative class. This test passes today (it does not call the
-    /// `todo!()` walker); it tells the frontend author what "done" looks
-    /// like. Mirrors `ruff_ruby_spo::tests::locked_shape_expands_to_expected_triples`.
+    /// Builds the expected model graph for the representative `Tesseract::Recognizer` class.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let graph = locked_recognizer_graph();
+    /// assert_eq!(graph.models.len(), 1);
+    /// assert_eq!(graph.models[0].name, "Tesseract::Recognizer");
+    /// ```
     fn locked_recognizer_graph() -> ModelGraph {
         let mut rec = Model::new("Tesseract::Recognizer");
         rec.bases.push(CppBase {
