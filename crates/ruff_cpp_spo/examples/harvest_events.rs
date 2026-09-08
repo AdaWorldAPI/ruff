@@ -33,23 +33,53 @@ use std::path::PathBuf;
 
 use ruff_cpp_spo::events::{EventKind, MethodOre, Symbols, walk_tu_events};
 
-/// A TSV cell can carry no tab and no newline. C++ identifiers and type
-/// spellings contain neither, but a malformed one would silently shift every
-/// later column, so the guard is unconditional.
+/// Replaces tab and line-break characters in a TSV cell with spaces.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(cell("a\tb\nc\rd"), "a b c d");
+/// ```
 fn cell(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
 }
 
-/// Pull the compile flags out of one `compile_commands.json` entry. Only the
-/// flags that change what the parser SEES are kept — `-o`, `-c` and the input
-/// file itself would make libclang re-drive a compilation.
+/// Extracts parser-relevant flags from a compilation command.
+///
+/// Compilation and output options, along with the source file, are omitted.
+///
+/// # Examples
+///
+/// ```
+/// let flags = args_of("clang++ -Iinclude -std=c++17 -c main.cpp -o main.o");
+/// assert_eq!(flags, vec!["-Iinclude", "-std=c++17"]);
+/// ```
 fn args_of(cmd: &str) -> Vec<String> {
     keep_parse_flags(&shell_split(cmd))
 }
 
-/// The filter half of [`args_of`], over tokens that are ALREADY split. The
-/// `arguments` form of a compilation database is a real array, so re-joining it
-/// into a string just to re-split it could only lose information.
+/// Filters compiler arguments to retain parser-relevant include, macro, and language-standard flags.
+///
+/// # Examples
+///
+/// ```
+/// let args = vec![
+///     "-I".to_owned(),
+///     "include".to_owned(),
+///     "-DDEBUG".to_owned(),
+///     "-std=c++17".to_owned(),
+///     "-o".to_owned(),
+///     "output.o".to_owned(),
+/// ];
+///
+/// assert_eq!(
+///     keep_parse_flags(&args),
+///     vec!["-I", "include", "-DDEBUG", "-std=c++17"]
+/// );
+/// ```
+///
+/// The returned arguments include `-I`, `-isystem`, and `-include` together
+/// with their following values, as well as joined `-I`, `-D`, and `-std` flags.
 fn keep_parse_flags(toks: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -74,7 +104,16 @@ fn keep_parse_flags(toks: &[String]) -> Vec<String> {
     out
 }
 
-/// Minimal POSIX-ish splitter: enough for the quoting cmake emits.
+/// Splits a command string into whitespace-separated arguments while honoring single quotes, double quotes, and backslash escapes.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(
+///     shell_split(r#"clang++ -I"include dir" 'source file.cpp'"#),
+///     vec!["clang++", "-Iinclude dir", "source file.cpp"]
+/// );
+/// ```
 fn shell_split(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -108,20 +147,22 @@ fn shell_split(s: &str) -> Vec<String> {
     out
 }
 
-/// `compile_commands.json` without a JSON dependency: the file is a flat array
-/// of objects, conventionally pretty-printed one field per line, which is the
-/// shape this reads.
+/// Parses compilation database entries into source paths and parser-relevant arguments.
 ///
-/// Each object is parsed INDEPENDENTLY and flushed at its closing brace. An
-/// earlier version kept `file` and `command` across objects and emitted as soon
-/// as both were set; an entry using `arguments` therefore left its `file`
-/// pending, and the NEXT object's `command` was attributed to the wrong file.
+/// Supports both shell-escaped `command` strings and already-split `arguments`
+/// arrays. Entries without either command form are ignored and reported.
 ///
-/// Both command forms defined by the JSON compilation database are read:
-/// `"command"` (one shell-escaped string) and `"arguments"` (an array of
-/// already-split strings, which the spec prefers precisely because it needs no
-/// shell unescaping). An entry carrying neither is reported rather than
-/// silently dropped.
+/// # Examples
+///
+/// ```
+/// let entries = parse_cc_json(
+///     r#"[{"file":"src/main.cpp","arguments":["clang++","-I","include","-c","src/main.cpp"]}]"#
+/// );
+///
+/// assert_eq!(entries.len(), 1);
+/// assert_eq!(entries[0].0, std::path::PathBuf::from("src/main.cpp"));
+/// assert_eq!(entries[0].1, vec!["-I", "include"]);
+/// ```
 fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
     let mut out = Vec::new();
     let mut file: Option<String> = None;
@@ -183,19 +224,15 @@ fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
     out
 }
 
-/// Every quoted run in a JSON array of strings, in order.
+/// Finds the first closing bracket outside a quoted JSON string.
 ///
-/// Scans for unescaped `"` delimiters rather than splitting on `,`, because a
-/// comma inside a string is CONTENT: `["-DPAIR=std::pair<int,int>"]` is one
-/// argument, and a comma split turns it into two invalid fragments that are
-/// then dropped, silently changing the flags a translation unit is parsed with.
-/// The byte index of the first `]` that is NOT inside a JSON string, or `None`
-/// when the array is still open.
+/// # Examples
 ///
-/// Shares its string/escape state machine with [`json_string_array`], so the
-/// two agree on where a string starts and ends; a scanner that disagreed with
-/// the one doing the extraction would be a second source of truth about the
-/// same text.
+/// ```
+/// assert_eq!(unquoted_bracket(r#"["a]"]]"#), Some(5));
+/// assert_eq!(unquoted_bracket(r#"["a"]"#), None);
+/// ```
+fn unquoted_bracket(text: &str) -> Option<usize> {
 fn unquoted_bracket(text: &str) -> Option<usize> {
     let (mut inside, mut esc) = (false, false);
     for (i, c) in text.char_indices() {
@@ -216,6 +253,17 @@ fn unquoted_bracket(text: &str) -> Option<usize> {
     None
 }
 
+/// Extracts quoted string values from text and partially unescapes newline and tab escapes.
+///
+/// # Examples
+///
+/// ```
+/// let values = json_string_array(r#"[ "one", "two\n" ]"#);
+/// assert_eq!(values, vec!["one", "two\n"]);
+/// ```
+///
+/// @param text Text containing quoted string values.
+/// @returns The extracted string values in their order of appearance.
 fn json_string_array(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -247,6 +295,19 @@ fn json_string_array(text: &str) -> Vec<String> {
     out
 }
 
+/// Extracts a quoted string value following a matching field prefix.
+///
+/// Recognizes `\n` and `\t` escapes and returns `None` when the prefix or
+/// quoted value is missing.
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(
+///     json_string_field(r#""name": "line\nvalue""#, r#""name":"#),
+///     Some("line\nvalue".to_string())
+/// );
+/// ```
 fn json_string_field(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(key)?.trim_start();
     let body = rest.strip_prefix('"')?;
@@ -271,6 +332,17 @@ fn json_string_field(line: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Harvests translation-unit events and writes event, scope, method, and symbol TSV files.
+///
+/// The corpus is selected with `ORE_CC_JSON` or `ORE_FILE`; `ORE_OUT` selects the
+/// output directory. Returns an error when no corpus is selected or no translation
+/// units remain after filtering.
+///
+/// # Examples
+///
+/// ```text
+/// ORE_CC_JSON=compile_commands.json ORE_OUT=/tmp/ore cargo run --example harvest_events
+/// ```
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(std::env::var("ORE_OUT").unwrap_or_else(|_| "/tmp/ore".into()));
     std::fs::create_dir_all(&out_dir)?;

@@ -36,36 +36,176 @@ pub trait BodyFacts {
 }
 
 impl BodyFacts for Function {
+    /// Returns the names of fields written by the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let writes = function.writes();
+    /// assert!(writes.contains(&"field".to_string()));
+    /// ```
     fn writes(&self) -> &[String] {
         &self.writes
     }
+    /// Provides the names of fields read by the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let fields = body.reads();
+    /// assert!(fields.iter().all(|field| !field.is_empty()));
+    /// ```
+    ///
+    /// Returns the fields accessed by the body.
     fn reads(&self) -> &[String] {
         &self.reads
     }
+    /// Provides the fields raised by the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// struct Facts {
+    ///     raises: Vec<String>,
+    /// }
+    ///
+    /// impl BodyFacts for Facts {
+    ///     fn writes(&self) -> &[String] { &[] }
+    ///     fn reads(&self) -> &[String] { &[] }
+    ///     fn raises(&self) -> &[String] { &self.raises }
+    ///     fn calls(&self) -> &[String] { &[] }
+    ///     fn guarded_writes(&self) -> &[String] { &[] }
+    /// }
+    ///
+    /// let facts = Facts {
+    ///     raises: vec![String::from("error")],
+    /// };
+    /// assert_eq!(facts.raises(), &[String::from("error")]);
+    /// ```
     fn raises(&self) -> &[String] {
         &self.raises
     }
+    /// Returns the calls recorded for the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let calls = body_facts.calls();
+    /// assert!(calls.iter().all(|call| !call.is_empty()));
+    /// ```
     fn calls(&self) -> &[String] {
         &self.calls
     }
+    /// Provides the fields whose writes are guarded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// struct Facts {
+    ///     guarded_writes: Vec<String>,
+    /// }
+    ///
+    /// impl BodyFacts for Facts {
+    ///     fn writes(&self) -> &[String] { &[] }
+    ///     fn reads(&self) -> &[String] { &[] }
+    ///     fn raises(&self) -> &[String] { &[] }
+    ///     fn calls(&self) -> &[String] { &[] }
+    ///     fn guarded_writes(&self) -> &[String] { &self.guarded_writes }
+    /// }
+    ///
+    /// let facts = Facts {
+    ///     guarded_writes: vec![String::from("value")],
+    /// };
+    /// assert_eq!(facts.guarded_writes(), &["value"]);
+    /// ```
     fn guarded_writes(&self) -> &[String] {
         &self.guarded_writes
     }
 }
 
 impl BodyFacts for CppMethod {
+    /// Returns the names of fields written by the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let writes = function.writes();
+    /// assert!(writes.contains(&"field".to_string()));
+    /// ```
     fn writes(&self) -> &[String] {
         &self.writes
     }
+    /// Provides the names of fields read by the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let fields = body.reads();
+    /// assert!(fields.iter().all(|field| !field.is_empty()));
+    /// ```
+    ///
+    /// Returns the fields accessed by the body.
     fn reads(&self) -> &[String] {
         &self.reads
     }
+    /// Provides the fields raised by the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// struct Facts {
+    ///     raises: Vec<String>,
+    /// }
+    ///
+    /// impl BodyFacts for Facts {
+    ///     fn writes(&self) -> &[String] { &[] }
+    ///     fn reads(&self) -> &[String] { &[] }
+    ///     fn raises(&self) -> &[String] { &self.raises }
+    ///     fn calls(&self) -> &[String] { &[] }
+    ///     fn guarded_writes(&self) -> &[String] { &[] }
+    /// }
+    ///
+    /// let facts = Facts {
+    ///     raises: vec![String::from("error")],
+    /// };
+    /// assert_eq!(facts.raises(), &[String::from("error")]);
+    /// ```
     fn raises(&self) -> &[String] {
         &self.raises
     }
+    /// Returns the calls recorded for the body.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let calls = body_facts.calls();
+    /// assert!(calls.iter().all(|call| !call.is_empty()));
+    /// ```
     fn calls(&self) -> &[String] {
         &self.calls
     }
+    /// Provides the fields whose writes are guarded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// struct Facts {
+    ///     guarded_writes: Vec<String>,
+    /// }
+    ///
+    /// impl BodyFacts for Facts {
+    ///     fn writes(&self) -> &[String] { &[] }
+    ///     fn reads(&self) -> &[String] { &[] }
+    ///     fn raises(&self) -> &[String] { &[] }
+    ///     fn calls(&self) -> &[String] { &[] }
+    ///     fn guarded_writes(&self) -> &[String] { &self.guarded_writes }
+    /// }
+    ///
+    /// let facts = Facts {
+    ///     guarded_writes: vec![String::from("value")],
+    /// };
+    /// assert_eq!(facts.guarded_writes(), &["value"]);
+    /// ```
     fn guarded_writes(&self) -> &[String] {
         &self.guarded_writes
     }
@@ -107,13 +247,20 @@ pub enum RecipeCentroid {
     Empty,
 }
 
-/// Classify a function's fact-set into its nearest recipe centroid.
+/// Classifies a body’s facts into the first matching recipe centroid.
 ///
-/// First-match-wins, in exactly the order of
-/// `.claude/knowledge/fuzzy-recipe-codebook.md` §3. The J1 guard-write fact
-/// (`guarded_writes`) splits [`RecipeCentroid::Default`] out **before**
-/// [`RecipeCentroid::Compute`] / [`RecipeCentroid::Normalize`] are checked,
-/// per the J1 finding recorded there.
+/// Classification prioritizes compensating, cascading, guarding, and write-then-raise
+/// behavior before distinguishing default, compute, normalize, observe, and empty bodies.
+/// Guarded writes take precedence over compute and normalize classifications.
+///
+/// # Examples
+///
+/// ```
+/// # use ruff_spo_triplet::recipe::{classify, RecipeCentroid};
+/// # let facts = todo!();
+/// let centroid = classify(&facts);
+/// assert_eq!(centroid, RecipeCentroid::Empty);
+/// ```
 #[must_use]
 pub fn classify<F: BodyFacts + ?Sized>(f: &F) -> RecipeCentroid {
     let writes = !f.writes().is_empty();

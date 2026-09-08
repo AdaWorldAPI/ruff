@@ -116,6 +116,14 @@ impl EventKind {
 }
 
 impl fmt::Display for EventKind {
+    /// Formats the event kind using its stable string representation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let kind = EventKind::FunctionEnter;
+    /// assert_eq!(kind.to_string(), kind.as_str());
+    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -145,6 +153,15 @@ pub enum ScopeKind {
 }
 
 impl ScopeKind {
+    /// Provides the stable name of this scope kind.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(ScopeKind::Loop.as_str(), "Loop");
+    /// ```
+    ///
+    /// Each scope kind maps to a fixed string representation.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Function => "Function",
@@ -165,8 +182,16 @@ impl ScopeKind {
         }
     }
 
-    /// Does a loop's exit close a back edge? The one control relation that is
-    /// structurally certain without a CFG.
+    /// Determines whether this scope kind represents a loop.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert!(ScopeKind::For.is_loop());
+    /// assert!(!ScopeKind::Block.is_loop());
+    /// ```
+    ///
+    /// Returns `true` for `for`, `while`, `do`, and range-based `for` loops; `false` otherwise.
     fn is_loop(self) -> bool {
         matches!(self, Self::For | Self::While | Self::Do | Self::RangeFor)
     }
@@ -186,6 +211,13 @@ pub enum SymKind {
 }
 
 impl SymKind {
+    /// Provides the stable string representation of this symbol kind.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(SymKind::Member.as_str(), "member");
+    /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Member => "member",
@@ -215,6 +247,15 @@ pub enum Role {
 }
 
 impl Role {
+    /// Returns the stable string representation of a role.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::events::Role;
+    ///
+    /// assert_eq!(Role::Param.as_str(), "param");
+    /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Own => "own",
@@ -239,6 +280,14 @@ pub enum Prov {
 }
 
 impl Prov {
+    /// Provides the stable lowercase label for this provenance value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(Prov::Clang.as_str(), "clang");
+    /// assert_eq!(Prov::Walk.as_str(), "walk");
+    /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Clang => "clang",
@@ -320,6 +369,19 @@ pub struct Symbols {
 }
 
 impl Symbols {
+    /// Interns a symbol and returns its stable identifier.
+    ///
+    /// Symbols with the same kind, role, and name share an identifier; the first
+    /// provenance value is retained for each unique symbol.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut symbols = Symbols::default();
+    /// let id = symbols.intern(SymKind::Member, Role::OwnMember, "value", Prov::Walk);
+    ///
+    /// assert_eq!(id, "s0");
+    /// ```
     pub fn intern(&mut self, kind: SymKind, role: Role, name: &str, prov: Prov) -> String {
         let key = (kind, role, name.to_string());
         if let Some(id) = self.index.get(&key) {
@@ -331,6 +393,14 @@ impl Symbols {
         format!("s{id}")
     }
 
+    /// Iterates over interned symbols with their stable identifiers and metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let symbols = Symbols::default();
+    /// assert_eq!(symbols.rows().count(), 0);
+    /// ```
     pub fn rows(&self) -> impl Iterator<Item = (String, SymKind, Role, &str, Prov)> {
         self.rows
             .iter()
@@ -338,10 +408,28 @@ impl Symbols {
             .map(|(i, (k, r, n, p))| (format!("s{i}"), *k, *r, n.as_str(), *p))
     }
 
+    /// Reports the number of interned symbols.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let symbols = Symbols::default();
+    /// assert_eq!(symbols.len(), 0);
+    /// ```
+    ///
+    /// Returns the number of symbols stored in the table.
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
+    /// Determines whether the symbol table contains no symbols.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let symbols = Symbols::default();
+    /// assert!(symbols.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -366,6 +454,14 @@ struct Walk<'s> {
 }
 
 impl<'s> Walk<'s> {
+    /// Creates a walker backed by the provided shared symbol table.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut symbols = Symbols::default();
+    /// let _walker = Walk::new(&mut symbols);
+    /// ```
     fn new(syms: &'s mut Symbols) -> Self {
         Self {
             syms,
@@ -375,21 +471,66 @@ impl<'s> Walk<'s> {
         }
     }
 
+    /// Gets the ID of the currently active scope, or `0` when no scope is active.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let scope_id = walk.cur();
+    /// ```
     fn cur(&self) -> u32 {
         self.stack.last().copied().unwrap_or(0)
     }
 
+    /// Gets the identifier of the enclosing scope.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # struct Walk { stack: Vec<u32> }
+    /// # impl Walk {
+    /// #     fn parent(&self) -> Option<u32> {
+    /// #         let n = self.stack.len();
+    /// #         (n >= 2).then(|| self.stack[n - 2])
+    /// #     }
+    /// # }
+    /// let walk = Walk { stack: vec![10, 20] };
+    /// assert_eq!(walk.parent(), Some(10));
+    /// ```
     fn parent(&self) -> Option<u32> {
         let n = self.stack.len();
         (n >= 2).then(|| self.stack[n - 2])
     }
 
+    /// Returns the source-file byte offset where an entity begins, or `0` when no source range is available.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use clang::Entity;
+    /// # fn example(entity: &Entity<'_>) {
+    /// let offset = anchor(entity);
+    /// assert!(offset >= 0);
+    /// # }
+    /// ```
     fn anchor(e: &Entity<'_>) -> u32 {
         e.get_range()
             .map(|r| r.get_start().get_file_location().offset)
             .unwrap_or(0)
     }
 
+    /// Appends a walker-originated event for an entity in the current scope.
+    ///
+    /// The event receives a sequence number, source anchor, current scope, and
+    /// parent scope, while its subject, object, control metadata, and type
+    /// relation remain unset.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let index = walk.push(EventKind::Read, &entity);
+    /// assert_eq!(walk.events[index].kind, EventKind::Read);
+    /// ```
     fn push(&mut self, kind: EventKind, e: &Entity<'_>) -> usize {
         let seq = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
         self.events.push(OreEvent {
@@ -407,8 +548,18 @@ impl<'s> Walk<'s> {
         self.events.len() - 1
     }
 
-    /// Open a scope, run `body`, close it. Enter/exit carry the scope's own id
-    /// and its kind symbol, so a nested sequence cannot flatten into a sibling.
+    /// Records a nested scope and its matching entry and exit events.
+    ///
+    /// The scope is linked to the currently active parent, and loop scopes mark
+    /// their exit event with a `back_edge` control label.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// walker.scoped(ScopeKind::Loop, entity, |walker| {
+    ///     walker.children(entity);
+    /// });
+    /// ```
     fn scoped<F: FnOnce(&mut Self)>(&mut self, kind: ScopeKind, e: &Entity<'_>, body: F) {
         let id = u32::try_from(self.scopes.len()).unwrap_or(u32::MAX);
         let depth = u16::try_from(self.stack.len()).unwrap_or(u16::MAX);
@@ -441,16 +592,33 @@ impl<'s> Walk<'s> {
         self.stack.pop();
     }
 
+    /// Visits each direct child entity with the walker.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// for child in entity.get_children() {
+    ///     walker.node(&child);
+    /// }
+    /// ```
     fn children(&mut self, e: &Entity<'_>) {
         for c in e.get_children() {
             self.node(&c);
         }
     }
 
-    /// A construct's body. A `CompoundStmt` here is the braces of the
-    /// construct we already opened a scope for, so it is walked THROUGH —
-    /// otherwise `if (x) f();` and `if (x) { f(); }` would differ by a scope,
-    /// and a tokenizer would learn brace style instead of behavior.
+    /// Walks a construct body without introducing a redundant block scope.
+    ///
+    /// Braced and unbraced bodies are handled uniformly, preserving equivalent
+    /// scope structures for constructs such as `if (x) f();` and
+    /// `if (x) { f(); }`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// if (condition) statement;
+    /// if (condition) { statement; }
+    /// ```
     fn body(&mut self, e: &Entity<'_>) {
         if e.get_kind() == EntityKind::CompoundStmt {
             self.children(e);
@@ -459,7 +627,24 @@ impl<'s> Walk<'s> {
         }
     }
 
-    /// The role of a referenced declaration. `prov=clang` — libclang resolved it.
+    /// Classifies a referenced declaration by role, symbol kind, and provenance.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let (role, kind, provenance) = ref_role(&entity);
+    /// assert_eq!(role, Role::Param);
+    /// assert_eq!(kind, SymKind::Param);
+    /// assert_eq!(provenance, Prov::Clang);
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing the declaration's role, symbol kind, and resolution provenance. Unresolved references use `Role::Unknown`, `SymKind::Other`, and `Prov::Walk`.
+    ///
+    /// # Parameters
+    ///
+    /// * `e` - The entity whose referenced declaration is classified.
     fn ref_role(e: &Entity<'_>) -> (Role, SymKind, Prov) {
         match e.get_reference().map(|r| r.get_kind()) {
             Some(EntityKind::ParmDecl) => (Role::Param, SymKind::Param, Prov::Clang),
@@ -469,6 +654,15 @@ impl<'s> Walk<'s> {
         }
     }
 
+    /// Visits a Clang entity and records its behavioral events and structural scopes.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let before = walk.events.len();
+    /// walk.node(&entity);
+    /// assert!(walk.events.len() >= before);
+    /// ```
     fn node(&mut self, e: &Entity<'_>) {
         match e.get_kind() {
             EntityKind::CompoundStmt => self.scoped(ScopeKind::Block, e, |w| w.children(e)),
@@ -787,7 +981,17 @@ impl<'s> Walk<'s> {
         }
     }
 
-    /// Record a write/read-modify-write against whatever the LHS names.
+    /// Records a write or read-modify-write event for the symbol named by the left-hand side.
+    ///
+    /// Member assignment targets are recorded as owned members; other targets use their
+    /// inferred symbol kind, role, and provenance.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// walk.write_event(&lhs, EventKind::Write);
+    /// ```
+    fn write_event(&mut self, lhs: &Entity<'_>, kind: EventKind) {
     fn write_event(&mut self, lhs: &Entity<'_>, kind: EventKind) {
         let (sym, prov) = if let Some(m) = assignment_target(lhs) {
             (
@@ -804,13 +1008,24 @@ impl<'s> Walk<'s> {
         self.events[i].prov = prov;
     }
 
-    /// Walk an assignment target's children WITHOUT re-recording the target
-    /// itself as a read — mirroring the shipped arm, which walks the LHS with
-    /// `walk_body` precisely to skip its own top-level `MemberRefExpr`.
+    /// Walks an assignment target's children without recording the target itself as a read.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// walker.node_skipping_top_member(lhs);
+    /// ```
     fn node_skipping_top_member(&mut self, lhs: &Entity<'_>) {
         self.children(lhs);
     }
 
+    /// Records a function or method call and traverses its receiver and arguments.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// walker.call(&call_entity);
+    /// ```
     fn call(&mut self, e: &Entity<'_>) {
         let name = e.get_name().unwrap_or_default();
         let referenced = e.get_reference();
@@ -869,8 +1084,16 @@ impl<'s> Walk<'s> {
 // Entry points
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The method IRI, byte-identical to what `ruff_spo_triplet::expand` builds
-/// for the same method — the join key every consumer relies on.
+/// Builds the canonical qualified identifier for a C++ method, including parameter types, constness, and reference qualification.
+///
+/// Returns `None` when the method has no name or semantic parent.
+///
+/// # Examples
+///
+/// ```
+/// let iri = "Namespace::Type.method(int, std::string) const &";
+/// assert_eq!(iri, "Namespace::Type.method(int, std::string) const &");
+/// ```
 fn method_iri(m: &Entity<'_>) -> Option<String> {
     let name = m.get_name()?;
     let parent = m.get_semantic_parent()?;
@@ -897,6 +1120,17 @@ fn method_iri(m: &Entity<'_>) -> Option<String> {
     ))
 }
 
+/// Identifies whether a Clang entity kind represents a callable declaration.
+///
+/// # Examples
+///
+/// ```
+/// assert!(is_callable(EntityKind::Method));
+/// assert!(!is_callable(EntityKind::Namespace));
+/// ```
+///
+/// Returns `true` for methods, constructors, destructors, conversion functions,
+/// and function declarations; `false` for other entity kinds.
 fn is_callable(k: EntityKind) -> bool {
     matches!(
         k,
@@ -908,6 +1142,19 @@ fn is_callable(k: EntityKind) -> bool {
     )
 }
 
+/// Collects callable method definitions from a Clang entity tree that belong to the translation unit's main file.
+///
+/// Matching methods are converted to ordered method data and appended to `out`; declarations from
+/// included headers are skipped.
+///
+/// # Examples
+///
+/// ```ignore
+/// collect(&root, tu, &mut symbols, &mut methods, main_file, &arm_cfg);
+/// ```
+///
+/// `main` identifies the translation unit's source file. `tu` and `arm_cfg` provide context for
+/// method extraction, while `syms` stores shared symbol identities.
 fn collect(
     e: &Entity<'_>,
     tu: &str,
@@ -933,6 +1180,19 @@ fn collect(
     }
 }
 
+/// Builds the ordered behavioral representation and metadata for a C++ method.
+///
+/// The result combines the method's ordered events and nested scopes with its
+/// identity, qualifiers, access, override information, shipped set counts, and
+/// centroid classification.
+///
+/// # Examples
+///
+/// ```ignore
+/// let ore = method_ore(&method, translation_unit, iri, &mut symbols, &arm_cfg);
+/// assert_eq!(ore.iri, iri);
+/// ```
+fn method_ore
 fn method_ore(
     m: &Entity<'_>,
     tu: &str,
@@ -1026,14 +1286,25 @@ fn method_ore(
     }
 }
 
-/// Walk ONE translation unit and return every method definition's ordered ore.
+/// Walks a translation unit and collects ordered ore for its method definitions.
+///
+/// Parse diagnostics at error severity are included in the returned translation-unit data.
 ///
 /// # Errors
 ///
-/// [`crate::WalkError::Libclang`] if libclang fails to initialise;
-/// [`crate::WalkError::Parse`] if the TU fails to parse. Parse DIAGNOSTICS are
-/// returned rather than swallowed — a partial AST must be visible, for the
-/// same reason `walk_tu_with_diagnostics` exists.
+/// Returns [`crate::WalkError::Libclang`] if libclang cannot be initialized, or
+/// [`crate::WalkError::Parse`] if parsing fails.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// let mut symbols = Symbols::default();
+/// let ore = walk_tu_events(Path::new("example.cpp"), &[], &mut symbols)?;
+/// # let _: TuOre = ore;
+/// # Ok::<(), crate::WalkError>(())
+/// ```
 pub fn walk_tu_events(
     path: &Path,
     args: &[String],
@@ -1116,6 +1387,14 @@ mod tests {
         m.events.iter().map(|e| e.kind.as_str()).collect()
     }
 
+    /// Collects the stable names of a method's scopes in traversal order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let method = MethodOre::default();
+    /// assert!(scope_kinds(&method).is_empty());
+    /// ```
     fn scope_kinds(m: &MethodOre) -> Vec<&'static str> {
         m.scopes.iter().map(|s| s.kind.as_str()).collect()
     }

@@ -819,7 +819,16 @@ pub enum CppRefQualifier {
 }
 
 impl CppRefQualifier {
-    /// The C++ spelling, as it appears in a method IRI's suffix.
+    /// Provides the C++ reference qualifier spelling used in method IRI suffixes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(CppRefQualifier::LValue.spelling(), "&");
+    /// assert_eq!(CppRefQualifier::RValue.spelling(), "&&");
+    /// ```
+    ///
+    /// Returns the C++ reference qualifier as `&` or `&&`.
     #[must_use]
     pub fn spelling(self) -> &'static str {
         match self {
