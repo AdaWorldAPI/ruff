@@ -35,6 +35,7 @@ use ruff_spo_triplet::{
 };
 
 mod actions;
+pub mod events;
 mod functions;
 mod menu;
 mod menu_regions;
