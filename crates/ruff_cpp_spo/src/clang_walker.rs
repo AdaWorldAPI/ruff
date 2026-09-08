@@ -1388,6 +1388,9 @@ fn absence_guard(cond: &Entity) -> Option<(String, GuardedBranch)> {
     let [member] = members.as_slice() else {
         return None;
     };
+    if !member_is_condition_subject(cond, 64) {
+        return None;
+    }
 
     let tokens: Vec<String> = cond
         .get_range()?
@@ -1415,6 +1418,81 @@ fn absence_guard(cond: &Entity) -> Option<(String, GuardedBranch)> {
         () => return None,
     };
     Some((member.clone(), branch))
+}
+
+/// Is the condition's own-member reference the SUBJECT of the test, or does the
+/// condition merely MENTION it?
+///
+/// `if (ptr_)`, `if (!ptr_)`, `if (ptr_ == nullptr)` and `if (name_.empty())`
+/// all test the member itself. `if (is_ready(ptr_))` and `if (count_ + 1)` do
+/// not: there the member is an argument or an operand, and the predicate's
+/// result says nothing about whether the member is absent. Before this check
+/// both were classified as guards, because the branch table reads TOKENS
+/// across the whole condition and never asked where in it the member sits — so
+/// `ptr_ = make()` in the other branch was recorded as a schema default.
+///
+/// The walk descends only through positions that keep the member the subject:
+/// wrappers and parentheses, a logical `!`, either side of a comparison, and
+/// the RECEIVER of a call. Never a call's arguments, never an operand of
+/// arithmetic, and never a dereference — `if (*ptr_)` tests the pointee, and
+/// the member holds the same address whichever way that goes.
+#[cfg(feature = "libclang")]
+fn member_is_condition_subject(node: &Entity, depth: u32) -> bool {
+    // Bounded so a cyclic cursor graph cannot loop; expression nesting in a
+    // condition is far shallower than this.
+    let Some(depth) = depth.checked_sub(1) else {
+        return false;
+    };
+    let children = node.get_children();
+    let any = |cs: &[Entity]| cs.iter().any(|c| member_is_condition_subject(c, depth));
+    match node.get_kind() {
+        // Either this IS the member, or it is a receiver chain leading to it
+        // (`name_.empty()` reaches `name_` through the callee reference).
+        EntityKind::MemberRefExpr => own_member_name(node).is_some() || any(&children),
+        EntityKind::UnexposedExpr | EntityKind::ParenExpr => any(&children),
+        // `!x` keeps `x` the subject. `*p`, `-n`, `&x`, `++i` do not.
+        EntityKind::UnaryOperator => {
+            unary_operator_spelling(node).as_deref() == Some("!") && any(&children)
+        }
+        // A comparison tests its operands; arithmetic and logic do not.
+        EntityKind::BinaryOperator => {
+            matches!(
+                binary_operator_spelling(node).as_deref(),
+                Some("==" | "!=" | "<" | ">" | "<=" | ">=")
+            ) && any(&children)
+        }
+        // An OVERLOADED operator is also a `CallExpr`, and there the first
+        // child is the left OPERAND rather than a callee — so `sp_ + 1` on a
+        // smart pointer would reach `sp_` through the ordinary-call path and
+        // become a guard, which the builtin-`+` case above rejects. Read the
+        // callee's name and treat operators as operators: a comparison, a
+        // contextual `operator bool`, or an `operator!` keeps the member the
+        // subject; anything else (arithmetic, `[]`, `*`, `->`) does not.
+        //
+        // A name that merely BEGINS with `operator` but is not in that set is
+        // rejected rather than followed, which is the conservative direction.
+        EntityKind::CallExpr => match node.get_name().as_deref() {
+            Some(
+                "operator==" | "operator!=" | "operator<" | "operator>" | "operator<="
+                | "operator>=" | "operator bool" | "operator!",
+            ) => any(&children),
+            Some(n) if n.starts_with("operator") => false,
+            // An ordinary call: only the callee/receiver chain, which IS the
+            // first child here. The arguments are deliberately not followed.
+            _ => children
+                .first()
+                .is_some_and(|c| member_is_condition_subject(c, depth)),
+        },
+        _ => false,
+    }
+}
+
+/// The operator spelling of a PREFIX unary operator, read off the token stream
+/// — libclang exposes no unary-operator kind either. Postfix `i++` yields `i`,
+/// which is what callers testing for `!` want.
+#[cfg(feature = "libclang")]
+fn unary_operator_spelling(node: &Entity) -> Option<String> {
+    Some(node.get_range()?.tokenize().first()?.get_spelling())
 }
 
 /// Every own data member referenced anywhere under `node`.
@@ -1792,16 +1870,27 @@ struct D : Base {
 
     const GUARDS: &str = r#"
 struct Str { bool empty() const; };
+struct Sp { bool operator==(decltype(nullptr)) const; explicit operator bool() const; };
 struct Cfg {
     int* ptr_;
     Str name_;
     int other_;
+    int count_;
+    Sp sp_;
     void null_guard(int* v) { if (ptr_ == nullptr) { ptr_ = v; } }
     void bang_guard(int* v) { if (!ptr_) { ptr_ = v; } }
     void empty_guard(Str s) { if (name_.empty()) { name_ = s; } }
     void present_guard(int* v) { if (ptr_ != nullptr) { } else { ptr_ = v; } }
     void bare_truth_guard(int* v) { if (ptr_) { } else { ptr_ = v; } }
     void not_empty_guard(Str s) { if (!name_.empty()) { } else { name_ = s; } }
+    void paren_truth_guard(int* v) { if ((ptr_)) { } else { ptr_ = v; } }
+    void this_truth_guard(int* v) { if (this->ptr_) { } else { ptr_ = v; } }
+    void zero_cmp_guard(int v) { if (count_ == 0) { count_ = v; } }
+    // A smart-pointer-shaped member: `==` and the truth test are OVERLOADED
+    // operators, so both arrive as calls. `prevSelVector == nullptr` in the
+    // real corpus is exactly this shape.
+    void sp_null_guard(Sp v) { if (sp_ == nullptr) { sp_ = v; } }
+    void sp_truth_guard(Sp v) { if (sp_) { } else { sp_ = v; } }
     void unguarded(int* v) { ptr_ = v; }
     void wrong_branch(int* v) { if (ptr_ == nullptr) { } else { ptr_ = v; } }
     void other_member_guard(int* v) { if (other_ == 0) { ptr_ = v; } }
@@ -1814,7 +1903,13 @@ struct Cfg {
     #[test]
     fn an_absence_test_makes_the_then_branch_write_a_guarded_write() {
         let all = arms("guards", GUARDS);
-        for name in ["null_guard", "bang_guard", "empty_guard"] {
+        for name in [
+            "null_guard",
+            "bang_guard",
+            "empty_guard",
+            "zero_cmp_guard",
+            "sp_null_guard",
+        ] {
             let a = &all[name];
             assert_eq!(a.guarded_writes.len(), 1, "{name}: {:?}", a.guarded_writes);
             assert!(
@@ -1833,6 +1928,11 @@ struct Cfg {
             ("present_guard", "ptr_"),
             ("bare_truth_guard", "ptr_"),
             ("not_empty_guard", "name_"),
+            // The member reached through parentheses and through an explicit
+            // `this`. Both must survive the subject check.
+            ("paren_truth_guard", "ptr_"),
+            ("this_truth_guard", "ptr_"),
+            ("sp_truth_guard", "sp_"),
         ] {
             let a = &all[name];
             assert_eq!(a.guarded_writes, [member], "{name} guarded writes");
@@ -1892,6 +1992,70 @@ struct Cfg {
             "an inner guard on another member drops the outer one: {:?}",
             regarded.guarded_writes
         );
+    }
+
+    /// Conditions that only MENTION the member. Each writes it in exactly the
+    /// branch the pre-fix rule guarded, because the misclassification is
+    /// silent whenever the write happens to land in the other branch — a
+    /// fixture with the write on the wrong side would pass without the fix.
+    const MENTIONS: &str = r#"
+bool is_ready(int* p);
+struct Sp { bool operator==(decltype(nullptr)) const; int operator+(int) const; explicit operator bool() const; };
+struct Cfg {
+    int* ptr_;
+    int count_;
+    Sp sp_;
+    // The predicate's value says nothing about whether `ptr_` is absent.
+    void helper_call(int* v)     { if (is_ready(ptr_)) { } else { ptr_ = v; } }
+    void neg_helper_call(int* v) { if (!is_ready(ptr_)) { ptr_ = v; } }
+    // ... nor does a comparison of that predicate against a null literal.
+    void helper_cmp_null(int* v) { if (is_ready(ptr_) == 0) { ptr_ = v; } }
+    // Arithmetic on the member is not a test of the member.
+    void arithmetic(int v)       { if (count_ + 1) { } else { count_ = v; } }
+    void neg_arithmetic(int v)   { if (!(count_ + 1)) { count_ = v; } }
+    // A dereference tests the POINTEE; `ptr_` holds the same address either
+    // way, so neither branch proves it absent.
+    void deref_truth(int* v)     { if (*ptr_) { } else { ptr_ = v; } }
+    void neg_deref(int* v)       { if (!*ptr_) { ptr_ = v; } }
+    // An OVERLOADED arithmetic operator reaches the walker as a call whose
+    // first child is the left operand, so it takes a different path through
+    // the subject check than the builtin `+` above and needs its own case.
+    void overloaded_plus(Sp v)   { if (sp_ + 1) { } else { sp_ = v; } }
+};
+"#;
+
+    /// The silence half of the subject check: a condition that merely mentions
+    /// the member is not a guard, so its write stays a plain write.
+    ///
+    /// Every one of these was recorded as a guarded write before
+    /// `member_is_condition_subject` existed, because the branch table reads
+    /// tokens across the whole condition and never asked where the member sat
+    /// in it. `guarded_writes` feeds `recipe::classify`, which prefers
+    /// `Default` over `Compute`/`Normalize`, so each was a method classified
+    /// by a guard the source does not contain.
+    #[test]
+    fn a_condition_that_only_mentions_the_member_is_not_a_guard() {
+        let all = arms("mentions", MENTIONS);
+        for name in [
+            "helper_call",
+            "neg_helper_call",
+            "helper_cmp_null",
+            "arithmetic",
+            "neg_arithmetic",
+            "deref_truth",
+            "neg_deref",
+            "overloaded_plus",
+        ] {
+            let a = &all[name];
+            // Anti-vacuity: the write must still be recorded, or this test
+            // would pass on an arm that saw nothing at all.
+            assert!(!a.writes.is_empty(), "{name} should still write");
+            assert!(
+                a.guarded_writes.is_empty(),
+                "{name} claimed a guarded write: {:?}",
+                a.guarded_writes
+            );
+        }
     }
 
     #[test]
