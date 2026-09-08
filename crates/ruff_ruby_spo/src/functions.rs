@@ -307,7 +307,7 @@ fn detect_guarded_default(
 }
 
 /// `self.X` or bare `X` (implicit-self attribute) → `Some("X")`; else `None`.
-fn attr_of_self(node: &Node) -> Option<&str> {
+pub(crate) fn attr_of_self(node: &Node) -> Option<&str> {
     if let Node::Send(s) = node
         && s.args.is_empty()
         && is_attr_ident(&s.method_name)
@@ -319,7 +319,7 @@ fn attr_of_self(node: &Node) -> Option<&str> {
 }
 
 /// `self.X.blank?` / `X.nil?` / `self.X.empty?` → the guarded field `X`.
-fn blank_guarded_field(cond: &Node) -> Option<&str> {
+pub(crate) fn blank_guarded_field(cond: &Node) -> Option<&str> {
     if let Node::Send(s) = cond
         && matches!(s.method_name.as_str(), "blank?" | "nil?" | "empty?")
     {
@@ -329,7 +329,7 @@ fn blank_guarded_field(cond: &Node) -> Option<&str> {
 }
 
 /// `self.X.present?` → `X` (the false-branch, i.e. `… unless X.present?`).
-fn present_guarded_field(cond: &Node) -> Option<&str> {
+pub(crate) fn present_guarded_field(cond: &Node) -> Option<&str> {
     if let Node::Send(s) = cond
         && s.method_name == "present?"
     {
@@ -590,7 +590,7 @@ const AR_MUTATORS: &[&str] = &[
 ];
 
 /// Is `method` one of the [`AR_MUTATORS`]?
-fn is_ar_mutator(method: &str) -> bool {
+pub(crate) fn is_ar_mutator(method: &str) -> bool {
     AR_MUTATORS.contains(&method)
 }
 
@@ -600,7 +600,7 @@ fn is_ar_mutator(method: &str) -> bool {
 /// becomes a `reads`/`writes` entry. A setter is recognised by stripping the
 /// trailing `=` and checking the base with this — `==` strips to `=` (not an
 /// ident → not a write), `state=` strips to `state` (ident → a write).
-fn is_attr_ident(name: &str) -> bool {
+pub(crate) fn is_attr_ident(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -610,7 +610,7 @@ fn is_attr_ident(name: &str) -> bool {
 /// (`"<receiver>.<method>"`). A bare call (`None`) and an explicit `self`
 /// both render as `"self"`. A relation/local receiver renders as its name; a
 /// constant as its dotted path; an unresolvable receiver as `"<expr>"`.
-fn receiver_label(recv: Option<&Node>) -> String {
+pub(crate) fn receiver_label(recv: Option<&Node>) -> String {
     match recv {
         None | Some(Node::Self_(_)) => "self".to_string(),
         Some(node @ Node::Const(_)) => {
@@ -635,7 +635,7 @@ fn receiver_label(recv: Option<&Node>) -> String {
 /// - `raise UserError.new("msg")` → `"UserError"` (`Node::Send` with recv=Const).
 /// - `raise UserError, "msg"` → handled by caller via `args.first()`.
 /// - `raise foo` (variable) → `None` (can't statically resolve).
-fn exception_type_name(arg: &Node) -> Option<String> {
+pub(crate) fn exception_type_name(arg: &Node) -> Option<String> {
     match arg {
         Node::Const(_) => const_to_dotted(arg),
         Node::Send(s) if s.method_name == "new" => s.recv.as_deref().and_then(const_to_dotted),
@@ -663,7 +663,10 @@ fn const_to_dotted(node: &Node) -> Option<String> {
 ///   `<rel>` on self, not traversing — handled by the `reads` arm.
 /// - `<rel>` bare (the recv is `Node::Send { method_name: "rel", recv: None }`
 ///   OR `Node::Lvar("rel")`) — that's the traversal entry.
-fn traversed_relation(s: &lib_ruby_parser::nodes::Send, known: &[String]) -> Option<String> {
+pub(crate) fn traversed_relation(
+    s: &lib_ruby_parser::nodes::Send,
+    known: &[String],
+) -> Option<String> {
     let recv = s.recv.as_deref()?;
     // `<rel>.each` — recv is a bare send with method == rel name and no
     // further receiver.
@@ -684,7 +687,7 @@ fn traversed_relation(s: &lib_ruby_parser::nodes::Send, known: &[String]) -> Opt
 }
 
 /// `for r in <expr>` — does `<expr>` name a known relation?
-fn node_relation_name(node: &Node, known: &[String]) -> Option<String> {
+pub(crate) fn node_relation_name(node: &Node, known: &[String]) -> Option<String> {
     match node {
         Node::Send(s) if s.recv.is_none() && known.iter().any(|r| r == &s.method_name) => {
             Some(s.method_name.clone())
