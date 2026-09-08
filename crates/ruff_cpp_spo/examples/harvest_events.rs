@@ -137,10 +137,16 @@ fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
         // raw text is accumulated and scanned for quoted runs at the closing
         // bracket, NEVER split on commas: `-DPAIR=std::pair<int,int>` is one
         // valid argument, and splitting it would silently drop the flag.
+        //
+        // The array ends at the first `]` OUTSIDE a string. A bare
+        // `contains(']')` stops early on `-I/tmp/sdk]` and keeps only the
+        // flags before it — the same silent truncation as the comma split, one
+        // level up: that one loses an argument, this one loses every argument
+        // after it.
         if let Some(acc) = collecting.as_mut() {
             acc.push_str(line);
-            if line.contains(']') {
-                argv = Some(json_string_array(acc));
+            if let Some(end) = unquoted_bracket(acc) {
+                argv = Some(json_string_array(&acc[..end]));
                 collecting = None;
             }
             continue;
@@ -152,8 +158,8 @@ fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
             cmd = Some(v);
         } else if let Some(rest) = line.strip_prefix("\"arguments\":") {
             let rest = rest.trim_start();
-            if rest.contains(']') {
-                argv = Some(json_string_array(rest));
+            if let Some(end) = unquoted_bracket(rest) {
+                argv = Some(json_string_array(&rest[..end]));
             } else {
                 collecting = Some(rest.to_string());
             }
@@ -183,6 +189,33 @@ fn parse_cc_json(text: &str) -> Vec<(PathBuf, Vec<String>)> {
 /// comma inside a string is CONTENT: `["-DPAIR=std::pair<int,int>"]` is one
 /// argument, and a comma split turns it into two invalid fragments that are
 /// then dropped, silently changing the flags a translation unit is parsed with.
+/// The byte index of the first `]` that is NOT inside a JSON string, or `None`
+/// when the array is still open.
+///
+/// Shares its string/escape state machine with [`json_string_array`], so the
+/// two agree on where a string starts and ends; a scanner that disagreed with
+/// the one doing the extraction would be a second source of truth about the
+/// same text.
+fn unquoted_bracket(text: &str) -> Option<usize> {
+    let (mut inside, mut esc) = (false, false);
+    for (i, c) in text.char_indices() {
+        if inside {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                inside = false;
+            }
+        } else if c == '"' {
+            inside = true;
+        } else if c == ']' {
+            return Some(i);
+        }
+    }
+    None
+}
+
 fn json_string_array(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -453,6 +486,51 @@ mod tests {
         assert_eq!(got, ["c++", "-DPAIR=std::pair<int,int>", "-c"]);
         // The whole point: the comma-bearing flag is ONE element, not two.
         assert_eq!(got.len(), 3, "a comma inside a string must not split it");
+    }
+
+    /// A `]` INSIDE a JSON string is content, not the end of the array. Ending
+    /// collection at the first bracket keeps only a prefix of the flags, and a
+    /// truncated flag list is a partial AST rather than an error — the same
+    /// silent-truncation class as the comma split above, one level up: that
+    /// one splits an argument, this one drops every argument after it.
+    #[test]
+    fn a_bracket_inside_an_argument_does_not_end_the_array() {
+        let db = r#"[
+{
+  "directory": "/tmp",
+  "arguments": [
+    "c++",
+    "-std=c++17",
+    "-I/tmp/sdk]",
+    "-DTAIL=1",
+    "-c",
+    "a.cpp"
+  ],
+  "file": "/tmp/a.cpp"
+}
+]"#;
+        let got = parse_cc_json(db);
+        assert_eq!(got.len(), 1, "one entry");
+        // `-DTAIL=1` sits AFTER the bracket-bearing argument, so it is exactly
+        // what an early stop loses.
+        assert_eq!(got[0].1, ["-std=c++17", "-I/tmp/sdk]", "-DTAIL=1"]);
+    }
+
+    /// The same truncation on ONE line: the array is still open after a
+    /// bracket that lives inside a string, so the remaining lines belong to it.
+    #[test]
+    fn a_bracket_inside_an_argument_does_not_close_a_single_line_array() {
+        let db = r#"[
+{
+  "directory": "/tmp",
+  "arguments": ["c++", "-I/tmp/sdk]",
+    "-DTAIL=1", "-c", "a.cpp"],
+  "file": "/tmp/a.cpp"
+}
+]"#;
+        let got = parse_cc_json(db);
+        assert_eq!(got.len(), 1, "one entry");
+        assert_eq!(got[0].1, ["-I/tmp/sdk]", "-DTAIL=1"]);
     }
 
     /// clang accepts `-I dir` as two tokens. Keeping the bare `-I` and dropping
