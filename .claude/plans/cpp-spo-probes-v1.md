@@ -523,3 +523,213 @@ adapter known-gap remains. In-crate falsifier gains
 
 - **Test count:** **58 ruff_spo_triplet + 15 ruff_cpp_spo**, all green.
   `clippy -D warnings` + fmt clean on both crates.
+
+## Update — 2026-09-07 (body-arm harvest wired end-to-end — the recipe-codebook's fifth arm lands; no corpus census yet)
+
+Commit `f068a3f` on this branch ("Harvest C++ method bodies into the recipe
+fingerprint") is a **new capability landing on the same walker these three
+probes gate**, not a new primary probe of its own — recorded here rather than
+in a new file. It closes the gap `.claude/knowledge/fuzzy-recipe-codebook.md`
+§2's coverage table has flagged since 2026-07-06: `ruff_cpp_spo` was the one
+frontend whose `method_body_arm` walker existed as a reviewed-but-dead-code
+draft (`#[allow(dead_code)] // TESTED via arm_tests; wired into CppMethod+expand
+is the follow-up`) — nothing on `CppMethod` could carry the fingerprint the
+codebook classifies on (`writes`/`reads`/`raises`/`calls` + the J1
+`guarded_writes` guard), and no `expand` arm could emit it.
+
+**What shipped (verified against the diff, file by file):**
+
+- `CppMethod` (`ruff_spo_triplet::ir`) gained the five body fields, under the
+  identical names, predicate mapping (`writes_field`/`reads_field`/`raises`/
+  `calls`/`writes_if_blank`), object encoding, and truth tiers (Authoritative
+  for `writes_field`/`raises`/`writes_if_blank`, Inferred for
+  `reads_field`/`calls`) as the Ruby/C# `Function` quartet. `expand`'s
+  `cpp_method` arm emits all five onto the per-overload method IRI; `reassemble`
+  recovers them (own-member objects stripped back to the bare member name,
+  `raises` stripped of the `exc:` namespace `expand` adds); `canonicalize_cpp`
+  sorts+dedups each Vec before the method-level round-trip compare. A new
+  cross-frontend test, `expand::tests::cpp_method_body_arm_expands_to_the_function_quartet`,
+  asserts the exact predicate/object shape on a fixture and a silence half (no
+  arm-less overload gains a body fact); `expand::tests::cpp_truth_tiers_match_calibration`
+  is extended to assert the C++ tiers match a hand-built `Function` carrying the
+  same five facts, fact-for-fact. (Correction, same day: an earlier draft of
+  this entry named `provenance_tiers_match_ruby_reference`; no test of that
+  name exists in the crate.)
+- `recipe::classify` — previously typed `fn classify(f: &Function)`, even
+  though its own doc comment already claimed to classify "Ruby hooks, Odoo
+  `_compute_*` methods, C# handlers, and C++ methods alike" — is now
+  `fn classify<F: BodyFacts + ?Sized>(f: &F)`, generic over a new `BodyFacts`
+  trait (`writes`/`reads`/`raises`/`calls`/`guarded_writes` accessors)
+  implemented for both `Function` and `CppMethod`. A new test,
+  `a_cpp_method_and_a_function_with_the_same_facts_classify_alike`, walks all
+  nine centroids (`Compensate`/`Cascade`/`Guard`/`WriteRaise`/`Default`/
+  `Compute`/`Normalize`/`Observe`/`Empty`) and asserts a `CppMethod` and a
+  `Function` carrying the identical fact-set land on the identical centroid
+  every time — so the doc's cross-frontend claim is measured, not aspirational.
+- `CppMethod` joined the DTO-surface lock as `CPP_METHOD_DTO`, and
+  `cpp_method_body_arm_keys_are_the_function_body_keys` asserts the five
+  body-arm keys sit in BOTH `FUNCTION_DTO` and `CPP_METHOD_DTO` — a rename on
+  one side now fails a test on the other before it ships.
+- The walker (`clang_walker.rs`) was corrected against three defects the
+  earlier draft's own status comment admitted it could not have caught without
+  a real TU: (1) libclang exposes no binary-operator KIND on stable, so the
+  draft recorded the LHS of ANY binary operator (`if (status_ == v)`) as a
+  write — the operator is now read off the token stream
+  (`binary_operator_spelling`); (2) the assignment target also landed in
+  `reads`, so a pure setter classified `Normalize` instead of `Compute`; (3)
+  `guarded_writes` was never populated at all, so J1 could not fire on C++.
+  Two further shapes were found only by dumping real cursors, not by reading
+  the AST docs: a class-typed member assigns through `operator=` (arrives as a
+  `CallExpr`, not a `BinaryOperator`), and a call's own callee reference is a
+  `MemberRefExpr` that would otherwise misread as a read of a field named
+  after the method.
+- `walk_tu` now parses bodies by default (`skip_function_bodies(false)`);
+  `walk_tu_configured(path, args, None)` opts back out for a faster
+  signature-only walk (arm left empty, signature plane byte-identical either
+  way — asserted by `a_signature_only_walk_leaves_the_arm_empty`).
+  `BodyArmConfig::{with_mutators, with_mutator_prefixes}` makes the
+  lifecycle-mutator vocabulary corpus-configurable, mirroring the C#
+  `--mutator-prefixes` generalization the codebook doc §2 already documents
+  (tested by `the_mutator_vocabulary_is_configurable`).
+- The arm is harvested from `Entity::get_definition()`, not the declaration
+  cursor — required because a method declared in a header and defined
+  out-of-line in a `.cpp` has its body on a DIFFERENT cursor
+  (`an_out_of_line_definition_is_harvested_through_the_declaration` pins this).
+  `walk_files` (`ruff_cpp_spo::lib`) now merges body arms across translation
+  units via a new `merge_body_arms`: first-wins stays right for the signature
+  plane (every sighting of a declaration agrees), but the header's sighting of
+  an out-of-line method is arm-less, so an already-inserted empty arm is
+  filled from a later TU that has one — keyed on `(name, param_types,
+  is_const)` so a merge can never move one overload's body onto another, and
+  never overwriting an already-non-empty arm (so the result does not depend on
+  TU visit order).
+
+**MEASURED, not merely reviewed:**
+
+- Every cursor shape the walker matches (`x_ = v`, `p.x_ = v`,
+  `this->x_ = v`, `x_ += v`, `++x_`, `arr_[i] = v`, `repo_.Save()`,
+  `name_ = s` via `operator=`, `throw E()`) is documented in `clang_walker.rs`
+  as measured against **real libclang 18** on a fixture built for each
+  construct — the module comment says so explicitly ("Every cursor shape
+  matched below was measured against libclang 18 on a fixture carrying each
+  construct, not inferred from the AST documentation"). This checkout has
+  `libclang-18.so` present (`/usr/lib/llvm-18/lib`), consistent with the
+  `#[cfg(feature = "libclang")]`-gated tests actually running here rather than
+  being reviewed-only.
+- `#[test]` counts, verified with `git show <rev>:<path> | grep -c '#\[test\]'`
+  at the commit and its parent (a static source count, NOT a `cargo
+  test`/`nextest` run — I did not run cargo, per this session's constraints):
+  `ruff_cpp_spo/src/*` goes **23 → 41** (`clang_walker.rs` alone 6 → 23;
+  `lib.rs` 17 → 18 for the new cross-TU merge test); `ruff_spo_triplet/src/*`
+  goes **170 → 176** (`ir.rs` +2, `expand.rs` +1, `reassemble.rs` +2,
+  `recipe.rs` +1). Note the plan's own last "Test count" line above (58 + 15,
+  from 2026-06-17) is now far stale relative to the parent commit's actual
+  170 / 23 — other, unrelated commits landed a great many tests on both
+  crates between 2026-06-17 and today; that drift predates and is unrelated
+  to this session's change.
+- The commit message additionally claims "every guard is disable-verified
+  red-then-green (16 checks)." I did not independently re-run the
+  disable/re-enable exercise (that needs `cargo test`, which I did not run),
+  so I cannot confirm the count of 16 myself — I can only report that the
+  commit states it, and that one specific instance is corroborated by a code
+  comment (below). The 16 is a claim about *behavioral guards*, not the same
+  number as the 24 new `#[test]` functions above (a guard and a test are not
+  1:1 — several of the new tests share one guard, and some pre-existing tests
+  were extended with new assertions against an already-counted `#[test]`).
+- Two of those 16 disable runs came back green on the first pass and were
+  investigated rather than accepted, per the commit message. **One is fully
+  explained**, in both the commit message and a code comment on
+  `a_body_defined_out_of_line_survives_the_cross_tu_dedup`
+  (`crates/ruff_cpp_spo/src/lib.rs`): the cross-TU fixture's header, parsed
+  without `-x c++`, was silently interpreted as **C** by libclang's
+  extension-based language guess, so the header's `struct Svc` failed to
+  parse as a C++ class at all — the header contributed nothing, the `.cpp`'s
+  sighting was the ONLY sighting, and first-wins (i.e. no merge at all)
+  looked like a working merge. Fixed by adding `-x c++` to the test's `args`
+  and an up-front assertion (a direct `walk_tu_with_diagnostics` call on the
+  header alone) that the header's own sighting really is arm-less, so the
+  test cannot pass unless there are genuinely two different sightings to
+  merge. The other was **a mis-aimed disable, not a
+  weak test**, and is identified here because the commit message left it
+  abstract: the target was `a_signature_only_walk_leaves_the_arm_empty`. That
+  opt-out is enforced TWICE — the TU is parsed with `skip_function_bodies`, and
+  `build_method` does not harvest — so disabling either mechanism alone leaves
+  the behaviour correct and the test green. Forcing the parse flag on turns it
+  red, and so does forcing both. That is redundancy rather than vacuity, and it
+  is now recorded in a doc comment on the test itself, so a future reader who
+  wants to drop one of the two mechanisms as dead weight learns up front that
+  no single test will notice.
+
+**NOT yet measured — stated explicitly, not by omission:**
+
+- **Correction, same day** — an earlier draft of this entry said the feature
+  had "zero corpus-scale numbers". A one-off census HAS since been run, and
+  its numbers are below. **Second correction, same day:**
+  `crates/ruff_cpp_spo/examples/harvest_ladybug.rs` now reports the body arm
+  too — the five fact totals, a full `RecipeCentroid` census, and a
+  top-classes-by-body-fact list — so the census is re-runnable rather than
+  one-off. What is still missing is a *gate*: the example prints, it does not
+  assert, so a regression would show up in the output and fail nothing. On
+  `src/include/catalog` (headers only) it reports 2424 methods, 381 with at
+  least one body fact, census `Observe=283 Compute=62 Normalize=19
+  Cascade=10 Guard=7` — and that 381 agrees exactly with an independent count
+  of body-predicate subjects in the emitted ndjson, which is the cross-check
+  that makes the census trustworthy rather than merely present.
+
+  `extract_tree` over `ladybug/src/catalog` (358 classes), every `CppMethod`
+  through `recipe::classify`:
+
+  | | `-std=c++17` | `-std=c++20` |
+  | --- | ---: | ---: |
+  | methods | 2782 | 2794 |
+  | non-`Empty` centroid | 362 (13.0%) | 577 (20.7%) |
+  | writes / reads / raises / calls | 110 / 373 / 13 / 8 | 126 / 692 / 23 / 28 |
+  | census | `Observe=253 Compute=67 Normalize=21 Guard=13 Cascade=8` | `Observe=431 Compute=74 Cascade=25 Normalize=24 Guard=23` |
+
+  **The two columns are the same corpus, one of them parsed wrongly, and the
+  gap is the finding.** `common/assert.h` needs `std::format`, so under
+  `-std=c++17` libclang emits an error diagnostic and recovers by silently
+  dropping declarations — costing a third of the body facts. That is exactly
+  the partial-AST failure mode `walk_tu_with_diagnostics`'s own doc comment
+  warns about ("0 failed from `walk_tu` alone does NOT mean the sweep is
+  complete"), reproducing on a real tree rather than in a fixture. Any future
+  corpus run must pass the standard the corpus actually needs and must read
+  the diagnostics, or it will quietly under-count.
+
+  `guarded_writes` is **0** across all 2794 methods, and that is the corpus
+  rather than the detector: a search of the whole `ladybug/src` tree finds
+  three absence tests on a member, and all three are early returns or an
+  assertion — none is a guarded write. So there is still no C++ analog of the
+  Redmine "SelfMap population 1 Default / 3 Normalize" J1 split, but the
+  reason is that this corpus does not use the lazy-init shape, not that the
+  detector failed to see it. A corpus that does use it is what the J1 hit-rate
+  question actually needs.
+
+  Still genuinely absent: a Tesseract-side run comparable to the "~97k
+  triples" C# figure, and any coarse triage PASS/FAIL or irreducible-core
+  roll.
+- The corpus-configurable mutator vocabulary
+  (`BodyArmConfig::with_mutators`/`with_mutator_prefixes`) is unit-tested but
+  has not been exercised against a real non-STL-shaped C++ persistence layer
+  the way the C# `--mutator-prefixes` generalization was measured against a
+  real production corpus.
+- J1 (`guarded_writes`) fires only on a LOCAL absence-test-guarding-the-branch
+  shape (no dominator analysis — by design, matching the Ruby/C# discipline);
+  this is unit-tested but its real-corpus hit rate on C++ is unmeasured, so
+  there is no C++ analog yet of the Redmine "SelfMap population 1 Default /
+  3 Normalize" measurement the codebook doc §3 reports.
+
+**Next probe — call it `CPP-RECIPE-CENSUS`.** The one-off numbers above are
+the first half of it; what is missing is making them re-runnable and gated.
+Run the body-arm harvest over a real corpus (Tesseract's already-pinned
+`src/ccutil` / `src/ccstruct`, or the new `harvest_ladybug.rs` target) and
+report the same shape of numbers the Ruby leg reported in
+`fuzzy-recipe-codebook.md` §4: coarse triage PASS/FAIL, the recipe-centroid
+histogram, the irreducible-core check (only `Compensate`/`WriteRaise` should
+survive the roll), and the J1 Default-vs-Normalize split — mirroring the C#
+leg's "tested end-to-end on a real production C# corpus (~97k triples)" line
+in the codebook's coverage table. Until that runs, treat "C++ recipe
+classification works" as **unit-proven and plumbed, not corpus-validated**.
+
+- **Test count (source `#[test]` attributes, not a `cargo test` run):**
+  **176 ruff_spo_triplet + 41 ruff_cpp_spo** as of this commit.

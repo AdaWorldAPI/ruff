@@ -4,8 +4,11 @@
 //! Walks a C++ corpus (Tesseract first; LLVM / Boost / `OpenCV` next) via
 //! libclang and produces a [`ModelGraph`] populated with the C++ machine-
 //! plane `Declaration` siblings the shared `ruff_spo_triplet` crate expands
-//! into the 13 C++ predicates (`inherits_from`, `template_specialises`,
-//! `virtually_overrides`, `is_pure_virtual`, …).
+//! into the C++ machine-plane predicates (`inherits_from`,
+//! `template_specialises`, `virtually_overrides`, `is_pure_virtual`, …).
+//! The exact set is whatever `expand::tests::cpp_emits_every_cpp_predicate`
+//! asserts — deliberately not restated here, because a count in prose goes
+//! stale the first time a predicate is minted and is then cited as evidence.
 //!
 //! # The harvester family
 //!
@@ -32,21 +35,26 @@
 //!   semantic transform, no re-parsing.
 //! - `walk_tu` (feature `libclang`) walks ONE translation unit via real
 //!   libclang and returns [`CppClass`] definitions (classes/bases/fields/
-//!   methods with their flags, system-header classes filtered out).
-//!   [`extract`] — the corpus-TREE orchestration over `walk_tu` — remains
-//!   `todo!()` (per-TU include resolution + cross-TU dedup). The target
-//!   triple shape is locked by `tests::locked_shape_expands_to_expected_triples`.
+//!   methods with their flags and body arm, system-header classes filtered
+//!   out). `extract_dir` / `extract_tree` walk a directory and a whole tree,
+//!   dedup classes by qualified name across translation units, and fold each
+//!   method's body arm in from whichever unit had the definition. [`extract`]
+//!   is still `todo!()`: what it adds over `extract_tree` is per-TU include
+//!   auto-detection, not the tree walk or the dedup. The target triple shape
+//!   is locked by `tests::locked_shape_expands_to_expected_triples`.
 //!
 //! # Iron rules this frontend respects
 //!
 //! - **`ruff_spo_triplet` stays serde-only.** The libclang dependency lives
-//!   here (behind a `libclang` feature, when wired), never in the shared
-//!   core.
+//!   here, behind the `libclang` feature, never in the shared core.
 //! - **No C++ source vendored into a `*-rs` target.** The corpus stays
 //!   upstream; `extract` walks it from a configurable path.
 //! - **Closed-vocab gate.** The C++ predicates are in
-//!   `ruff_spo_triplet::Predicate` under the `predicate_count_locked_at_47`
-//!   gate. A new C++ predicate is a deliberate ontology change there.
+//!   `ruff_spo_triplet::Predicate` under the `predicate_count_locked_at_79`
+//!   gate in `triple.rs` (the number moves with the vocabulary; the gate is
+//!   the test). A new C++ predicate is a deliberate ontology change there —
+//!   the method body arm added none, because it reuses the five predicates
+//!   the Ruby/Python `Function` body already emits.
 
 use std::path::Path;
 
@@ -57,10 +65,16 @@ use ruff_spo_triplet::{
 
 #[cfg(feature = "libclang")]
 mod clang_walker;
+// The ordered behavioral ore — a SECOND walk that preserves the sequence,
+// duplicates and scope structure the five-set body arm collapses. Additive:
+// nothing in `clang_walker`'s output changes. See `events`'s module doc and
+// `.claude/plans/behavioral-ore-v1.md`.
+#[cfg(feature = "libclang")]
+pub mod events;
 #[cfg(feature = "libclang")]
 pub use clang_walker::{
-    MAPPED_CURSOR_KINDS, ParseDiagnostic, WalkError, class_body_cursor_histogram, walk_enums,
-    walk_free_functions, walk_tu, walk_tu_with_diagnostics,
+    BodyArmConfig, MAPPED_CURSOR_KINDS, ParseDiagnostic, WalkError, class_body_cursor_histogram,
+    walk_enums, walk_free_functions, walk_tu, walk_tu_configured, walk_tu_with_diagnostics,
 };
 
 /// The namespace prefix for C++ machine-plane subjects/objects.
@@ -311,8 +325,14 @@ fn walk_files(files: &[std::path::PathBuf], args: &[String]) -> Result<ModelGrap
         match walk_tu(f, args) {
             Ok(classes) => {
                 for cls in classes {
-                    seen.entry(cls.qualified_name())
-                        .or_insert_with(|| model_from_class(&cls));
+                    match seen.entry(cls.qualified_name()) {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(model_from_class(&cls));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            merge_body_arms(e.get_mut(), &model_from_class(&cls));
+                        }
+                    }
                 }
             }
             Err(WalkError::Parse(_)) => {}
@@ -322,6 +342,50 @@ fn walk_files(files: &[std::path::PathBuf], args: &[String]) -> Result<ModelGrap
     let mut graph = ModelGraph::new(NAMESPACE);
     graph.models = seen.into_values().collect();
     Ok(graph)
+}
+
+/// Fold a later TU's view of an already-seen class into the kept one, taking
+/// the body arm from whichever TU actually had the body.
+///
+/// A class is normally declared once in a header and seen again in every TU
+/// that includes it, so first-wins is right for the signature plane — every
+/// sighting agrees. The body arm does NOT agree: a method declared in the
+/// header and DEFINED in a `.cpp` has an empty arm in every TU but that one,
+/// and the header is usually walked first. Without this fold the out-of-line
+/// definitions — which in a real C++ corpus is most of the interesting
+/// behaviour — would silently harvest nothing.
+///
+/// Methods are matched on `(name, param_types, is_const, ref_qualifier)`: the
+/// same identity the method IRI encodes, so a merge can never move one
+/// overload's body onto another. The ref-qualifier is load-bearing here and
+/// not decoration — `value() &` and `value() &&` agree on the first three, and
+/// without the fourth this function would copy whichever body it found first
+/// onto both. Only an EMPTY arm is filled; a non-empty one is never
+/// overwritten, so the result does not depend on which TU came first.
+#[cfg(feature = "libclang")]
+fn merge_body_arms(kept: &mut Model, incoming: &Model) {
+    for method in &mut kept.methods {
+        if !method.writes.is_empty()
+            || !method.reads.is_empty()
+            || !method.raises.is_empty()
+            || !method.calls.is_empty()
+        {
+            continue;
+        }
+        let Some(with_body) = incoming.methods.iter().find(|m| {
+            m.name == method.name
+                && m.param_types == method.param_types
+                && m.is_const == method.is_const
+                && m.ref_qualifier == method.ref_qualifier
+        }) else {
+            continue;
+        };
+        method.writes.clone_from(&with_body.writes);
+        method.reads.clone_from(&with_body.reads);
+        method.raises.clone_from(&with_body.raises);
+        method.calls.clone_from(&with_body.calls);
+        method.guarded_writes.clone_from(&with_body.guarded_writes);
+    }
 }
 
 /// The pure unpacking: build a [`Model`] from a parsed [`CppClass`] by
@@ -401,6 +465,12 @@ mod tests {
             is_const: false,
             is_static: false,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.methods.push(CppMethod {
             name: "Clear".to_string(),
@@ -415,6 +485,12 @@ mod tests {
             is_const: false,
             is_static: false,
             access: CppAccess::Public,
+            writes: Vec::new(),
+            reads: Vec::new(),
+            raises: Vec::new(),
+            calls: Vec::new(),
+            guarded_writes: Vec::new(),
+            ref_qualifier: None,
         });
         rec.templates.push(CppTemplate {
             kind: CppTemplateKind::Specialisation,
@@ -561,6 +637,12 @@ mod tests {
                     is_const: false,
                     is_static: false,
                     access: CppAccess::Public,
+                    writes: Vec::new(),
+                    reads: Vec::new(),
+                    raises: Vec::new(),
+                    calls: Vec::new(),
+                    guarded_writes: Vec::new(),
+                    ref_qualifier: None,
                 }),
                 Declaration::Template(CppTemplate {
                     kind: CppTemplateKind::Instantiation,
@@ -1002,6 +1084,165 @@ class Recognizer : public Classify {
         );
     }
 
+    /// A class declared in a header and DEFINED in a `.cpp` is seen by two
+    /// translation units: the header's sighting has the signatures and an
+    /// empty body arm, the source's has both. First-wins on the whole model
+    /// would keep the header's — so every out-of-line definition, which in a
+    /// real C++ corpus is most of the behaviour, would harvest nothing.
+    ///
+    /// Hermetic: writes its own two-file corpus, so it measures the merge and
+    /// not the availability of a real tree.
+    #[cfg(feature = "libclang")]
+    #[test]
+    fn a_body_defined_out_of_line_survives_the_cross_tu_dedup() {
+        let _guard = CLANG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "cpp_merge_body_arms_{}",
+            crate::clang_walker::fixture_salt()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // `a_header.h` sorts before `b_source.cpp`, so the arm-less sighting
+        // is the one `walk_files` inserts first — the order the merge has to
+        // survive.
+        std::fs::write(
+            dir.join("a_header.h"),
+            "struct Repo { void Save(); };\n\
+             struct Svc { int status_; Repo repo_; void finish(int v); };\n",
+        )
+        .expect("header");
+        std::fs::write(
+            dir.join("b_source.cpp"),
+            "#include \"a_header.h\"\n\
+             void Svc::finish(int v) { status_ = v; repo_.Save(); }\n",
+        )
+        .expect("source");
+
+        // `-x c++` is load-bearing: without it libclang guesses the language
+        // from the extension and parses a `.h` as C, where the header's class
+        // fails to parse at all. The header would then contribute NOTHING, the
+        // source's sighting would be the only one, and first-wins would look
+        // like a working merge. (Measured — this test passed with the merge
+        // disabled until the flag was added.)
+        let args = [
+            "-std=c++17".to_string(),
+            "-x".to_string(),
+            "c++".to_string(),
+            format!("-I{}", dir.display()),
+        ];
+
+        // Anti-vacuity: the header's own sighting must really be arm-less, or
+        // there are not two different sightings to merge and the assertions
+        // below would hold with no merge at all.
+        let (header_classes, _) = crate::walk_tu_with_diagnostics(
+            &dir.join("a_header.h"),
+            &[
+                "-std=c++17".to_string(),
+                "-x".to_string(),
+                "c++".to_string(),
+            ],
+        )
+        .expect("header walks");
+        let header_finish = header_classes
+            .iter()
+            .find(|c| c.name == "Svc")
+            .and_then(|c| {
+                c.declarations.iter().find_map(|d| match d {
+                    Declaration::Method(m) if m.name == "finish" => Some(m),
+                    _ => None,
+                })
+            })
+            .expect("the header declares finish");
+        assert!(
+            header_finish.writes.is_empty(),
+            "the header sighting must be arm-less: {:?}",
+            header_finish.writes
+        );
+
+        let graph = extract_dir(&dir, &args).expect("libclang init (LIBCLANG_PATH set)");
+        let svc = graph
+            .models
+            .iter()
+            .find(|m| m.name == "Svc")
+            .expect("Svc harvested");
+        let finish = svc
+            .methods
+            .iter()
+            .find(|m| m.name == "finish")
+            .expect("finish harvested");
+        assert_eq!(finish.writes, ["status_"], "the out-of-line body's write");
+        assert_eq!(finish.calls, ["repo_.Save"], "the out-of-line body's call");
+        // The signature plane is unaffected by the merge.
+        assert_eq!(finish.param_types, ["int"]);
+        assert_eq!(svc.methods.len(), 1, "the class is not duplicated");
+    }
+
+    /// The ref-qualifier is part of the merge key, not decoration.
+    ///
+    /// `value() &` and `value() &&` agree on name, parameter types and
+    /// cv-qualifier. Both are declared in the header with no body and defined
+    /// out of line, so both arrive at the merge with an empty arm and both
+    /// match on the first three fields. Matching on those alone copies
+    /// whichever definition `find` reaches first onto BOTH overloads.
+    #[cfg(feature = "libclang")]
+    #[test]
+    fn a_ref_qualified_overload_pair_does_not_swap_bodies_in_the_merge() {
+        let _guard = CLANG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "cpp_merge_refqual_{}",
+            crate::clang_walker::fixture_salt()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("a_header.h"),
+            "struct Holder { int lvalue_only_; int rvalue_only_; \n\
+             void value() &; void value() &&; };\n",
+        )
+        .expect("header");
+        std::fs::write(
+            dir.join("b_source.cpp"),
+            "#include \"a_header.h\"\n\
+             void Holder::value() & { lvalue_only_ = 1; }\n\
+             void Holder::value() && { rvalue_only_ = 2; }\n",
+        )
+        .expect("source");
+
+        let args = [
+            "-std=c++17".to_string(),
+            "-x".to_string(),
+            "c++".to_string(),
+            format!("-I{}", dir.display()),
+        ];
+        let graph = extract_dir(&dir, &args).expect("libclang init (LIBCLANG_PATH set)");
+        let holder = graph
+            .models
+            .iter()
+            .find(|m| m.name == "Holder")
+            .expect("Holder harvested");
+        assert_eq!(holder.methods.len(), 2, "the overloads stayed distinct");
+
+        let of = |q| {
+            holder
+                .methods
+                .iter()
+                .find(|m| m.ref_qualifier == Some(q))
+                .unwrap_or_else(|| panic!("no {q:?} overload"))
+        };
+        assert_eq!(
+            of(ruff_spo_triplet::CppRefQualifier::LValue).writes,
+            ["lvalue_only_"]
+        );
+        assert_eq!(
+            of(ruff_spo_triplet::CppRefQualifier::RValue).writes,
+            ["rvalue_only_"]
+        );
+    }
+
     /// First **ndjson emission** from a real corpus subset — gated on
     /// `TESSERACT_SRC`. Walks all of `src/ccutil` via [`extract_dir`], expands
     /// to SPO triples, serialises to ndjson, and round-trips it. The
@@ -1262,7 +1503,10 @@ class Recognizer : public Classify {
         let _guard = CLANG_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let base = std::env::temp_dir().join("ruff_cpp_spo_tree_fixture");
+        let base = std::env::temp_dir().join(format!(
+            "ruff_cpp_spo_tree_fixture_{}",
+            crate::clang_walker::fixture_salt()
+        ));
         let sub = base.join("sub");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&sub).expect("mkdir tree");
@@ -1308,7 +1552,10 @@ class Recognizer : public Classify {
         let _guard = CLANG_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let base = std::env::temp_dir().join("ruff_cpp_spo_symlink_fixture");
+        let base = std::env::temp_dir().join(format!(
+            "ruff_cpp_spo_symlink_fixture_{}",
+            crate::clang_walker::fixture_salt()
+        ));
         let sub = base.join("sub");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&sub).expect("mkdir");

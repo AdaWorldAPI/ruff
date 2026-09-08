@@ -679,12 +679,25 @@ pub struct CppField {
     pub type_name: String,
 }
 
-/// One method declaration carrying its C++ property flags.
+/// One method declaration carrying its C++ property flags — and, when the
+/// harvester saw the body, its **body arm**.
 ///
 /// Every method is classified (`rdf:type Function` + `has_function`); each
 /// set flag additionally expands to a method-property predicate. The flags
 /// are not mutually exclusive (a method can be both `constexpr` and
 /// `noexcept`, an `operator` and an `override`).
+///
+/// The five trailing `Vec` fields ([`Self::writes`] / [`Self::reads`] /
+/// [`Self::raises`] / [`Self::calls`] / [`Self::guarded_writes`]) are the
+/// C++ reading of the [`Function`] body quartet — the `(W, R, X, C)`
+/// fingerprint plus the J1 guard the recipe codebook
+/// (`.claude/knowledge/fuzzy-recipe-codebook.md`) classifies on. They expand
+/// to the SAME five predicates with the SAME object encoding and truth tiers
+/// as the Ruby/Python `Function` path, so `recipe::classify` and the OGAR
+/// `lift_actions` feed see one shape regardless of frontend. All five are
+/// `skip_serializing_if`-empty: a signature-only harvest (bodies skipped, or
+/// a declaration whose definition lives in a TU the walker never saw) leaves
+/// the ndjson byte-identical to the pre-arm shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -747,6 +760,73 @@ pub struct CppMethod {
     /// likely internal). Defaults to `Public`.
     #[serde(default)]
     pub access: CppAccess,
+    /// Own data members the body ASSIGNS (`x_ = v`, `x_ += v`, `++x_`,
+    /// `x_.operator=(v)`, and a `this->x_` spelling of each). Emitted as
+    /// `writes_field` (Authoritative — the assignment names its target).
+    /// Members of OTHER objects (`other.x_ = v`) are deliberately not
+    /// writes: the fingerprint is about *this* class's state. Sorted, deduped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    /// Own data members the body READS (any member reference that is not the
+    /// bare assignment target; compound assignment and `++` count as both a
+    /// read and a write). Emitted as `reads_field` (Inferred). Sorted, deduped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    /// Exception type names the body `throw`s, bare (`BadStatus`, not
+    /// `exc:BadStatus` — the expander adds the `exc:` namespace exactly as it
+    /// does for [`Function::raises`]). Emitted as `raises` (Authoritative).
+    /// Sorted, deduped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raises: Vec<String>,
+    /// Lifecycle-mutator calls the body dispatches, as `"<receiver>.<method>"`
+    /// (`repo_.Save`, `this.Flush`). Only the configured mutator set is
+    /// captured, mirroring [`Function::calls`] — the signal is "this method
+    /// calls a writer", not a full call graph. Emitted as `calls` (Inferred).
+    /// Sorted, deduped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<String>,
+    /// The J1 fact: own members whose write sits under an absence test on
+    /// that same member (`if (x_ == nullptr) x_ = …;`, `if (!x_) …`,
+    /// `if (x_.empty()) …`, or the else-branch of the presence form). Always a
+    /// subset of [`Self::writes`]; emitted as `writes_if_blank`
+    /// (Authoritative). Sorted, deduped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guarded_writes: Vec<String>,
+    /// `void f() &` / `void f() &&` — the ref-qualifier, part of the method's
+    /// identity rather than a property. `None` for the unqualified case. It
+    /// rides the method IRI's suffix alongside the cv-qualifier; see
+    /// [`CppRefQualifier`] for why leaving it out silently merges two
+    /// different functions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_qualifier: Option<CppRefQualifier>,
+}
+
+/// The ref-qualifier of a member function (`void f() &` / `void f() &&`).
+///
+/// Part of a method's IDENTITY, not merely a property: a class may declare
+/// both `f() &` and `f() &&` with the same name, parameter types and
+/// cv-qualifier, and they are different functions with different bodies.
+/// Without this in the method IRI the two collapse onto one node under the
+/// `(s, p, o)` dedup, and a body-arm merge then copies one overload's facts
+/// onto the other. `None` is the unqualified case, which is almost every
+/// method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CppRefQualifier {
+    /// `void f() &` — callable on an lvalue.
+    LValue,
+    /// `void f() &&` — callable on an rvalue.
+    RValue,
+}
+
+impl CppRefQualifier {
+    /// The C++ spelling, as it appears in a method IRI's suffix.
+    #[must_use]
+    pub fn spelling(self) -> &'static str {
+        match self {
+            Self::LValue => "&",
+            Self::RValue => "&&",
+        }
+    }
 }
 
 /// `constexpr` vs `consteval` compile-time markers.
@@ -872,6 +952,32 @@ mod dto_surface_tests {
         "writes",
     ];
 
+    /// The full `CppMethod` DTO surface, pinned. The five body-arm keys
+    /// (`calls`/`guarded_writes`/`raises`/`reads`/`writes`) are the C++
+    /// reading of the [`FUNCTION_DTO`] quartet + J1 fact and share its
+    /// consumers (`recipe::classify`, `ogar-from-ruff::lift_actions`); the
+    /// rest is the signature plane `ruff_cpp_codegen` reconstructs from.
+    const CPP_METHOD_DTO: &[&str] = &[
+        "access",
+        "calls",
+        "constexpr_kind",
+        "guarded_writes",
+        "is_const",
+        "is_noexcept",
+        "is_pure_virtual",
+        "is_static",
+        "name",
+        "operator_kind",
+        "overrides",
+        "param_types",
+        "raises",
+        "reads",
+        "ref_qualifier",
+        "requires_clause",
+        "return_type",
+        "writes",
+    ];
+
     /// The full `Field` DTO surface, pinned.
     const FIELD_DTO: &[&str] = &[
         "depends_on",
@@ -920,6 +1026,29 @@ mod dto_surface_tests {
         "templates",
         "validations",
     ];
+
+    fn full_cpp_method() -> CppMethod {
+        CppMethod {
+            name: "m".into(),
+            is_pure_virtual: true,
+            constexpr_kind: Some(ConstexprKind::Constexpr),
+            is_noexcept: true,
+            overrides: Some("Base::m".into()),
+            operator_kind: Some("==".into()),
+            requires_clause: Some("C<T>".into()),
+            return_type: Some("int".into()),
+            param_types: vec!["int".into()],
+            is_const: true,
+            is_static: true,
+            access: CppAccess::Public,
+            writes: vec!["w_".into()],
+            reads: vec!["r_".into()],
+            raises: vec!["E".into()],
+            calls: vec!["repo_.Save".into()],
+            guarded_writes: vec!["w_".into()],
+            ref_qualifier: Some(CppRefQualifier::LValue),
+        }
+    }
 
     fn full_function() -> Function {
         Function {
@@ -1024,20 +1153,7 @@ mod dto_surface_tests {
                 name: "m".into(),
                 type_name: "int".into(),
             }],
-            methods: vec![CppMethod {
-                name: "m".into(),
-                is_pure_virtual: true,
-                constexpr_kind: Some(ConstexprKind::Constexpr),
-                is_noexcept: true,
-                overrides: Some("Base::m".into()),
-                operator_kind: Some("==".into()),
-                requires_clause: Some("C<T>".into()),
-                return_type: Some("int".into()),
-                param_types: vec!["int".into()],
-                is_const: true,
-                is_static: true,
-                access: CppAccess::Public,
-            }],
+            methods: vec![full_cpp_method()],
             templates: vec![CppTemplate {
                 kind: CppTemplateKind::Specialisation,
                 name: "T".into(),
@@ -1066,6 +1182,25 @@ mod dto_surface_tests {
     #[test]
     fn model_dto_surface_locked() {
         assert_eq!(keys(&full_model()), MODEL_DTO);
+    }
+
+    #[test]
+    fn cpp_method_dto_surface_locked() {
+        assert_eq!(keys(&full_cpp_method()), CPP_METHOD_DTO);
+    }
+
+    /// The C++ body arm is the `Function` quartet + J1 fact under the SAME
+    /// key names, so one recipe classifier / one OGAR lift serves both
+    /// frontends. A rename on one side must bang here before it ships.
+    #[test]
+    fn cpp_method_body_arm_keys_are_the_function_body_keys() {
+        for k in ["calls", "guarded_writes", "raises", "reads", "writes"] {
+            assert!(FUNCTION_DTO.contains(&k), "`{k}` missing from FUNCTION_DTO");
+            assert!(
+                CPP_METHOD_DTO.contains(&k),
+                "`{k}` missing from CPP_METHOD_DTO"
+            );
+        }
     }
 
     #[test]

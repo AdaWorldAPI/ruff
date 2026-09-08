@@ -8,13 +8,26 @@
 //! directly into the `lance_graph` SPO store.
 //!
 //! It exists so that **business logic extracted from different source
-//! languages produces the same ontology graph**. The Python/Odoo frontend
-//! (`ruff_python_dto_check`) and a future Ruby/Rails frontend (`OpenProject`)
-//! both:
+//! languages produces the same ontology graph**. Four frontends fill the IR
+//! directly — `ruff_python_spo` (Odoo), `ruff_ruby_spo` (OpenProject/Rails),
+//! `ruff_sqlalchemy_spo` (Flask-SQLAlchemy) and `ruff_cpp_spo` (C++ via
+//! libclang) — and each one:
 //!
-//! 1. parse their own AST,
-//! 2. fill a [`ModelGraph`] (the only language-specific work), and
-//! 3. call [`expand`] + [`ndjson::to_ndjson`].
+//! 1. parses its own AST,
+//! 2. fills a [`ModelGraph`] (the only language-specific work), and
+//! 3. calls [`expand`] + [`ndjson::to_ndjson`].
+//!
+//! `ruff_csharp_spo` joins one step later: Roslyn is .NET-only, so its parse
+//! runs out of process and writes [`Triple`] ndjson directly. Its seam is the
+//! ndjson contract rather than the IR, which is why it does not name
+//! [`ModelGraph`] anywhere.
+//!
+//! Note for anyone following an older version of this paragraph: it named
+//! `ruff_python_dto_check` as the Python frontend, and Ruby as future work.
+//! Neither is so. `ruff_python_dto_check` is a separate harvester with its own
+//! JSON bundle schema; it does not depend on this crate and never builds a
+//! [`ModelGraph`]. `ruff_ruby_spo` is not future — the recipe codebook calls
+//! it the reference frontend.
 //!
 //! The triple vocabulary, the provenance/truth calibration, and the IRI
 //! shape live here once. A new language is a new frontend, not a new
@@ -22,9 +35,11 @@
 //!
 //! ```text
 //!   Python AST ─┐
-//!               ├─► ModelGraph (IR) ─► expand() ─► Vec<Triple> ─► ndjson ─► SPO store
-//!   Ruby AST  ──┘        ▲                  ▲            ▲
-//!                   language-specific   THIS CRATE   THIS CRATE
+//!   Ruby AST   ─┤
+//!   C++ AST    ─┼─► ModelGraph (IR) ─► expand() ─► Vec<Triple> ─► ndjson ─► SPO store
+//!   SQLAlchemy ─┘        ▲                  ▲            ▲            ▲
+//!                   language-specific   THIS CRATE   THIS CRATE       │
+//!   C# (Roslyn, out of process) ──────────────────────────────────────┘
 //! ```
 //!
 //! # The triple schema
@@ -80,15 +95,15 @@ pub use expand::expand;
 pub use ir::{
     ActsAs, AssocDecl, AssocKind, AttrDecl, AttrKind, Callback, ConcernKind, ConcernRef,
     ConstexprKind, CppAccess, CppBase, CppField, CppFriend, CppMacroUse, CppMethod,
-    CppStaticAssert, CppTemplate, CppTemplateKind, Delegation, DslCall, DynMethod, Field, Function,
-    GemDsl, GemKind, Model, ModelGraph, ScopeDecl, ScopeKind, StiInfo, UsingRef, Validation,
-    ValidationKind,
+    CppRefQualifier, CppStaticAssert, CppTemplate, CppTemplateKind, Delegation, DslCall, DynMethod,
+    Field, Function, GemDsl, GemKind, Model, ModelGraph, ScopeDecl, ScopeKind, StiInfo, UsingRef,
+    Validation, ValidationKind,
 };
 pub use nav_digest::build_nav_digest;
 pub use ndjson::{ParseError, from_ndjson, to_ndjson};
 pub use quad::{MenuQuad, PurposeRole, PurposeRule, classify_purpose};
 pub use reassemble::{cpp_projection, reassemble};
-pub use recipe::{RecipeCentroid, classify, is_recoverable};
+pub use recipe::{BodyFacts, RecipeCentroid, classify, is_recoverable};
 pub use region::{RegionFact, RegionSubject, region_triples};
 pub use structured_names::{
     NameGrammar, StructuredName, Tier, parse_structured_name, part_of_edges,
