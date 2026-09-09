@@ -21,6 +21,48 @@ symbol are already known, going direct is cheaper than briefing an agent.
 Never Haiku for any of it. This mirrors the grindwork/accumulation split
 already codified in the sibling `lance-graph` workspace.
 
+## Session traps (each one cost real time in this repo)
+
+**Commit BEFORE you disable, not after.** The disable-verification cycle is
+`break the guard → watch the test fail → restore`, and the restore is
+`git checkout <file>`. That reverts to the last COMMIT, not to the state you
+started from — so if the work under test is uncommitted, the restore deletes
+it. Measured: a fix plus its new test were both eaten this way, and the loss
+was only noticed because a later grep showed the old code back in place.
+Order is: commit, then disable, then checkout.
+
+**A disable that does not apply is indistinguishable from a guard that is not
+load-bearing.** Both look like "the test still passes". Twice here a patch
+script anchored on text that `cargo fmt` had since reformatted, the edit
+silently no-opped, and the green run nearly went into the record as evidence
+that a guard was inert. Always assert the replacement actually happened:
+
+```python
+assert s.count(old) == 1, "anchor moved"
+```
+
+Related: turning a knob is only a disable if the knob BINDS. Zeroing a
+constant proves nothing when the guarded quantity can reach the same outcome
+by another route, or when a different `min()` term is the binding one.
+
+**`git status` reports CLEAN, not CURRENT.** A stale branch does not merely
+give stale answers — it manufactures findings that do not exist on `main`.
+Before the first measurement in a fresh container, and after any rebase:
+
+```sh
+git fetch origin main && git log --oneline -1 origin/main
+git merge-base --is-ancestor origin/main HEAD || echo "STALE — re-measure after rebase"
+```
+
+Re-run the measurement after a rebase; a conclusion drawn before it does not
+survive it, and has previously outlived the rebase in a PR body.
+
+**A green fixture proves the shape it contains, nothing else.** Several fixes
+in this crate were correct for the case in the fixture and wrong for the case
+that was not — a bare `lines.each` fixture passing while `self.lines.each`
+was silently broken. When a fix distinguishes two shapes, the test carries
+both, and asserts they differ.
+
 ## Code Review Rules
 
 When reviewing a branch or pull request, be deliberately nitpicky. Report not
