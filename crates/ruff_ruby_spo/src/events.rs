@@ -3,7 +3,7 @@
 //!
 //! # Why this exists
 //!
-//! [`crate::functions`]'s body walker ends by collapsing its traversal into
+//! `crate::functions`'s body walker ends by collapsing its traversal into
 //! sets: `extract_functions_from_body` runs `dedup_in_place` over all six
 //! vectors of every [`ruff_spo_triplet::Function`], unconditionally. The
 //! walker visits statements in source order and then sorts that order away.
@@ -13,7 +13,7 @@
 //! method read a field five times. Those are exactly the shapes a behavioral
 //! vocabulary would be made of.
 //!
-//! The class-body side loses a different thing. [`crate::walk::walk_class_body`]
+//! The class-body side loses a different thing. `crate::walk::walk_class_body`
 //! pushes one [`crate::Declaration`] per macro in source order, and that order
 //! is real — Rails executes callbacks in declaration order — but it is an
 //! accident of a `Vec`, never an explicit fact, and it does not survive
@@ -401,7 +401,7 @@ pub struct OreScope {
 /// One declaration in a class body, at its position in the stream.
 ///
 /// This is the Rails arm. The `options` are the reason it exists: a callback's
-/// `if:` / `unless:` / `on:` is captured by [`crate::walk`] and then dropped by
+/// `if:` / `unless:` / `on:` is captured by `crate::walk` and then dropped by
 /// `ruff_spo_triplet::expand`, which emits only `phase:target`.
 #[derive(Debug, Clone)]
 pub struct RailsEvent {
@@ -677,7 +677,7 @@ impl<'s> Walk<'s> {
 
 impl Walk<'_> {
     /// Walk one body node, preserving order and structure. Mirrors the shape
-    /// recognition of [`crate::functions`]'s set walker exactly — the same
+    /// recognition of `crate::functions`'s set walker exactly — the same
     /// node patterns produce the same facts — and differs only in that every
     /// occurrence is kept, in place, inside the scope it occurred in.
     #[expect(
@@ -1186,7 +1186,7 @@ fn rails_kind(decl: &Declaration) -> RailsKind {
 /// produced it.
 ///
 /// Routing is not re-implemented: each statement goes through
-/// [`crate::walk::walk_class_body`], the one place that decides what a macro
+/// `crate::walk::walk_class_body`, the one place that decides what a macro
 /// means. This arm only records WHERE and IN WHAT ORDER — a statement that
 /// yields two declarations yields two events sharing an anchor.
 fn rails_arm(body: &Node) -> Vec<RailsEvent> {
@@ -1254,7 +1254,7 @@ fn defs_of(body: &Node, out: &mut Vec<(String, Node)>) {
 /// Walk one class body into both arms.
 ///
 /// The set counts on each [`MethodOre`] come from the SHIPPED
-/// [`crate::functions::extract_functions_from_body`] run over the very same
+/// `crate::functions::extract_functions_from_body` run over the very same
 /// body node in the very same parse — not a second parse and not a second
 /// walk, so any difference between the two views is a difference in what is
 /// preserved, never an artefact of having looked twice.
