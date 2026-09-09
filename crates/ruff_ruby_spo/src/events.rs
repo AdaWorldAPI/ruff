@@ -53,9 +53,20 @@
 //! [`MethodOre`] carries the shipped six-set counts beside the events so a
 //! consumer can compare the two views without a second parse — and, more
 //! importantly, without a second WALK, which would make any difference
-//! between them ambiguous. `events_collapse_to_the_shipped_six_sets` asserts
-//! that folding the events back into sets reproduces the shipped arm exactly:
-//! the change is about what is PRESERVED, not about what a fact IS.
+//! between them ambiguous. `events_collapse_to_the_shipped_six_sets` folds the
+//! stream back into ALL SIX sets — `reads`, `writes`, `guarded_writes`,
+//! `raises`, `traverses`, `calls` — and asserts they equal the shipped arm's:
+//! the change is
+//! about what is PRESERVED, not about what a fact IS.
+//!
+//! That holds with ONE named exception, pinned by its own test rather than
+//! left implicit. `self.foo(arg)` — an explicit-self send of an
+//! attribute-shaped name WITH arguments — is a `reads` entry on the shipped
+//! side (its self-send branch tests `is_attr_ident` and never
+//! `args.is_empty()`) and a [`EventKind::Call`] here. A send carrying
+//! arguments is not an attribute read, so this arm keeps the faithful
+//! observation; the cost is that "a strict superset of the shipped sets" is
+//! true of five sets and of `reads` everywhere except this shape.
 //!
 //! # Neutrality — the ore must not pre-solve its consumer's experiment
 //!
@@ -63,7 +74,14 @@
 //! kind. A blank-guarded default write is a [`EventKind::Condition`] carrying
 //! the predicate's own name, a [`EventKind::Branch`] carrying which arm, and a
 //! [`EventKind::Write`] — three primitives whose co-occurrence a consumer may
-//! learn to call a guard. An association walk is a [`EventKind::Read`] whose
+//! learn to call a guard. (The gate's fold rebuilds `guarded_writes` from
+//! exactly that co-occurrence, so the claim is demonstrated, not asserted.)
+//!
+//! Neutrality is not the same as discarding. The `||=` / `&&=` operator IS
+//! recorded, in `control` — because the shipped arm reads one as guarded and
+//! the other as an ordinary write, so an untagged `Write` for both would make
+//! that distinction unlearnable rather than merely un-named. The rule is:
+//! carry what the syntax certainly says, decide nothing it does not. An association walk is a [`EventKind::Read`] whose
 //! symbol happens to be interned as [`SymKind::Relation`]. Identities are
 //! carried verbatim, never hashed; different consumers hash differently.
 //!
@@ -106,7 +124,10 @@ pub enum EventKind {
     Read,
     /// An attribute write (`self.x = …`).
     Write,
-    /// A read-modify-write (`self.x += …`, `self.x ||= …`).
+    /// A read-modify-write (`self.x += …`). NOT `self.x ||= …` / `&&=`:
+    /// those are [`EventKind::Write`] tagged `or_assign` / `and_assign`,
+    /// matching the shipped arm, which records `+=` as read+write but `||=`
+    /// as write+guarded and `&&=` as write alone.
     ReadWrite,
     /// A conditional's test expression. `obj` is the predicate callee when the
     /// test is a send, so `blank?` / `present?` survive as identity.
@@ -381,8 +402,10 @@ pub struct OreEvent {
     /// Source byte offset, so lexical order stays checkable against
     /// traversal order rather than silently conflated with it.
     pub anchor: u32,
-    /// A structurally-certain relation only: which arm, which construct, a
-    /// loop's back edge. Never a successor edge.
+    /// A structurally-certain tag only: which arm, which construct, a loop's
+    /// back edge, the syntactic form that produced the event (`traversal`,
+    /// `or_assign`, `and_assign`). Never a successor edge, and never an
+    /// interpretation — every value here is readable straight off the AST.
     pub control: Option<String>,
     pub prov: Prov,
 }
@@ -720,7 +743,7 @@ impl Walk<'_> {
             }
             // `self.x ||= v` — a write, and the J1 blank-guard idiom.
             Node::OrAsgn(o) => {
-                self.op_assign(&o.recv, at);
+                self.op_assign(&o.recv, at, "or_assign");
                 self.body(&o.value);
             }
             // `self.x += v` — a read-modify-write.
@@ -741,7 +764,7 @@ impl Walk<'_> {
             }
             // `self.x &&= v` — a present-guarded write.
             Node::AndAsgn(a) => {
-                self.op_assign(&a.recv, at);
+                self.op_assign(&a.recv, at, "and_assign");
                 self.body(&a.value);
             }
             // A general send: relation walk, mutator dispatch, or neither.
@@ -1023,6 +1046,14 @@ impl Walk<'_> {
     /// A send with a non-self receiver, or none. Records the relation walk and
     /// the mutator dispatch the set walker records, then recurses.
     fn general_send(&mut self, s: &lib_ruby_parser::nodes::Send, at: u32) {
+        // Set when the traversal arm has already consumed the receiver, so
+        // the generic re-walk below does not emit a SECOND, untagged `Read`
+        // of the same name. `lines.each` is one observation — a traversal of
+        // `lines` — not a traversal plus a plain attribute read of it; the
+        // shipped arm likewise files that name under `traverses` and never
+        // under `reads`. Double-counting it would inflate `reads` with a
+        // name the fold has already attributed elsewhere.
+        let mut recv_consumed = false;
         if let Some(rel) = crate::functions::traversed_relation(s, self.known) {
             let sym = self.attr(&rel);
             self.push(
@@ -1033,6 +1064,7 @@ impl Walk<'_> {
                 Some("traversal"),
                 Prov::Parser,
             );
+            recv_consumed = true;
         } else if s.recv.is_none()
             && crate::functions::is_attr_ident(&s.method_name)
             && s.args.is_empty()
@@ -1058,7 +1090,7 @@ impl Walk<'_> {
                 Prov::Parser,
             );
         }
-        if let Some(recv) = s.recv.as_deref() {
+        if !recv_consumed && let Some(recv) = s.recv.as_deref() {
             self.body(recv);
         }
         for arg in &s.args {
@@ -1066,13 +1098,29 @@ impl Walk<'_> {
         }
     }
 
-    /// `x ||= v` / `x &&= v` on a `self` attribute — a write. The guard
-    /// semantics stay out of the alphabet: the co-occurrence is the evidence.
-    fn op_assign(&mut self, recv: &Node, at: u32) {
+    /// `x ||= v` / `x &&= v` on a `self` attribute — a write, tagged with
+    /// WHICH operator wrote it.
+    ///
+    /// The guard *semantics* stay out of the alphabet — there is still no
+    /// `GuardedWrite` kind — but the operator itself is a structurally-certain
+    /// syntactic fact, and dropping it is not neutrality, it is loss: the
+    /// shipped arm reads `||=` as a blank-guarded default (`writes` +
+    /// `guarded_writes`) and `&&=` as an ordinary write, so a bare `Write` for
+    /// both leaves that distinction unreconstructible from the ore. Tagging
+    /// the syntax lets a consumer LEARN that `or_assign` co-occurs with
+    /// guardedness; naming the event `GuardedWrite` would have decided it.
+    fn op_assign(&mut self, recv: &Node, at: u32, op: &str) {
         if let Some(field) = crate::functions::attr_of_self(recv) {
             let field = field.to_string();
             let sym = self.attr(&field);
-            self.push(EventKind::Write, Some(sym), None, at, None, Prov::Parser);
+            self.push(
+                EventKind::Write,
+                Some(sym),
+                None,
+                at,
+                Some(op),
+                Prov::Parser,
+            );
         }
     }
 
@@ -1421,82 +1469,212 @@ mod tests {
 
     // ── the additivity gate ────────────────────────────────────────────
 
+    /// Fold the ordered stream back into the shipped six sets.
+    ///
+    /// Deliberately written the way a CONSUMER would have to write it: it
+    /// reads only the ore — events, scopes, symbols — and never the AST. If
+    /// a set cannot be rebuilt from here, the ore lost it.
+    ///
+    /// Returns distinct-name counts in the shipped arm's own order:
+    /// `[reads, writes, guarded, raises, traverses, calls]`.
+    fn fold_six(syms: &Symbols, m: &MethodOre) -> [u32; 6] {
+        let name_of = |id: &Option<String>| -> Option<String> {
+            let id = id.as_ref()?;
+            syms.rows().find(|r| &r.0 == id).map(|r| r.3.to_string())
+        };
+        let own = |e: &OreEvent| -> Option<String> {
+            match subj_of(syms, e) {
+                Some((_, Role::Own, n)) => Some(n),
+                _ => None,
+            }
+        };
+        let ctl = |e: &OreEvent, want: &str| e.control.as_deref() == Some(want);
+
+        let (mut reads, mut writes, mut guarded) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut raises, mut traverses, mut calls) = (Vec::new(), Vec::new(), Vec::new());
+
+        for e in &m.events {
+            match e.kind {
+                // A traversal is a Read tagged `traversal`; the shipped arm
+                // files it under `traverses`, not `reads`.
+                EventKind::Read if ctl(e, "traversal") => traverses.extend(own(e)),
+                EventKind::Read => reads.extend(own(e)),
+                // `+=` is read AND write on the shipped side.
+                EventKind::ReadWrite => {
+                    reads.extend(own(e));
+                    writes.extend(own(e));
+                }
+                EventKind::Write => {
+                    writes.extend(own(e));
+                    // Source 1 of `guarded_writes`: `x ||= v`. Recoverable
+                    // ONLY because op_assign tags the operator — `&&=` is a
+                    // write and deliberately not guarded, and without the tag
+                    // the two are the same event.
+                    if ctl(e, "or_assign") {
+                        guarded.extend(own(e));
+                    }
+                }
+                EventKind::Raise => raises.extend(name_of(&e.obj)),
+                EventKind::Call => {
+                    if let (Some(r), Some(c)) = (name_of(&e.subj), name_of(&e.obj)) {
+                        calls.push(format!("{r}.{c}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Source 2 of `guarded_writes`: the `if`/`unless` blank-guard idiom.
+        // Rebuilt from co-occurrence exactly as the module doc promises — a
+        // Condition naming the predicate and the field, a Branch naming the
+        // arm, and a Write of that field in that arm's scope. Mirrors the
+        // shipped `claim_if_writes`, which claims only DIRECT statements of
+        // the branch, so the write's scope must be the branch scope itself.
+        for c in m.events.iter().filter(|e| e.kind == EventKind::Condition) {
+            let Some(field) = own(c) else { continue };
+            let arm = match name_of(&c.obj).as_deref() {
+                Some("blank?" | "nil?" | "empty?") => ScopeKind::Then,
+                Some("present?") => ScopeKind::Else,
+                _ => continue,
+            };
+            for sc in m
+                .scopes
+                .iter()
+                .filter(|s| s.parent == Some(c.scope) && s.kind == arm)
+            {
+                for w in m
+                    .events
+                    .iter()
+                    .filter(|e| e.kind == EventKind::Write && e.scope == sc.id)
+                {
+                    if own(w).as_deref() == Some(field.as_str()) {
+                        guarded.push(field.clone());
+                    }
+                }
+            }
+        }
+
+        let n = |mut v: Vec<String>| {
+            v.sort();
+            v.dedup();
+            u32::try_from(v.len()).unwrap()
+        };
+        [
+            n(reads),
+            n(writes),
+            n(guarded),
+            n(raises),
+            n(traverses),
+            n(calls),
+        ]
+    }
+
     /// THE gate: folding the ordered events back into sets must reproduce
-    /// the shipped six-set arm exactly. What changed is what is PRESERVED,
-    /// never what a fact IS. If this fails, the two walkers disagree about
-    /// the meaning of a body and the ordered ore is not a superset.
+    /// the shipped six-set arm exactly — all six, not the easy four. What
+    /// changed is what is PRESERVED, never what a fact IS. If this fails,
+    /// the two walkers disagree about the meaning of a body and the ordered
+    /// ore is not a superset.
+    ///
+    /// The fixture is adversarial on purpose: a repeated mutator call (the
+    /// shipped arm dedups it, so a raw event count would pass vacuously), a
+    /// relation traversal, `||=` and `&&=` side by side (the pair that is
+    /// indistinguishable without the operator tag), `+=`, and the `if`-guard
+    /// idiom (the second, co-occurrence-only source of `guarded_writes`).
     #[test]
     fn events_collapse_to_the_shipped_six_sets() {
         let (cs, syms) = ore(r"
 class Invoice < ApplicationRecord
   belongs_to :project
+  has_many :lines
   def settle
     self.total = 1
     self.total = 2
-    self.state = 'x'
-    raise ArgumentError if self.total.nil?
+    self.state ||= 'draft'
+    self.locked &&= true
+    self.count += 1
+    self.total = 0 if self.total.blank?
+    lines.each
     self.save
+    self.save
+    raise ArgumentError
   end
 end");
         let m = method(&cs[0], "settle");
-
-        let mut reads: Vec<String> = Vec::new();
-        let mut writes: Vec<String> = Vec::new();
-        let mut raises: Vec<String> = Vec::new();
-        let mut calls = 0_u32;
-        for e in &m.events {
-            match e.kind {
-                EventKind::Read | EventKind::ReadWrite => {
-                    if let Some((_, Role::Own, n)) = subj_of(&syms, e) {
-                        reads.push(n);
-                    }
-                }
-                EventKind::Raise => {
-                    if let Some(id) = &e.obj
-                        && let Some(r) = syms.rows().find(|r| &r.0 == id)
-                    {
-                        raises.push(r.3.to_string());
-                    }
-                }
-                EventKind::Call => calls += 1,
-                _ => {}
-            }
-            if matches!(e.kind, EventKind::Write | EventKind::ReadWrite)
-                && let Some((_, Role::Own, n)) = subj_of(&syms, e)
-            {
-                writes.push(n);
-            }
-        }
-        // The fold dedups; the stream did not.
-        let dedup = |mut v: Vec<String>| {
-            v.sort();
-            v.dedup();
-            v
-        };
-        assert_eq!(
-            u32::try_from(dedup(writes.clone()).len()).unwrap(),
-            m.set_writes,
-            "folded writes must equal the shipped set"
-        );
-        assert_eq!(
-            u32::try_from(dedup(reads).len()).unwrap(),
+        let got = fold_six(&syms, m);
+        let want = [
             m.set_reads,
-            "folded reads must equal the shipped set"
-        );
-        assert_eq!(
-            u32::try_from(dedup(raises).len()).unwrap(),
+            m.set_writes,
+            m.set_guarded,
             m.set_raises,
-            "folded raises must equal the shipped set"
-        );
+            m.set_traverses,
+            m.set_calls,
+        ];
         assert_eq!(
-            calls, m.set_calls,
-            "folded calls must equal the shipped set"
+            got, want,
+            "fold [reads, writes, guarded, raises, traverses, calls] must equal the shipped six sets"
         );
-        // ANTI-VACUITY: the stream must have carried MORE than the set did.
-        // Two writes to `total` collapse to one set entry; if the raw event
-        // count equalled the set count this test would be asserting nothing.
-        assert_eq!(writes.len(), 3, "three write events before dedup");
-        assert_eq!(m.set_writes, 2, "two distinct fields written");
+
+        // ANTI-VACUITY. Each of these would make some assertion above hold
+        // for the wrong reason if it were not true of this fixture.
+        let ev = |k: EventKind| m.events.iter().filter(|e| e.kind == k).count();
+        assert!(
+            ev(EventKind::Write) > want[1] as usize,
+            "more write events than distinct written fields — otherwise dedup is untested"
+        );
+        assert!(
+            ev(EventKind::Call) > want[5] as usize,
+            "the mutator call repeats — otherwise a raw count would pass"
+        );
+        assert!(
+            want[2] >= 2,
+            "both guarded_writes sources fire: `||=` and the if-idiom"
+        );
+        assert!(
+            want[4] >= 1,
+            "a traversal is present, so `traverses` is not vacuously zero"
+        );
+        assert!(
+            m.events
+                .iter()
+                .any(|e| e.control.as_deref() == Some("and_assign")),
+            "`&&=` is present and tagged — it must NOT reach guarded_writes"
+        );
+    }
+
+    /// The ONE named divergence, pinned so it cannot drift silently.
+    ///
+    /// `self.foo(arg)` — an explicit-self send of an attribute-shaped name
+    /// WITH arguments. The shipped arm files it as a `reads` entry: its
+    /// self-send branch tests `is_attr_ident(method)` with no `args.is_empty()`
+    /// guard (`functions.rs`, the third arm). The ordered arm requires empty
+    /// args and therefore emits a `Call`.
+    ///
+    /// The ore's reading is the faithful observation — a send with arguments
+    /// is not an attribute read — but that means "the fold reproduces the
+    /// shipped sets exactly" is NOT universal, and the module doc says so
+    /// rather than pretending. This test measures the delta instead of
+    /// hiding it: fix either side and it fails.
+    #[test]
+    fn self_send_with_args_is_the_one_place_the_two_walkers_disagree() {
+        let (cs, syms) = ore(r"
+class Invoice < ApplicationRecord
+  def settle
+    self.foo(1)
+  end
+end");
+        let m = method(&cs[0], "settle");
+        let got = fold_six(&syms, m);
+
+        // Shipped: one read (`foo`), no calls — `foo` is not an AR mutator.
+        assert_eq!(m.set_reads, 1, "shipped arm counts `self.foo(1)` as a read");
+        assert_eq!(m.set_calls, 0, "shipped arm records no call for it");
+        // Ore: no read, one call.
+        assert_eq!(got[0], 0, "ore emits no Read for a send carrying arguments");
+        assert_eq!(got[5], 1, "ore emits a Call instead");
+        assert!(
+            m.events.iter().any(|e| e.kind == EventKind::Call),
+            "the Call event is the ore's reading of this shape"
+        );
     }
 
     // ── order ──────────────────────────────────────────────────────────
