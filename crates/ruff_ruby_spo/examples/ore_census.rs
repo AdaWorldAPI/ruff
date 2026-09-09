@@ -13,9 +13,14 @@ use std::path::PathBuf;
 use ruff_ruby_spo::events::{EventKind, Symbols, source_ore};
 
 fn main() {
-    let root = PathBuf::from(
-        std::env::var("RAILS_SRC").unwrap_or_else(|_| "/home/user/adaworldapi/openproject".into()),
-    );
+    // Required, not defaulted. A machine-specific absolute default meant an
+    // unset variable produced a silent all-zero census with no diagnostic —
+    // measured once, in this session, and mistaken for a real result.
+    let Ok(root) = std::env::var("RAILS_SRC") else {
+        eprintln!("RAILS_SRC is unset — point it at a Rails source tree");
+        return;
+    };
+    let root = PathBuf::from(root);
     let limit: usize = std::env::var("LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -58,8 +63,18 @@ fn main() {
                 if m.scopes.len() > 1 {
                     with_multi_scope += 1;
                 }
+                // All SIX, including `set_guarded`. Summing five made the
+                // denominator too small on any corpus containing a
+                // blank-guarded default, so the preservation ratio was
+                // overstated — while `MethodOre` carried the sixth count all
+                // along.
                 set_total += u64::from(
-                    m.set_reads + m.set_writes + m.set_raises + m.set_calls + m.set_traverses,
+                    m.set_reads
+                        + m.set_writes
+                        + m.set_guarded
+                        + m.set_raises
+                        + m.set_calls
+                        + m.set_traverses,
                 );
                 for e in &m.events {
                     *kinds.entry(e.kind.as_str()).or_default() += 1;
