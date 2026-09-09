@@ -4,6 +4,76 @@ This repository contains both Ruff (a Python linter and formatter) and ty (a Pyt
 
 The `ruff_*_spo` crates (`ruff_ruby_spo`, `ruff_python_spo`, `ruff_csharp_spo`, `ruff_cpp_spo`, `ruff_spo_triplet`, …) are the AdaWorldAPI **SPO/transcode** side — AST → `(subject, predicate, object)` fact harvest feeding the OGAR transpiler. Methods for that side are curated in `.claude/knowledge/` (each with a `READ BY:` header) and applied by agents in `.claude/agents/`. **Before harvesting method-body facts or lowering a behaviour arm, read `.claude/knowledge/fuzzy-recipe-codebook.md`** — it teaches how to cook a `(verb, criteria)` recipe codebook and correlate fuzzy imperative bodies to declarative recipes, rather than transcribing bodies. The `fuzzy-proposer` agent carries that method. **Before starting (or resuming) any whole legacy-app→Rust transcode — odoo→odoo-rs, redmine/OpenProject→openproject-nexgen-rs, WoA→woa-rs (worked reference: MedCare→MedCare-rs) — read `.claude/knowledge/consumer-transcode-furnace-playbook.md`** — it frames the loop *around* the codebook: the ore/slag furnace, the two parity oracles (value + Klickwege structure), the three-axis mint gate, the no-hand-roll rule, and a per-consumer portability map.
 
+## Delegation: grindwork goes to Sonnet agents
+
+Fan mechanical work out to Sonnet subagents rather than running it on the main
+thread. The split is by SHAPE of the work, not by how hard it looks:
+
+**Sonnet agents** — find every call site of X; quote a definition; trace a
+constant's readers; check whether a symbol exists anywhere; run a scoped command
+and report the tail; census a corpus.
+
+**Main thread** — whether a review finding is actually correct; what a
+measurement means; designing a falsifier; deciding a divergence is defensible
+rather than a defect.
+
+The rule bites on SWEEPS — "every site that reads this", "does this exist",
+"which of these five shapes are real". For a single lookup where the file and
+symbol are already known, going direct is cheaper than briefing an agent.
+
+Never Haiku for any of it. This mirrors the grindwork/accumulation split
+already codified in the sibling `lance-graph` workspace.
+
+## Session traps (each one cost real time in this repo)
+
+**Commit BEFORE you disable, not after.** The disable-verification cycle is
+`break the guard → watch the test fail → restore`, and the restore is
+`git checkout <file>`. That reverts to the last COMMIT, not to the state you
+started from — so if the work under test is uncommitted, the restore deletes
+it. Measured: a fix plus its new test were both eaten this way, and the loss
+was only noticed because a later grep showed the old code back in place.
+Order is: commit, then disable, then checkout.
+
+**A disable that does not apply is indistinguishable from a guard that is not
+load-bearing.** Both look like "the test still passes". Twice here a patch
+script anchored on text that `cargo fmt` had since reformatted, the edit
+silently no-opped, and the green run nearly went into the record as evidence
+that a guard was inert. Always assert the replacement actually happened:
+
+```python
+assert s.count(old) == 1, "anchor moved"
+```
+
+Related: turning a knob is only a disable if the knob BINDS. Zeroing a
+constant proves nothing when the guarded quantity can reach the same outcome
+by another route, or when a different `min()` term is the binding one.
+
+**`git status` reports CLEAN, not CURRENT.** A stale branch does not merely
+give stale answers — it manufactures findings that do not exist on `main`.
+Before the first measurement in a fresh container, and after any rebase:
+
+```sh
+git fetch origin main && git log --oneline -1 origin/main
+git merge-base --is-ancestor origin/main HEAD || echo "STALE — re-measure after rebase"
+```
+
+Re-run the measurement after a rebase; a conclusion drawn before it does not
+survive it, and has previously outlived the rebase in a PR body.
+
+**`prek` cannot run in this sandbox, so Markdown edits ship unchecked.** The
+local `uv run --locked prek` fails on a `uv` version that cannot parse this
+repo's `exclude-newer`, so the hook set never runs here — and CI's `prek` job
+then fails on formatting the edit introduced. It has already happened once, on
+the commit that added *this* section. Avoid Markdown constructs `mdformat`
+rewrites (pipe tables are padded to the widest cell); prefer prose and bullets,
+which it leaves alone. A `prek` green on commit N says nothing about commit N+1.
+
+**A green fixture proves the shape it contains, nothing else.** Several fixes
+in this crate were correct for the case in the fixture and wrong for the case
+that was not — a bare `lines.each` fixture passing while `self.lines.each`
+was silently broken. When a fix distinguishes two shapes, the test carries
+both, and asserts they differ.
+
 ## Code Review Rules
 
 When reviewing a branch or pull request, be deliberately nitpicky. Report not
