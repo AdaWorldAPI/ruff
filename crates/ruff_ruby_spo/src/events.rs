@@ -94,7 +94,7 @@
 //! `anchor`, so lexical order stays checkable against traversal order rather
 //! than being silently conflated with it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use lib_ruby_parser::{Loc, Node};
@@ -258,6 +258,13 @@ pub enum ScopeKind {
     Rescue,
     Ensure,
     Lambda,
+    /// The argument list of a `raise`. A scope rather than a `control` tag
+    /// because the arguments nest (`raise Error, self.a.b`) and a flat tag
+    /// would mark only the outermost event. Everything under it is a real
+    /// observation that answers to NO shipped set — the shipped arm records
+    /// the exception and returns — so the fold skips this subtree instead of
+    /// counting reads the set arm never had.
+    RaiseArgs,
 }
 
 impl ScopeKind {
@@ -277,6 +284,7 @@ impl ScopeKind {
             Self::For => "For",
             Self::Rescue => "Rescue",
             Self::Ensure => "Ensure",
+            Self::RaiseArgs => "RaiseArgs",
             Self::Lambda => "Lambda",
         }
     }
@@ -732,9 +740,17 @@ impl Walk<'_> {
                             .intern(SymKind::Exception, Role::None, &name, Prov::Parser)
                     });
                 self.push(EventKind::Raise, None, exc, at, None, Prov::Parser);
+                // `raise Error, self.message` really does read `message`, and
+                // the shipped arm drops it — it records the exception and
+                // returns. Keeping the observation is the point of this arm,
+                // so the walk stays and the scope tag says where the facts
+                // came from; the fold then knows they answer to no shipped
+                // set rather than inflating `reads`.
+                self.enter(ScopeKind::RaiseArgs, at);
                 for arg in &s.args {
                     self.body(arg);
                 }
+                self.exit(at);
             }
             // `self.<x>` — write, mutator call, or read, in that priority
             // order, matching the set walker.
@@ -772,6 +788,12 @@ impl Walk<'_> {
                 self.general_send(s, at);
             }
             Node::For(f) => {
+                // Tagged `traversal`, not `iteratee`: the shipped arm files
+                // `for x in self.items` under `traverses` and never touches
+                // `reads`, and one fact must not answer to two tag names.
+                // The iteratee is NOT walked afterwards — doing so sent
+                // `self.items` through `self_send` and produced a second,
+                // untagged Read of the same relation.
                 if let Some(rel) = crate::functions::node_relation_name(&f.iteratee, self.known) {
                     let sym = self.attr(&rel);
                     self.push(
@@ -779,12 +801,11 @@ impl Walk<'_> {
                         Some(sym),
                         None,
                         at,
-                        Some("iteratee"),
+                        Some("traversal"),
                         Prov::Parser,
                     );
                 }
                 self.enter(ScopeKind::For, at);
-                self.body(&f.iteratee);
                 if let Some(b) = f.body.as_deref() {
                     self.body(b);
                 }
@@ -1026,6 +1047,12 @@ impl Walk<'_> {
             self.push(EventKind::Read, Some(sym), None, at, None, Prov::Parser);
             return;
         }
+        // The fallback: an explicit-self send that is neither a setter, nor an
+        // ActiveRecord mutator, nor an argument-free attribute read —
+        // `self.valid?`, `self.foo(1)`, `self == other`. The shipped arm
+        // records NOTHING for these (its three arms all miss), so the Call is
+        // tagged: it is a real observation, but it answers to no shipped set
+        // and must not inflate `calls`.
         let callee = self.callee(method);
         let recv = self
             .syms
@@ -1035,7 +1062,7 @@ impl Walk<'_> {
             Some(recv),
             Some(callee),
             at,
-            None,
+            Some("self_send"),
             Prov::Parser,
         );
         for arg in &s.args {
@@ -1095,6 +1122,49 @@ impl Walk<'_> {
         }
         for arg in &s.args {
             self.body(arg);
+        }
+    }
+
+    /// A method's parameters, in declaration order.
+    ///
+    /// [`EventKind::Param`] had no emitter before this: the variant was
+    /// documented, the alphabet advertised it, and a census over 5502
+    /// `OpenProject` methods measured exactly zero of them, because `defs_of`
+    /// kept only `(name, body)` and threw the argument list away. `control`
+    /// carries the parameter's syntactic kind, which is the part the AST
+    /// states with certainty — required vs optional vs splat vs keyword —
+    /// while what a default EXPRESSION does stays an ordinary walked fact.
+    fn params(&mut self, args: Option<&Node>) {
+        let Some(Node::Args(a)) = args else { return };
+        for p in &a.args {
+            let at = anchor(p);
+            let (name, kind) = match p {
+                Node::Arg(x) => (x.name.clone(), "required"),
+                Node::Optarg(x) => (x.name.clone(), "optional"),
+                Node::Restarg(x) => (x.name.clone().unwrap_or_default(), "rest"),
+                Node::Kwarg(x) => (x.name.clone(), "keyword"),
+                Node::Kwoptarg(x) => (x.name.clone(), "keyword_optional"),
+                Node::Kwrestarg(x) => (x.name.clone().unwrap_or_default(), "keyword_rest"),
+                Node::Blockarg(x) => (x.name.clone().unwrap_or_default(), "block"),
+                _ => continue,
+            };
+            let sym = self
+                .syms
+                .intern(SymKind::Param, Role::Param, &name, Prov::Parser);
+            self.push(
+                EventKind::Param,
+                Some(sym),
+                None,
+                at,
+                Some(kind),
+                Prov::Parser,
+            );
+            // A default is a real expression evaluated at call time.
+            match p {
+                Node::Optarg(x) => self.body(&x.default),
+                Node::Kwoptarg(x) => self.body(&x.default),
+                _ => {}
+            }
         }
     }
 
@@ -1267,7 +1337,7 @@ fn rails_arm(body: &Node) -> Vec<RailsEvent> {
 /// Collect every `def` in a class body, paired with the visibility the
 /// shipped walker assigns it, so the Ruby arm covers exactly the same method
 /// set the set arm does.
-fn defs_of(body: &Node, out: &mut Vec<(String, Node)>) {
+fn defs_of(body: &Node, out: &mut Vec<Node>) {
     match body {
         Node::Begin(b) => {
             for stmt in &b.statements {
@@ -1284,11 +1354,12 @@ fn defs_of(body: &Node, out: &mut Vec<(String, Node)>) {
                 defs_of(b, out);
             }
         }
-        Node::Def(d) => {
-            if let Some(b) = d.body.as_deref() {
-                out.push((d.name.clone(), b.clone()));
-            }
-        }
+        // The WHOLE `Def` node, not `(name, body)`. Keeping only the body
+        // dropped `def noop; end` entirely (the shipped extractor makes a
+        // `Function` for every `Def`, body or not) and threw away the
+        // argument list, which is why `EventKind::Param` had no emitter and
+        // measured zero across 5502 OpenProject methods.
+        Node::Def(_) => out.push(body.clone()),
         Node::Send(s) => {
             // `private def foo … end` — the def rides as an argument.
             for arg in &s.args {
@@ -1322,13 +1393,13 @@ pub fn class_ore(iri: &str, name: &str, body: &Node, syms: &mut Symbols) -> Clas
     let (public_fns, helper_fns) =
         crate::functions::extract_functions_from_body(Some(body), &decls);
     let mut sets: BTreeMap<String, (u32, bool)> = BTreeMap::new();
-    let mut set_rows: BTreeMap<String, &ruff_spo_triplet::Function> = BTreeMap::new();
+    let mut set_rows: BTreeMap<String, VecDeque<&ruff_spo_triplet::Function>> = BTreeMap::new();
     for f in &public_fns {
-        set_rows.insert(f.name.clone(), f);
+        set_rows.entry(f.name.clone()).or_default().push_back(f);
         sets.insert(f.name.clone(), (0, true));
     }
     for f in &helper_fns {
-        set_rows.insert(f.name.clone(), f);
+        set_rows.entry(f.name.clone()).or_default().push_back(f);
         sets.insert(f.name.clone(), (0, false));
     }
 
@@ -1336,12 +1407,27 @@ pub fn class_ore(iri: &str, name: &str, body: &Node, syms: &mut Symbols) -> Clas
     defs_of(body, &mut defs);
 
     let mut methods = Vec::new();
-    for (method_name, def_body) in defs {
+    for def_node in defs {
+        let Node::Def(d) = &def_node else { continue };
+        let method_name = d.name.clone();
+        let at = anchor(&def_node);
         let mut walk = Walk::new(syms, &known);
-        walk.enter(ScopeKind::Method, anchor(&def_body));
-        walk.body(&def_body);
-        walk.exit(anchor(&def_body));
-        let shipped = set_rows.get(&method_name);
+        walk.enter(ScopeKind::Method, at);
+        // Parameters first, in declaration order, before any body fact.
+        walk.params(d.args.as_deref());
+        // A body-less `def noop; end` still yields a MethodOre — the shipped
+        // extractor counts it, so omitting it would make the two arms cover
+        // different method sets.
+        if let Some(b) = d.body.as_deref() {
+            walk.body(b);
+        }
+        walk.exit(at);
+        // Popped, not looked up: a class may legally define the same name
+        // twice, and a plain `get` handed every such MethodOre the LAST
+        // definition's counts. Both arms enumerate the same body in the same
+        // order, so consuming in order pairs each ore with its own row.
+        let shipped = set_rows.get_mut(&method_name).and_then(VecDeque::pop_front);
+        let shipped = shipped.as_ref();
         let public = sets.get(&method_name).is_none_or(|(_, p)| *p);
         methods.push(MethodOre {
             iri: format!("{iri}.{method_name}"),
@@ -1490,10 +1576,35 @@ mod tests {
         };
         let ctl = |e: &OreEvent, want: &str| e.control.as_deref() == Some(want);
 
+        // Every scope that is, or descends from, a `RaiseArgs` scope. The
+        // shipped arm records a raise's exception and returns without
+        // touching its arguments, so those observations answer to no shipped
+        // set. Computed as a closure over the tree rather than a flat tag
+        // because `raise Error, self.a.b` nests.
+        let mut in_raise: Vec<u32> = Vec::new();
+        loop {
+            let before = in_raise.len();
+            for sc in &m.scopes {
+                if in_raise.contains(&sc.id) {
+                    continue;
+                }
+                let inherited = sc.parent.is_some_and(|pa| in_raise.contains(&pa));
+                if sc.kind == ScopeKind::RaiseArgs || inherited {
+                    in_raise.push(sc.id);
+                }
+            }
+            if in_raise.len() == before {
+                break;
+            }
+        }
+
         let (mut reads, mut writes, mut guarded) = (Vec::new(), Vec::new(), Vec::new());
         let (mut raises, mut traverses, mut calls) = (Vec::new(), Vec::new(), Vec::new());
 
         for e in &m.events {
+            if in_raise.contains(&e.scope) {
+                continue;
+            }
             match e.kind {
                 // A traversal is a Read tagged `traversal`; the shipped arm
                 // files it under `traverses`, not `reads`.
@@ -1515,7 +1626,9 @@ mod tests {
                     }
                 }
                 EventKind::Raise => raises.extend(name_of(&e.obj)),
-                EventKind::Call => {
+                // `self_send` marks the non-mutator explicit-self fallback,
+                // for which the shipped arm records nothing at all.
+                EventKind::Call if !ctl(e, "self_send") => {
                     if let (Some(r), Some(c)) = (name_of(&e.subj), name_of(&e.obj)) {
                         calls.push(format!("{r}.{c}"));
                     }
@@ -1586,7 +1699,7 @@ mod tests {
 class Invoice < ApplicationRecord
   belongs_to :project
   has_many :lines
-  def settle
+  def settle(amount, note = 'x')
     self.total = 1
     self.total = 2
     self.state ||= 'draft'
@@ -1594,9 +1707,13 @@ class Invoice < ApplicationRecord
     self.count += 1
     self.total = 0 if self.total.blank?
     lines.each
+    for row in lines
+      self.seen = row
+    end
+    self.valid?
     self.save
     self.save
-    raise ArgumentError
+    raise ArgumentError, self.memo
   end
 end");
         let m = method(&cs[0], "settle");
@@ -1639,6 +1756,100 @@ end");
                 .any(|e| e.control.as_deref() == Some("and_assign")),
             "`&&=` is present and tagged — it must NOT reach guarded_writes"
         );
+        // Each shape below was a real bug found in review; the fixture must
+        // actually contain it or this gate re-opens silently.
+        assert!(
+            m.events.iter().any(|e| e.kind == EventKind::Param),
+            "parameters are emitted — `EventKind::Param` had no producer at \
+             all and measured zero over 5502 real methods"
+        );
+        assert!(
+            m.scopes.iter().any(|sc| sc.kind == ScopeKind::For),
+            "a relation `for` loop is present — its iteratee must fold to \
+             `traverses`, never `reads`"
+        );
+        assert!(
+            m.scopes.iter().any(|sc| sc.kind == ScopeKind::RaiseArgs),
+            "a raise carries an argument that reads a field — the shipped arm \
+             never walks those, so they must not inflate `reads`"
+        );
+        assert!(
+            m.events
+                .iter()
+                .any(|e| e.control.as_deref() == Some("self_send")),
+            "a non-mutator explicit-self send is present — the shipped arm \
+             records nothing for it, so it must not inflate `calls`"
+        );
+    }
+
+    /// Both arms must cover the SAME method set, and parameters must exist.
+    ///
+    /// `defs_of` used to keep only `(name, body)`, which dropped every
+    /// body-less `def` — the shipped extractor builds a `Function` for each
+    /// one, so the two arms silently disagreed about which methods exist —
+    /// and threw the argument list away, leaving [`EventKind::Param`] with no
+    /// producer anywhere in the crate.
+    #[test]
+    fn every_def_yields_an_ore_and_parameters_are_emitted() {
+        let (cs, syms) = ore(r"
+class Invoice < ApplicationRecord
+  def noop; end
+  def settle(amount, note = 1, *rest, key:, opt: 2, **kw, &blk)
+    self.total = amount
+  end
+end");
+        let c = &cs[0];
+        assert_eq!(
+            c.methods.len(),
+            2,
+            "a body-less `def noop; end` still gets a MethodOre"
+        );
+        let noop = method(c, "noop");
+        assert!(
+            noop.events.iter().any(|e| e.kind == EventKind::ScopeEnter),
+            "an empty method is an empty body, not an absent method"
+        );
+
+        let m = method(c, "settle");
+        let params: Vec<(String, String)> = m
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::Param)
+            .filter_map(|e| {
+                let n = subj_of(&syms, e)?.2;
+                Some((n, e.control.clone()?))
+            })
+            .collect();
+        assert_eq!(
+            params,
+            vec![
+                ("amount".into(), "required".into()),
+                ("note".into(), "optional".into()),
+                ("rest".into(), "rest".into()),
+                ("key".into(), "keyword".into()),
+                ("opt".into(), "keyword_optional".into()),
+                ("kw".into(), "keyword_rest".into()),
+                ("blk".into(), "block".into()),
+            ],
+            "every parameter kind, in declaration order"
+        );
+        // Order is the whole point: params precede the first body fact.
+        let first_param = m.events.iter().position(|e| e.kind == EventKind::Param);
+        let first_write = m.events.iter().position(|e| e.kind == EventKind::Write);
+        assert!(first_param < first_write, "parameters come before the body");
+        // And the six-set fold still holds with parameters in the stream.
+        assert_eq!(
+            fold_six(&syms, m),
+            [
+                m.set_reads,
+                m.set_writes,
+                m.set_guarded,
+                m.set_raises,
+                m.set_traverses,
+                m.set_calls
+            ],
+            "parameters are additive — they belong to no shipped set"
+        );
     }
 
     /// The ONE named divergence, pinned so it cannot drift silently.
@@ -1668,13 +1879,33 @@ end");
         // Shipped: one read (`foo`), no calls — `foo` is not an AR mutator.
         assert_eq!(m.set_reads, 1, "shipped arm counts `self.foo(1)` as a read");
         assert_eq!(m.set_calls, 0, "shipped arm records no call for it");
-        // Ore: no read, one call.
+        // Ore: no read. The disagreement is ONE-SIDED and confined to `reads`
+        // — the ore is missing a fact the shipped arm invents, not inventing
+        // one of its own.
         assert_eq!(got[0], 0, "ore emits no Read for a send carrying arguments");
-        assert_eq!(got[5], 1, "ore emits a Call instead");
-        assert!(
-            m.events.iter().any(|e| e.kind == EventKind::Call),
-            "the Call event is the ore's reading of this shape"
+        assert_eq!(
+            got[5], 0,
+            "and the Call it does emit is tagged `self_send`, so it does NOT \
+             inflate `calls` — the shipped arm has none either"
         );
+        // The observation is still carried; only its FOLD is suppressed.
+        assert!(
+            m.events
+                .iter()
+                .any(|e| e.kind == EventKind::Call && e.control.as_deref() == Some("self_send")),
+            "the tagged Call is the ore's reading of this shape — preserved, \
+             just not answerable to a shipped set"
+        );
+        // Every other set agrees, so this really is the only disagreement.
+        let want = [
+            m.set_reads,
+            m.set_writes,
+            m.set_guarded,
+            m.set_raises,
+            m.set_traverses,
+            m.set_calls,
+        ];
+        assert_eq!(got[1..], want[1..], "only `reads` may disagree");
     }
 
     // ── order ──────────────────────────────────────────────────────────
