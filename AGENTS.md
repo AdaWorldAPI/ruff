@@ -4,6 +4,23 @@ This repository contains both Ruff (a Python linter and formatter) and ty (a Pyt
 
 The `ruff_*_spo` crates (`ruff_ruby_spo`, `ruff_python_spo`, `ruff_csharp_spo`, `ruff_cpp_spo`, `ruff_spo_triplet`, …) are the AdaWorldAPI **SPO/transcode** side — AST → `(subject, predicate, object)` fact harvest feeding the OGAR transpiler. Methods for that side are curated in `.claude/knowledge/` (each with a `READ BY:` header) and applied by agents in `.claude/agents/`. **Before harvesting method-body facts or lowering a behaviour arm, read `.claude/knowledge/fuzzy-recipe-codebook.md`** — it teaches how to cook a `(verb, criteria)` recipe codebook and correlate fuzzy imperative bodies to declarative recipes, rather than transcribing bodies. The `fuzzy-proposer` agent carries that method. **Before starting (or resuming) any whole legacy-app→Rust transcode — odoo→odoo-rs, redmine/OpenProject→openproject-nexgen-rs, WoA→woa-rs (worked reference: MedCare→MedCare-rs) — read `.claude/knowledge/consumer-transcode-furnace-playbook.md`** — it frames the loop *around* the codebook: the ore/slag furnace, the two parity oracles (value + Klickwege structure), the three-axis mint gate, the no-hand-roll rule, and a per-consumer portability map.
 
+## Delegation: grindwork goes to Sonnet agents
+
+Fan mechanical work out to Sonnet subagents rather than running it on the main
+thread. The split is by SHAPE of the work, not by how hard it looks:
+
+| | |
+|---|---|
+| **Sonnet agents** | find every call site of X; quote a definition; trace a constant's readers; check whether a symbol exists anywhere; run a scoped command and report the tail; census a corpus |
+| **Main thread** | whether a review finding is actually correct; what a measurement means; designing a falsifier; deciding a divergence is defensible rather than a defect |
+
+The rule bites on SWEEPS — "every site that reads this", "does this exist",
+"which of these five shapes are real". For a single lookup where the file and
+symbol are already known, going direct is cheaper than briefing an agent.
+
+Never Haiku for any of it. This mirrors the grindwork/accumulation split
+already codified in the sibling `lance-graph` workspace.
+
 ## Code Review Rules
 
 When reviewing a branch or pull request, be deliberately nitpicky. Report not
