@@ -1091,7 +1091,16 @@ impl Walk<'_> {
                 Some("traversal"),
                 Prov::Parser,
             );
-            recv_consumed = true;
+            // ONLY for a BARE relation receiver (`lines.each`). The shipped
+            // arm walks every receiver: a bare `lines` reaches its general
+            // Send arm and records nothing, but `self.lines` reaches its
+            // self-send arm and DOES record a read. Suppressing both was
+            // over-broad — it fixed the bare double count and silently
+            // deleted a read the set arm really has.
+            recv_consumed = matches!(
+                s.recv.as_deref(),
+                Some(Node::Send(r)) if r.recv.is_none()
+            );
         } else if s.recv.is_none()
             && crate::functions::is_attr_ident(&s.method_name)
             && s.args.is_empty()
@@ -1849,6 +1858,55 @@ end");
                 m.set_calls
             ],
             "parameters are additive — they belong to no shipped set"
+        );
+    }
+
+    /// BOTH traversal receiver forms, because they behave differently.
+    ///
+    /// The shipped arm walks every receiver. A BARE `lines` reaches its
+    /// general Send arm and records nothing; an explicit-self `self.lines`
+    /// reaches its self-send arm and records a READ. So the ore may suppress
+    /// its own receiver re-walk for the bare form only — suppressing both
+    /// (the first version of this fix) deleted a read the set arm really has,
+    /// and no fixture caught it because every traversal fixture was bare.
+    #[test]
+    fn both_traversal_receiver_forms_fold_to_the_shipped_sets() {
+        let (cs, syms) = ore(r"
+class Invoice < ApplicationRecord
+  has_many :lines
+  def bare
+    lines.each
+  end
+  def explicit
+    self.lines.each
+  end
+end");
+        for name in ["bare", "explicit"] {
+            let m = method(&cs[0], name);
+            assert_eq!(
+                fold_six(&syms, m),
+                [
+                    m.set_reads,
+                    m.set_writes,
+                    m.set_guarded,
+                    m.set_raises,
+                    m.set_traverses,
+                    m.set_calls
+                ],
+                "`{name}` traversal must fold to the shipped six sets"
+            );
+        }
+        // The two forms are NOT the same shipped fact, which is the whole
+        // reason one may be suppressed and the other may not.
+        let bare = method(&cs[0], "bare");
+        let explicit = method(&cs[0], "explicit");
+        assert_eq!(bare.set_traverses, 1, "both are traversals");
+        assert_eq!(explicit.set_traverses, 1, "both are traversals");
+        assert_eq!(bare.set_reads, 0, "a BARE receiver is not a read");
+        assert_eq!(
+            explicit.set_reads, 1,
+            "an explicit-self receiver IS a read — suppressing it would delete \
+             a shipped fact"
         );
     }
 
