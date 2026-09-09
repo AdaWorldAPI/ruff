@@ -603,15 +603,25 @@ impl<'s> Walk<'s> {
         }
     }
 
+    /// The scope the walker is currently inside. Zero is the method scope
+    /// itself, which is never pushed — so an empty stack is not an error.
     fn cur(&self) -> u32 {
         self.stack.last().copied().unwrap_or(0)
     }
 
+    /// The scope enclosing [`Self::cur`], or `None` at the method scope.
+    /// Used to link a scope to its parent so the fold can walk the chain
+    /// upwards — that is how a `Write` inside an `if` is attributed to the
+    /// branch that guards it.
     fn parent(&self) -> Option<u32> {
         let n = self.stack.len();
         (n >= 2).then(|| self.stack[n - 2])
     }
 
+    /// The sequence number the next event will carry. Events are numbered by
+    /// emission order, which IS the source order this module exists to keep;
+    /// the saturating conversion is unreachable in practice (it would need a
+    /// single method with 4 billion events) and is preferred to a panic.
     fn next_seq(&self) -> u32 {
         u32::try_from(self.events.len()).unwrap_or(u32::MAX)
     }
@@ -691,6 +701,11 @@ impl<'s> Walk<'s> {
         });
     }
 
+    /// Intern `name` as an own-role symbol, classifying it as a relation when
+    /// the class declared one under that name and as a plain attribute
+    /// otherwise. The `known` list is the class's own declarations, so the
+    /// same identifier can be a relation in one class and an attribute in
+    /// another — which is why this cannot be a free function.
     fn attr(&mut self, name: &str) -> String {
         let kind = if self.known.iter().any(|r| r == name) {
             SymKind::Relation
@@ -700,6 +715,9 @@ impl<'s> Walk<'s> {
         self.syms.intern(kind, Role::Own, name, Prov::Parser)
     }
 
+    /// Intern `name` as a call target. Callees carry no role: the receiver is
+    /// recorded separately as the event's subject, so the symbol itself is
+    /// just the method name.
     fn callee(&mut self, name: &str) -> String {
         self.syms
             .intern(SymKind::Callee, Role::None, name, Prov::Parser)
