@@ -9,10 +9,13 @@ The `ruff_*_spo` crates (`ruff_ruby_spo`, `ruff_python_spo`, `ruff_csharp_spo`, 
 Fan mechanical work out to Sonnet subagents rather than running it on the main
 thread. The split is by SHAPE of the work, not by how hard it looks:
 
-| | |
-|---|---|
-| **Sonnet agents** | find every call site of X; quote a definition; trace a constant's readers; check whether a symbol exists anywhere; run a scoped command and report the tail; census a corpus |
-| **Main thread** | whether a review finding is actually correct; what a measurement means; designing a falsifier; deciding a divergence is defensible rather than a defect |
+**Sonnet agents** — find every call site of X; quote a definition; trace a
+constant's readers; check whether a symbol exists anywhere; run a scoped command
+and report the tail; census a corpus.
+
+**Main thread** — whether a review finding is actually correct; what a
+measurement means; designing a falsifier; deciding a divergence is defensible
+rather than a defect.
 
 The rule bites on SWEEPS — "every site that reads this", "does this exist",
 "which of these five shapes are real". For a single lookup where the file and
@@ -56,6 +59,14 @@ git merge-base --is-ancestor origin/main HEAD || echo "STALE — re-measure afte
 
 Re-run the measurement after a rebase; a conclusion drawn before it does not
 survive it, and has previously outlived the rebase in a PR body.
+
+**`prek` cannot run in this sandbox, so Markdown edits ship unchecked.** The
+local `uv run --locked prek` fails on a `uv` version that cannot parse this
+repo's `exclude-newer`, so the hook set never runs here — and CI's `prek` job
+then fails on formatting the edit introduced. It has already happened once, on
+the commit that added *this* section. Avoid Markdown constructs `mdformat`
+rewrites (pipe tables are padded to the widest cell); prefer prose and bullets,
+which it leaves alone. A `prek` green on commit N says nothing about commit N+1.
 
 **A green fixture proves the shape it contains, nothing else.** Several fixes
 in this crate were correct for the case in the fixture and wrong for the case
