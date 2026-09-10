@@ -42,6 +42,7 @@ use std::path::Path;
 use clang::diagnostic::Severity;
 use clang::{
     Accessibility, Clang, Entity, EntityKind, ExceptionSpecification, Index, RefQualifier,
+    StorageClass,
 };
 use ruff_spo_triplet::{
     CppAccess, CppBase, CppField, CppFriend, CppMethod, CppRefQualifier, CppTemplate,
@@ -260,10 +261,32 @@ fn collect_functions(entity: &Entity, out: &mut Vec<CppFunction>) {
                     collect_calls(&child, &mut calls);
                     calls.sort();
                     calls.dedup();
+                    // AST-DLL signature shape, captured exactly as the class
+                    // walker captures it for a member (`void` filtered out, types
+                    // verbatim from the cursor) so the two planes agree and one
+                    // downstream manifest can read both.
+                    let return_type = child
+                        .get_result_type()
+                        .map(|t| t.get_display_name())
+                        .filter(|d| !d.is_empty() && d != "void");
+                    let param_types = child
+                        .get_arguments()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|a| a.get_type().map(|t| t.get_display_name()))
+                        .collect();
+                    // File-scope `static` is INTERNAL LINKAGE in C, not a
+                    // class-level member. `is_static_method()` answers the
+                    // member question and is false for a free function, so the
+                    // storage class is the right source here.
+                    let is_static = child.get_storage_class() == Some(StorageClass::Static);
                     out.push(CppFunction {
                         namespace: enclosing_scopes(&child),
                         name,
                         calls,
+                        return_type,
+                        param_types,
+                        is_static,
                     });
                 }
             }
@@ -2417,6 +2440,84 @@ int root(int x) { return leaf(x); }
             .unwrap_or_else(|| panic!("root missing; got {funcs:?}"));
         assert!(root.namespace.is_empty(), "namespace {:?}", root.namespace);
         assert_eq!(root.calls, vec!["leaf".to_string()]);
+    }
+
+    /// The AST-DLL signature shape for FREE functions: without these three
+    /// fields the C-library arm can name a function but not its signature, so a
+    /// downstream `MethodSig` manifest carries an empty parameter list for every
+    /// entry.
+    const FREE_FN_SIGNATURE_SRC: &str = r"
+int with_params(const char *name, int count, double scale) { return count; }
+void returns_nothing(int a) { (void)a; }
+static int tu_private(void) { return 1; }
+const char *returns_pointer(void) { return nullptr; }
+";
+
+    #[test]
+    fn free_function_signatures_are_captured_in_order() {
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("free_fn_signature", FREE_FN_SIGNATURE_SRC);
+        let funcs = walk_free_functions(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+
+        let find = |n: &str| {
+            funcs
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("{n} missing; got {funcs:?}"))
+        };
+
+        let with_params = find("with_params");
+        // Order is load-bearing: the expander encodes position in the object,
+        // so a reordered vector silently produces a different signature. A
+        // set-equality assertion here would not catch that.
+        assert_eq!(
+            with_params.param_types,
+            vec![
+                "const char *".to_string(),
+                "int".to_string(),
+                "double".to_string()
+            ]
+        );
+        assert_eq!(with_params.return_type.as_deref(), Some("int"));
+
+        // `void` is ABSENT, not `Some("void")` — the AST-DLL shape reads a
+        // missing `returns_type` as "no value returned".
+        let nothing = find("returns_nothing");
+        assert_eq!(nothing.return_type, None);
+        assert_eq!(nothing.param_types, vec!["int".to_string()]);
+
+        // A `(void)` parameter list is zero parameters, not one named `void`.
+        let ptr = find("returns_pointer");
+        assert!(ptr.param_types.is_empty(), "params {:?}", ptr.param_types);
+        assert_eq!(ptr.return_type.as_deref(), Some("const char *"));
+    }
+
+    #[test]
+    fn file_scope_static_is_reported_as_internal_linkage() {
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("free_fn_static", FREE_FN_SIGNATURE_SRC);
+        let funcs = walk_free_functions(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+
+        let find = |n: &str| {
+            funcs
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("{n} missing; got {funcs:?}"))
+        };
+        // The discriminating pair: `is_static_method()` is false for BOTH of
+        // these (neither is a member), so reading the storage class is what
+        // makes the flag carry information rather than being constant false.
+        assert!(find("tu_private").is_static, "file-scope static missed");
+        assert!(
+            !find("with_params").is_static,
+            "external linkage misreported"
+        );
     }
 
     /// Fix 3 (walker half): a TU with an unresolved `#include` still parses

@@ -148,6 +148,32 @@ pub struct CppFunction {
     /// graph. Distinct from the AR/OO `BodyArm.calls` (persistence mutators
     /// only); this is EVERY `CallExpr` callee.
     pub calls: Vec<String>,
+    /// Return type, verbatim (e.g. `bool`, `const char *`). `None` (and not
+    /// emitted) for `void` — the AST-DLL shape reads an absent `returns_type`
+    /// as "no value returned".
+    ///
+    /// Same capture as [`CppMethod::return_type`], and deliberately the same
+    /// closed-vocab predicate (`returns_type`): a free function's signature is
+    /// not a different KIND of fact from a member's, so it needs no new
+    /// predicate and no second encoding.
+    pub return_type: Option<String>,
+    /// Parameter types in signature order, verbatim — one `has_param_type`
+    /// each, positions riding the `<index>:<type>` object encoding exactly as
+    /// [`CppMethod::param_types`] does.
+    ///
+    /// Without this the C-library arm could name a function but not its
+    /// signature, so a downstream `MethodSig` manifest would carry an empty
+    /// parameter list for every entry — a signature plane with no signatures.
+    pub param_types: Vec<String>,
+    /// `static` at file scope — internal linkage, i.e. NOT part of the
+    /// library's API surface.
+    ///
+    /// This is the C meaning of `static` (translation-unit-private), which is a
+    /// different fact from [`CppMethod::is_static`]'s class-level member. It
+    /// rides the same `is_static` predicate because both answer "no implicit
+    /// receiver, not an instance-bound call"; the distinction that matters to a
+    /// transcode — is this callable from outside the TU — is the one captured.
+    pub is_static: bool,
 }
 
 /// A C or C++ enum declaration, with fully-explicit variant values.
