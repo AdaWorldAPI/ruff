@@ -67,6 +67,10 @@ ruff_cpp_codegen = { workspace = true }
 workspace = true
 
 [[example]]
+name = "harvest_openggs"
+required-features = ["libclang"]
+
+[[example]]
 name = "harvest_events"
 required-features = ["libclang"]
 # The compilation-database reader lives here and has its own unit tests, so the
