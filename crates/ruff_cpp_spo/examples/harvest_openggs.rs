@@ -139,17 +139,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // once per TU. Keeping the first sighting inside one model is a corpus
         // decision, not a dedup of occurrences.
         //
-        // The key is (name, ordered parameter types), NOT the name alone: this
-        // corpus is compiled as C++, so `f(int)` and `f(double)` are two
-        // distinct functions that a name-only key would collapse into one,
-        // silently dropping the second before it ever reached the graph. The
-        // oracle cannot catch that either — it compares a projection of the
-        // graph against an expansion of the SAME graph, and both are equally
-        // short. This key matches the identity the method IRI already uses.
+        // The key is (QUALIFIED name, ordered parameter types), and both halves
+        // are load-bearing. Parameter types, because this corpus is compiled as
+        // C++, so `f(int)` and `f(double)` are two distinct functions a
+        // name-only key would collapse into one. The qualified name, because
+        // `CppFunction::name` is bare while scope is captured separately, so
+        // `a::f(int)` and `b::f(int)` collide on the bare name — and they would
+        // then collide again in the method IRI, which is
+        // `{model_iri}.{name}({params})` with no scope component.
+        //
+        // The oracle cannot catch either collapse: it compares a projection of
+        // the graph against an expansion of the SAME graph, so both sides are
+        // equally short. The class plane already uses the qualified name for
+        // exactly this — as its dedup key in `walk_tu` and as the `Model::name`
+        // in `model_from_class` — so this mirrors an established identity
+        // rather than inventing one.
         let mut seen = BTreeSet::new();
         let mut model = Model::new(&stem);
         for f in funcs {
-            if !seen.insert((f.name.clone(), f.param_types.clone())) {
+            let identity = f.qualified_name();
+            if !seen.insert((identity.clone(), f.param_types.clone())) {
                 continue;
             }
             n_functions += 1;
@@ -165,8 +174,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the harvest directly; representing it in the shared IR would need
             // its own predicate, and that is a deliberate ontology change, not
             // something to smuggle in by overloading an existing one.
+            // The qualified name is what reaches the IR, so the method IRI
+            // carries the scope the shared `CppMethod` has no field for.
+            // Adding one would be an ontology change; a scope-qualified name is
+            // still a name, and it is how C++ itself writes the identity. At
+            // global scope this is the bare name, so a C corpus is unaffected.
             model.methods.push(CppMethod {
-                name: f.name,
+                name: identity,
                 return_type: f.return_type,
                 param_types: f.param_types,
                 ..CppMethod::default()
