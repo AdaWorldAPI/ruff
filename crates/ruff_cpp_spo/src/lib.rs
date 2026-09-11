@@ -166,14 +166,23 @@ pub struct CppFunction {
     /// signature, so a downstream `MethodSig` manifest would carry an empty
     /// parameter list for every entry — a signature plane with no signatures.
     pub param_types: Vec<String>,
-    /// `static` at file scope — internal linkage, i.e. NOT part of the
+    /// `static` at file scope — C internal linkage, i.e. NOT part of the
     /// library's API surface.
     ///
-    /// This is the C meaning of `static` (translation-unit-private), which is a
-    /// different fact from [`CppMethod::is_static`]'s class-level member. It
-    /// rides the same `is_static` predicate because both answer "no implicit
-    /// receiver, not an instance-bound call"; the distinction that matters to a
-    /// transcode — is this callable from outside the TU — is the one captured.
+    /// This is a DIFFERENT fact from `CppMethod::is_static`, which means "a
+    /// class-level member with no implicit `this`", and it must not be mapped
+    /// onto that predicate. The tempting justification — that both mean "no
+    /// implicit receiver" — does not survive contact: if it did, EVERY free
+    /// function would be `is_static`, not just the translation-unit-private
+    /// ones, and an exported C function would render as though it were an
+    /// instance method. Consumers would also have no way to recover linkage
+    /// without reinterpreting an established predicate.
+    ///
+    /// So linkage lives here, on the frontend type, and is deliberately left
+    /// out of the shared IR: the closed vocabulary has no predicate for it, and
+    /// adding one is a deliberate ontology change rather than something to
+    /// obtain by overloading. See `examples/harvest_openggs.rs` for the mapping
+    /// that omits it, and why omission is a truer encoding than either value.
     pub is_static: bool,
 }
 

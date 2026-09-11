@@ -145,11 +145,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             n_functions += 1;
+            // `CppFunction::is_static` (C internal linkage) is deliberately NOT
+            // mapped onto `CppMethod::is_static`. That predicate means "a
+            // class-level member with no implicit `this`", and a free function
+            // is not a class member at all, so neither value is a true claim
+            // about it: `true` would assert class membership, `false` would
+            // assert an implicit receiver these functions do not have. The
+            // expander emits `is_static` only when the field is true, so
+            // leaving it at the default makes NO claim — which is the honest
+            // encoding. Linkage stays on `CppFunction` for a consumer reading
+            // the harvest directly; representing it in the shared IR would need
+            // its own predicate, and that is a deliberate ontology change, not
+            // something to smuggle in by overloading an existing one.
             model.methods.push(CppMethod {
                 name: f.name,
                 return_type: f.return_type,
                 param_types: f.param_types,
-                is_static: f.is_static,
                 ..CppMethod::default()
             });
         }
