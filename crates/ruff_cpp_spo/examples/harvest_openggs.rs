@@ -53,7 +53,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use ruff_cpp_spo::{NAMESPACE, walk_free_functions};
+use ruff_cpp_spo::{NAMESPACE, walk_free_functions_with_diagnostics};
 use ruff_spo_triplet::{CppMethod, Model, ModelGraph, Triple, expand, to_ndjson};
 
 fn env_or(key: &str, default: &str) -> String {
@@ -71,6 +71,14 @@ fn translation_units(src: &PathBuf) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Run the harvest.
+///
+/// Two failure postures, deliberately different: a MISSING corpus is a printed
+/// skip and `Ok`, so this example runs on any checkout; a FAILED ORACLE is a
+/// hard error that writes nothing, because a manifest whose IRIs disagree with
+/// the triples is worse than no manifest. A translation unit that parses but
+/// emits an error diagnostic is skipped rather than harvested — see the gate in
+/// the loop for why the oracle cannot catch that case.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src = PathBuf::from(env_or("GGS_SRC", "/home/user/OpenGGS/src"));
     if !src.is_dir() {
@@ -91,20 +99,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which keys every manifest IRI differently from the expanded triples — the
     // oracle caught exactly that on the first run.
     let mut graph = ModelGraph::new(NAMESPACE);
-    let (mut n_functions, mut n_failed) = (0usize, 0usize);
+    let (mut n_functions, mut n_failed, mut n_diagnostics) = (0usize, 0usize, 0usize);
 
     for tu in &units {
         let stem = tu
             .file_stem()
             .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-        let funcs = match walk_free_functions(tu, &args) {
-            Ok(f) => f,
+        let (funcs, diagnostics) = match walk_free_functions_with_diagnostics(tu, &args) {
+            Ok(fd) => fd,
             Err(e) => {
                 eprintln!("[ggs] {stem}: parse failed: {e}");
                 n_failed += 1;
                 continue;
             }
         };
+        // A TU that parsed but emitted an error diagnostic is NOT usable ore.
+        // libclang recovers from an unresolved #include by dropping the
+        // declarations that needed it, with no Err and no marker — so the
+        // functions are simply absent, and the round-trip oracle below cannot
+        // see the loss (it compares a projection of the graph against an
+        // expansion of the SAME graph; both are equally short). Refuse the unit
+        // rather than mint a manifest from a partial parse.
+        if !diagnostics.is_empty() {
+            eprintln!(
+                "[ggs] {stem}: SKIPPED — {} error diagnostic(s); first: {}",
+                diagnostics.len(),
+                diagnostics[0]
+            );
+            for d in diagnostics.iter().skip(1).take(2) {
+                eprintln!("[ggs]     also: {d}");
+            }
+            n_diagnostics += 1;
+            continue;
+        }
         if funcs.is_empty() {
             continue;
         }
@@ -173,7 +200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(out.join("triples.ndjson"), to_ndjson(&triples))?;
 
     eprintln!(
-        "[ggs] {} TUs ({n_failed} failed to parse), {} models, {n_functions} functions",
+        "[ggs] {} TUs ({n_failed} failed to parse, {n_diagnostics} skipped on error \
+         diagnostics), {} models, {n_functions} functions",
         units.len(),
         graph.models.len()
     );

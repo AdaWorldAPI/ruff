@@ -74,7 +74,8 @@ pub mod events;
 #[cfg(feature = "libclang")]
 pub use clang_walker::{
     BodyArmConfig, MAPPED_CURSOR_KINDS, ParseDiagnostic, WalkError, class_body_cursor_histogram,
-    walk_enums, walk_free_functions, walk_tu, walk_tu_configured, walk_tu_with_diagnostics,
+    walk_enums, walk_free_functions, walk_free_functions_with_diagnostics, walk_tu,
+    walk_tu_configured, walk_tu_with_diagnostics,
 };
 
 /// The namespace prefix for C++ machine-plane subjects/objects.
