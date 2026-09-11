@@ -36,7 +36,7 @@ mod manifest;
 mod render;
 
 pub use manifest::{ClassManifest, MethodSig, decompile, is_signature_plane, project};
-pub use render::render;
+pub use render::{render, render_with_parity};
 
 #[cfg(test)]
 mod integration_tests {

@@ -136,12 +136,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         // A function DEFINED in a header reachable from several TUs is harvested
-        // once per TU. Keeping the first sighting per name inside one model is a
-        // corpus decision, not a dedup of occurrences.
+        // once per TU. Keeping the first sighting inside one model is a corpus
+        // decision, not a dedup of occurrences.
+        //
+        // The key is (name, ordered parameter types), NOT the name alone: this
+        // corpus is compiled as C++, so `f(int)` and `f(double)` are two
+        // distinct functions that a name-only key would collapse into one,
+        // silently dropping the second before it ever reached the graph. The
+        // oracle cannot catch that either — it compares a projection of the
+        // graph against an expansion of the SAME graph, and both are equally
+        // short. This key matches the identity the method IRI already uses.
         let mut seen = BTreeSet::new();
         let mut model = Model::new(&stem);
         for f in funcs {
-            if !seen.insert(f.name.clone()) {
+            if !seen.insert((f.name.clone(), f.param_types.clone())) {
                 continue;
             }
             n_functions += 1;
@@ -205,7 +213,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let out = PathBuf::from(env_or("GGS_OUT", ".claude/harvest/openggs"));
     std::fs::create_dir_all(&out)?;
-    let rendered = ruff_cpp_codegen::render(&manifests);
+    // This corpus's own parity status, not the Tesseract arm's. `render` would
+    // stamp "operator-blocked: leptonica" onto an artifact that has nothing to
+    // do with leptonica — an artifact asserting something false about its own
+    // verification is worse than one that says nothing.
+    let rendered = ruff_cpp_codegen::render_with_parity(
+        &manifests,
+        "UNRUN (no execution oracle: signatures only, bodies are hand-port)",
+    );
     std::fs::write(out.join("openggs_methods.rs"), &rendered)?;
 
     std::fs::write(out.join("triples.ndjson"), to_ndjson(&triples))?;
