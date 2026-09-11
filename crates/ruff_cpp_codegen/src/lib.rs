@@ -26,9 +26,12 @@
 //!
 //! [`decompile`] regenerates the signature-plane triples a manifest encodes;
 //! the round-trip `decompile(project(g))` must equal `expand(g)` restricted to
-//! the signature plane. That is the `codegen_spine::roundtrip_eq` pattern over
-//! the *live harvested* triples (see `manifest::tests`): a manifest that drops a
-//! method or mangles a parameter fails it. A green render run is NOT byte-parity
+//! the signature plane. That MIRRORS the `codegen_spine::roundtrip_eq` pattern
+//! over the *live harvested* triples (see `manifest::tests`): a manifest that
+//! drops a method or mangles a parameter fails it. "Mirrors", not "conforms to"
+//! — see `manifest`'s module doc for why the correspondence is unchecked.
+//!
+//! A green render run is NOT byte-parity
 //! with libtesseract (that is the operator-gated `PROBE-OGAR-ADAPTER-UNICHARSET`);
 //! every emitted file says so via its `PARITY: UNRUN` marker.
 
@@ -36,7 +39,7 @@ mod manifest;
 mod render;
 
 pub use manifest::{ClassManifest, MethodSig, decompile, is_signature_plane, project};
-pub use render::render;
+pub use render::{render, render_with_parity};
 
 #[cfg(test)]
 mod integration_tests {

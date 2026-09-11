@@ -42,6 +42,7 @@ use std::path::Path;
 use clang::diagnostic::Severity;
 use clang::{
     Accessibility, Clang, Entity, EntityKind, ExceptionSpecification, Index, RefQualifier,
+    StorageClass,
 };
 use ruff_spo_triplet::{
     CppAccess, CppBase, CppField, CppFriend, CppMethod, CppRefQualifier, CppTemplate,
@@ -197,6 +198,37 @@ pub fn walk_tu_configured(
 /// [`WalkError::Parse`] if the TU fails to parse.
 #[cfg(feature = "libclang")]
 pub fn walk_free_functions(path: &Path, args: &[String]) -> Result<Vec<CppFunction>, WalkError> {
+    walk_free_functions_with_diagnostics(path, args).map(|(functions, _)| functions)
+}
+
+/// Like [`walk_free_functions`], but also returns every libclang parse
+/// diagnostic at [`Severity::Error`] or higher (one parse, not two —
+/// [`walk_free_functions`] is a thin wrapper over this).
+///
+/// This is the free-function twin of [`walk_tu_with_diagnostics`], and it
+/// exists for the same reason, which that function's doc states for the class
+/// plane: libclang recovers from an unresolved `#include` by treating the file
+/// as successfully parsed while simply DROPPING the declarations that needed
+/// the missing header. No `Err`, no marker — the functions are just ABSENT.
+///
+/// The consequence is sharper for a harvest than for a single lookup, and
+/// sharper still when a round-trip oracle is watching: an oracle that compares
+/// a projection of the graph against an expansion of the SAME graph is blind to
+/// this, because both sides are equally missing whatever the parse dropped. It
+/// proves the projection faithful, never the harvest complete. A caller
+/// sweeping a corpus must call this and refuse the translation unit when the
+/// list is non-empty — "0 failed to parse" does NOT mean "the corpus was
+/// captured".
+///
+/// # Errors
+///
+/// [`WalkError::Libclang`] if libclang fails to initialise;
+/// [`WalkError::Parse`] if the TU fails to parse at all.
+#[cfg(feature = "libclang")]
+pub fn walk_free_functions_with_diagnostics(
+    path: &Path,
+    args: &[String],
+) -> Result<(Vec<CppFunction>, Vec<ParseDiagnostic>), WalkError> {
     let clang = Clang::new().map_err(WalkError::Libclang)?;
     let index = Index::new(&clang, false, false);
     let tu = index
@@ -206,9 +238,18 @@ pub fn walk_free_functions(path: &Path, args: &[String]) -> Result<Vec<CppFuncti
         .parse()
         .map_err(|e| WalkError::Parse(e.to_string()))?;
 
+    let diagnostics = tu
+        .get_diagnostics()
+        .into_iter()
+        .filter(|d| d.get_severity() >= Severity::Error)
+        .map(|d| ParseDiagnostic {
+            message: d.formatter().format(),
+        })
+        .collect();
+
     let mut out = Vec::new();
     collect_functions(&tu.get_entity(), &mut out);
-    Ok(out)
+    Ok((out, diagnostics))
 }
 
 /// Recurse the AST, emitting a [`CppFunction`] for every free-function
@@ -260,10 +301,32 @@ fn collect_functions(entity: &Entity, out: &mut Vec<CppFunction>) {
                     collect_calls(&child, &mut calls);
                     calls.sort();
                     calls.dedup();
+                    // AST-DLL signature shape, captured exactly as the class
+                    // walker captures it for a member (`void` filtered out, types
+                    // verbatim from the cursor) so the two planes agree and one
+                    // downstream manifest can read both.
+                    let return_type = child
+                        .get_result_type()
+                        .map(|t| t.get_display_name())
+                        .filter(|d| !d.is_empty() && d != "void");
+                    let param_types = child
+                        .get_arguments()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|a| a.get_type().map(|t| t.get_display_name()))
+                        .collect();
+                    // File-scope `static` is INTERNAL LINKAGE in C, not a
+                    // class-level member. `is_static_method()` answers the
+                    // member question and is false for a free function, so the
+                    // storage class is the right source here.
+                    let is_static = child.get_storage_class() == Some(StorageClass::Static);
                     out.push(CppFunction {
                         namespace: enclosing_scopes(&child),
                         name,
                         calls,
+                        return_type,
+                        param_types,
+                        is_static,
                     });
                 }
             }
@@ -2417,6 +2480,136 @@ int root(int x) { return leaf(x); }
             .unwrap_or_else(|| panic!("root missing; got {funcs:?}"));
         assert!(root.namespace.is_empty(), "namespace {:?}", root.namespace);
         assert_eq!(root.calls, vec!["leaf".to_string()]);
+    }
+
+    /// A TU whose `#include` cannot be resolved. libclang parses it
+    /// "successfully" and DROPS the declaration that needed the header.
+    const UNRESOLVED_INCLUDE_SRC: &str = r"
+#include <this_header_does_not_exist_anywhere.h>
+int survives(int x) { return x; }
+";
+
+    #[test]
+    fn an_unresolved_include_is_reported_as_an_error_diagnostic() {
+        // The can-it-fire half. A guard that has never been shown to trigger
+        // carries no information, and this one did not exist at all until
+        // CodeRabbit pointed out that `walk_free_functions` returned Ok on a
+        // partial parse.
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("unresolved_include", UNRESOLVED_INCLUDE_SRC);
+        let (funcs, diagnostics) =
+            walk_free_functions_with_diagnostics(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !diagnostics.is_empty(),
+            "an unresolvable include must surface as an error diagnostic; got {funcs:?}"
+        );
+        // And the point of the guard: the parse still returned Ok, so a caller
+        // that only checks the Result sees nothing wrong.
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.to_string().contains("file not found")),
+            "diagnostics {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_clean_translation_unit_reports_no_error_diagnostics() {
+        // The can-it-stay-silent half. Without this, a guard that flagged every
+        // TU would pass the test above while making the harvest reject
+        // everything — the same information content as never firing.
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("clean_tu_diags", PLAIN_FREE_FUNCTION_SRC);
+        let (funcs, diagnostics) =
+            walk_free_functions_with_diagnostics(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(diagnostics.is_empty(), "clean TU reported {diagnostics:?}");
+        assert_eq!(funcs.len(), 2, "and still harvests its functions");
+    }
+
+    /// The AST-DLL signature shape for FREE functions: without these three
+    /// fields the C-library arm can name a function but not its signature, so a
+    /// downstream `MethodSig` manifest carries an empty parameter list for every
+    /// entry.
+    const FREE_FN_SIGNATURE_SRC: &str = r"
+int with_params(const char *name, int count, double scale) { return count; }
+void returns_nothing(int a) { (void)a; }
+static int tu_private(void) { return 1; }
+const char *returns_pointer(void) { return nullptr; }
+";
+
+    #[test]
+    fn free_function_signatures_are_captured_in_order() {
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("free_fn_signature", FREE_FN_SIGNATURE_SRC);
+        let funcs = walk_free_functions(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+
+        let find = |n: &str| {
+            funcs
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("{n} missing; got {funcs:?}"))
+        };
+
+        let with_params = find("with_params");
+        // Order is load-bearing: the expander encodes position in the object,
+        // so a reordered vector silently produces a different signature. A
+        // set-equality assertion here would not catch that.
+        assert_eq!(
+            with_params.param_types,
+            vec![
+                "const char *".to_string(),
+                "int".to_string(),
+                "double".to_string()
+            ]
+        );
+        assert_eq!(with_params.return_type.as_deref(), Some("int"));
+
+        // `void` is ABSENT, not `Some("void")` — the AST-DLL shape reads a
+        // missing `returns_type` as "no value returned".
+        let nothing = find("returns_nothing");
+        assert_eq!(nothing.return_type, None);
+        assert_eq!(nothing.param_types, vec!["int".to_string()]);
+
+        // A `(void)` parameter list is zero parameters, not one named `void`.
+        let ptr = find("returns_pointer");
+        assert!(ptr.param_types.is_empty(), "params {:?}", ptr.param_types);
+        assert_eq!(ptr.return_type.as_deref(), Some("const char *"));
+    }
+
+    #[test]
+    fn file_scope_static_is_reported_as_internal_linkage() {
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("free_fn_static", FREE_FN_SIGNATURE_SRC);
+        let funcs = walk_free_functions(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+
+        let find = |n: &str| {
+            funcs
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("{n} missing; got {funcs:?}"))
+        };
+        // The discriminating pair: `is_static_method()` is false for BOTH of
+        // these (neither is a member), so reading the storage class is what
+        // makes the flag carry information rather than being constant false.
+        assert!(find("tu_private").is_static, "file-scope static missed");
+        assert!(
+            !find("with_params").is_static,
+            "external linkage misreported"
+        );
     }
 
     /// Fix 3 (walker half): a TU with an unresolved `#include` still parses

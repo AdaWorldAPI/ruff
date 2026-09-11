@@ -74,7 +74,8 @@ pub mod events;
 #[cfg(feature = "libclang")]
 pub use clang_walker::{
     BodyArmConfig, MAPPED_CURSOR_KINDS, ParseDiagnostic, WalkError, class_body_cursor_histogram,
-    walk_enums, walk_free_functions, walk_tu, walk_tu_configured, walk_tu_with_diagnostics,
+    walk_enums, walk_free_functions, walk_free_functions_with_diagnostics, walk_tu,
+    walk_tu_configured, walk_tu_with_diagnostics,
 };
 
 /// The namespace prefix for C++ machine-plane subjects/objects.
@@ -148,6 +149,65 @@ pub struct CppFunction {
     /// graph. Distinct from the AR/OO `BodyArm.calls` (persistence mutators
     /// only); this is EVERY `CallExpr` callee.
     pub calls: Vec<String>,
+    /// Return type, verbatim (e.g. `bool`, `const char *`). `None` (and not
+    /// emitted) for `void` — the AST-DLL shape reads an absent `returns_type`
+    /// as "no value returned".
+    ///
+    /// Same capture as [`CppMethod::return_type`], and deliberately the same
+    /// closed-vocab predicate (`returns_type`): a free function's signature is
+    /// not a different KIND of fact from a member's, so it needs no new
+    /// predicate and no second encoding.
+    pub return_type: Option<String>,
+    /// Parameter types in signature order, verbatim — one `has_param_type`
+    /// each, positions riding the `<index>:<type>` object encoding exactly as
+    /// [`CppMethod::param_types`] does.
+    ///
+    /// Without this the C-library arm could name a function but not its
+    /// signature, so a downstream `MethodSig` manifest would carry an empty
+    /// parameter list for every entry — a signature plane with no signatures.
+    pub param_types: Vec<String>,
+    /// `static` at file scope — C internal linkage, i.e. NOT part of the
+    /// library's API surface.
+    ///
+    /// This is a DIFFERENT fact from `CppMethod::is_static`, which means "a
+    /// class-level member with no implicit `this`", and it must not be mapped
+    /// onto that predicate. The tempting justification — that both mean "no
+    /// implicit receiver" — does not survive contact: if it did, EVERY free
+    /// function would be `is_static`, not just the translation-unit-private
+    /// ones, and an exported C function would render as though it were an
+    /// instance method. Consumers would also have no way to recover linkage
+    /// without reinterpreting an established predicate.
+    ///
+    /// So linkage lives here, on the frontend type, and is deliberately left
+    /// out of the shared IR: the closed vocabulary has no predicate for it, and
+    /// adding one is a deliberate ontology change rather than something to
+    /// obtain by overloading. See `examples/harvest_openggs.rs` for the mapping
+    /// that omits it, and why omission is a truer encoding than either value.
+    pub is_static: bool,
+}
+
+#[cfg(feature = "libclang")]
+impl CppFunction {
+    /// The fully-qualified name (`a::f`) — the free-function counterpart of
+    /// [`CppClass::qualified_name`]. Joins [`Self::namespace`] components with
+    /// `::` and appends [`Self::name`]; returns the bare name at global scope,
+    /// which is the norm for a C library.
+    ///
+    /// This, not [`Self::name`], is the function's IDENTITY. `namespace` is
+    /// captured separately by the walker (and covers an owning class scope, so
+    /// `Widget::helper` yields `["Widget"]`), so the bare name alone does not
+    /// distinguish `a::f(int)` from `b::f(int)` — two different functions that
+    /// a name-keyed consumer silently collapses into one. The class plane
+    /// already treats the qualified name this way: it is both the dedup key
+    /// (`walk_tu`) and the [`Model::name`] (`model_from_class`).
+    #[must_use]
+    pub fn qualified_name(&self) -> String {
+        if self.namespace.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}::{}", self.namespace.join("::"), self.name)
+        }
+    }
 }
 
 /// A C or C++ enum declaration, with fully-explicit variant values.
@@ -577,6 +637,57 @@ mod tests {
     fn namespace_is_cpp() {
         let triples = expand(&locked_recognizer_graph());
         assert!(triples.iter().all(|t| t.s.starts_with("cpp:")));
+    }
+
+    /// The free-function counterpart, and the reason it exists: a bare name
+    /// does not distinguish `a::f` from `b::f`, so a name-keyed dedup drops one
+    /// of them silently. Both arms are asserted — global scope must stay bare
+    /// (the C-library norm, where qualifying would change every identity) and a
+    /// namespaced pair must come out distinct.
+    #[test]
+    fn free_function_qualified_name_distinguishes_namespaces() {
+        let bare = CppFunction {
+            name: "pixScale".to_string(),
+            ..CppFunction::default()
+        };
+        assert_eq!(
+            bare.qualified_name(),
+            "pixScale",
+            "a global-scope C function must keep its bare name"
+        );
+
+        let in_a = CppFunction {
+            namespace: vec!["a".to_string()],
+            name: "f".to_string(),
+            param_types: vec!["int".to_string()],
+            ..CppFunction::default()
+        };
+        let in_b = CppFunction {
+            namespace: vec!["b".to_string()],
+            name: "f".to_string(),
+            param_types: vec!["int".to_string()],
+            ..CppFunction::default()
+        };
+        assert_eq!(in_a.qualified_name(), "a::f");
+        assert_ne!(
+            in_a.qualified_name(),
+            in_b.qualified_name(),
+            "a::f(int) and b::f(int) must not share an identity"
+        );
+        // The anti-vacuity arm: the two are indistinguishable by the key this
+        // replaces, so the qualification is load-bearing rather than cosmetic.
+        assert_eq!(
+            (&in_a.name, &in_a.param_types),
+            (&in_b.name, &in_b.param_types),
+            "the fixture no longer collides on the bare-name key it guards"
+        );
+
+        let nested = CppFunction {
+            namespace: vec!["tesseract".to_string(), "lstm".to_string()],
+            name: "helper".to_string(),
+            ..CppFunction::default()
+        };
+        assert_eq!(nested.qualified_name(), "tesseract::lstm::helper");
     }
 
     #[test]
