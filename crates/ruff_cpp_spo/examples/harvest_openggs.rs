@@ -175,6 +175,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         graph.models.push(model);
     }
 
+    // `CppFunction::calls` is deliberately NOT mapped onto `CppMethod::calls`,
+    // and unlike the `is_static` decision above this one has NO guard behind it
+    // — so the invariant is asserted here rather than described.
+    //
+    // The two fields share a name and a `Vec<String>` and mean different
+    // things: `CppFunction::calls` is EVERY `CallExpr` callee as a bare name,
+    // while `CppMethod::calls` is the closed `ActiveRecord` mutator set as
+    // `"<receiver>.<method>"` and expands to "this method calls a writer".
+    // Mapping one onto the other would mint every-callee facts as
+    // lifecycle-mutator claims, and every guard in this arm is blind to it:
+    // the compiler and clippy see the same name and type; the oracle below
+    // cannot see it because `Calls` is not on the signature plane
+    // (`ruff_cpp_codegen::is_signature_plane`); and a truth-leg check could
+    // not either, because both `Predicate::Calls` emission sites stamp
+    // `Provenance::Inferred`, so `f`/`c` are identical either way.
+    //
+    // The free-function call graph wants its own predicate — the other
+    // `walk_free_functions` consumer already prints it as `dispatches_to` —
+    // and that is a deliberate ontology change, not this example's to make.
+    assert!(
+        graph
+            .models
+            .iter()
+            .flat_map(|m| &m.methods)
+            .all(|m| m.calls.is_empty()),
+        "CppFunction::calls (every callee) must not be mapped onto          CppMethod::calls (the mutator set only)"
+    );
+
     let triples = expand(&graph);
 
     // ── THE ORACLE ───────────────────────────────────────────────────────────
