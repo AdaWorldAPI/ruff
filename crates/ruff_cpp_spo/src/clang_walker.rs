@@ -198,6 +198,37 @@ pub fn walk_tu_configured(
 /// [`WalkError::Parse`] if the TU fails to parse.
 #[cfg(feature = "libclang")]
 pub fn walk_free_functions(path: &Path, args: &[String]) -> Result<Vec<CppFunction>, WalkError> {
+    walk_free_functions_with_diagnostics(path, args).map(|(functions, _)| functions)
+}
+
+/// Like [`walk_free_functions`], but also returns every libclang parse
+/// diagnostic at [`Severity::Error`] or higher (one parse, not two —
+/// [`walk_free_functions`] is a thin wrapper over this).
+///
+/// This is the free-function twin of [`walk_tu_with_diagnostics`], and it
+/// exists for the same reason, which that function's doc states for the class
+/// plane: libclang recovers from an unresolved `#include` by treating the file
+/// as successfully parsed while simply DROPPING the declarations that needed
+/// the missing header. No `Err`, no marker — the functions are just ABSENT.
+///
+/// The consequence is sharper for a harvest than for a single lookup, and
+/// sharper still when a round-trip oracle is watching: an oracle that compares
+/// a projection of the graph against an expansion of the SAME graph is blind to
+/// this, because both sides are equally missing whatever the parse dropped. It
+/// proves the projection faithful, never the harvest complete. A caller
+/// sweeping a corpus must call this and refuse the translation unit when the
+/// list is non-empty — "0 failed to parse" does NOT mean "the corpus was
+/// captured".
+///
+/// # Errors
+///
+/// [`WalkError::Libclang`] if libclang fails to initialise;
+/// [`WalkError::Parse`] if the TU fails to parse at all.
+#[cfg(feature = "libclang")]
+pub fn walk_free_functions_with_diagnostics(
+    path: &Path,
+    args: &[String],
+) -> Result<(Vec<CppFunction>, Vec<ParseDiagnostic>), WalkError> {
     let clang = Clang::new().map_err(WalkError::Libclang)?;
     let index = Index::new(&clang, false, false);
     let tu = index
@@ -207,9 +238,18 @@ pub fn walk_free_functions(path: &Path, args: &[String]) -> Result<Vec<CppFuncti
         .parse()
         .map_err(|e| WalkError::Parse(e.to_string()))?;
 
+    let diagnostics = tu
+        .get_diagnostics()
+        .into_iter()
+        .filter(|d| d.get_severity() >= Severity::Error)
+        .map(|d| ParseDiagnostic {
+            message: d.formatter().format(),
+        })
+        .collect();
+
     let mut out = Vec::new();
     collect_functions(&tu.get_entity(), &mut out);
-    Ok(out)
+    Ok((out, diagnostics))
 }
 
 /// Recurse the AST, emitting a [`CppFunction`] for every free-function
@@ -2440,6 +2480,58 @@ int root(int x) { return leaf(x); }
             .unwrap_or_else(|| panic!("root missing; got {funcs:?}"));
         assert!(root.namespace.is_empty(), "namespace {:?}", root.namespace);
         assert_eq!(root.calls, vec!["leaf".to_string()]);
+    }
+
+    /// A TU whose `#include` cannot be resolved. libclang parses it
+    /// "successfully" and DROPS the declaration that needed the header.
+    const UNRESOLVED_INCLUDE_SRC: &str = r"
+#include <this_header_does_not_exist_anywhere.h>
+int survives(int x) { return x; }
+";
+
+    #[test]
+    fn an_unresolved_include_is_reported_as_an_error_diagnostic() {
+        // The can-it-fire half. A guard that has never been shown to trigger
+        // carries no information, and this one did not exist at all until
+        // CodeRabbit pointed out that `walk_free_functions` returned Ok on a
+        // partial parse.
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("unresolved_include", UNRESOLVED_INCLUDE_SRC);
+        let (funcs, diagnostics) =
+            walk_free_functions_with_diagnostics(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !diagnostics.is_empty(),
+            "an unresolvable include must surface as an error diagnostic; got {funcs:?}"
+        );
+        // And the point of the guard: the parse still returned Ok, so a caller
+        // that only checks the Result sees nothing wrong.
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.to_string().contains("file not found")),
+            "diagnostics {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_clean_translation_unit_reports_no_error_diagnostics() {
+        // The can-it-stay-silent half. Without this, a guard that flagged every
+        // TU would pass the test above while making the harvest reject
+        // everything — the same information content as never firing.
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("clean_tu_diags", PLAIN_FREE_FUNCTION_SRC);
+        let (funcs, diagnostics) =
+            walk_free_functions_with_diagnostics(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(diagnostics.is_empty(), "clean TU reported {diagnostics:?}");
+        assert_eq!(funcs.len(), 2, "and still harvests its functions");
     }
 
     /// The AST-DLL signature shape for FREE functions: without these three
