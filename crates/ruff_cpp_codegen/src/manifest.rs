@@ -24,8 +24,19 @@
 //! method, mangles a parameter, loses a return type, or misses an override edge
 //! produces a different `(s, p, o)` set and fails the round-trip. This is the
 //! `codegen_spine::roundtrip_eq` pattern (project → decompile → compare against
-//! the live harvested triples), implemented over `ruff_spo_triplet::Triple` so
+//! the live harvested triples), reimplemented over `ruff_spo_triplet::Triple` so
 //! the codegen crate stays `ruff_spo_triplet`-only (no lance-graph edge).
+//!
+//! **The correspondence is asserted, not checked, and is known to be partial.**
+//! `roundtrip_eq` lives in `lance-graph-contract`, which this crate deliberately
+//! does not depend on, so nothing here can call it and nothing fails if the two
+//! drift. One divergence is already known: `roundtrip_eq`'s truth leg is
+//! documented as always run (`0.0` does not skip it), while the comparison here
+//! keys on `(s, p, o)` and drops `f`/`c`. That is sound for this plane only
+//! because `expand` and `decompile` assign identical provenance to all seven
+//! signature predicates — a property of the current expander, not a guarantee.
+//! Read every `roundtrip_eq` mention in this crate as naming the pattern being
+//! copied, never as a verified equivalence.
 
 use ruff_spo_triplet::{CppMethod, ModelGraph, Predicate, Provenance, Triple};
 
@@ -252,8 +263,9 @@ mod tests {
     }
 
     /// The teeth: regenerating the signature plane from the projected manifest
-    /// equals `expand`'s signature-plane output for the same graph. This is the
-    /// `codegen_spine::roundtrip_eq` pattern over the live harvested triples.
+    /// equals `expand`'s signature-plane output for the same graph. This mirrors
+    /// the `codegen_spine::roundtrip_eq` pattern over the live harvested triples
+    /// (unchecked correspondence — see the module doc).
     #[test]
     fn decompile_roundtrips_signature_plane_against_expand() {
         let g = fixture();
