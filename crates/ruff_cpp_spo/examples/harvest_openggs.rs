@@ -200,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .flat_map(|m| &m.methods)
             .all(|m| m.calls.is_empty()),
-        "CppFunction::calls (every callee) must not be mapped onto          CppMethod::calls (the mutator set only)"
+        "CppFunction::calls is every callee; CppMethod::calls is the mutator set only"
     );
 
     let triples = expand(&graph);

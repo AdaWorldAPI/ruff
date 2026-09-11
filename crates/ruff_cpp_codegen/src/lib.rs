@@ -29,7 +29,9 @@
 //! the signature plane. That MIRRORS the `codegen_spine::roundtrip_eq` pattern
 //! over the *live harvested* triples (see `manifest::tests`): a manifest that
 //! drops a method or mangles a parameter fails it. "Mirrors", not "conforms to"
-//! — see `manifest`'s module doc for why the correspondence is unchecked. A green render run is NOT byte-parity
+//! — see `manifest`'s module doc for why the correspondence is unchecked.
+//!
+//! A green render run is NOT byte-parity
 //! with libtesseract (that is the operator-gated `PROBE-OGAR-ADAPTER-UNICHARSET`);
 //! every emitted file says so via its `PARITY: UNRUN` marker.
 
