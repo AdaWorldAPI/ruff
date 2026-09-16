@@ -147,6 +147,8 @@ pub enum ScopeKind {
 }
 
 impl ScopeKind {
+    /// The wire spelling — `PascalCase`, like [`EventKind::as_str`]. Stable:
+    /// consumers match on it.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Function => "Function",
@@ -188,6 +190,13 @@ pub enum SymKind {
 }
 
 impl SymKind {
+    /// The wire spelling. Stable — consumers match on it.
+    ///
+    /// LOWERCASE, unlike the structural [`EventKind`] / [`ScopeKind`]
+    /// vocabularies: the symbol-table triple ([`SymKind`], [`Role`], [`Prov`])
+    /// is lowercase throughout. `SymKind` and `Role` also both spell `param`
+    /// and `local`, so a consumer joining on the string alone must carry the
+    /// column it came from.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Member => "member",
@@ -217,6 +226,9 @@ pub enum Role {
 }
 
 impl Role {
+    /// The wire spelling — lowercase, like [`SymKind::as_str`]. Stable:
+    /// consumers match on it. Shares `param` and `local` with [`SymKind`]; the
+    /// two columns are only unambiguous together.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Own => "own",
@@ -241,6 +253,9 @@ pub enum Prov {
 }
 
 impl Prov {
+    /// The wire spelling — lowercase. Stable: consumers match on it, and it is
+    /// the column a consumer reads to say how much of what it consumed the
+    /// compiler actually answered.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Clang => "clang",
@@ -322,6 +337,13 @@ pub struct Symbols {
 }
 
 impl Symbols {
+    /// Interns `name` under (`kind`, `role`) and returns its stable `sN` id.
+    ///
+    /// The key is the TRIPLE, not the name: one spelling under a different
+    /// [`SymKind`] or [`Role`] is a different symbol and gets its own id.
+    /// Only the FIRST `prov` is kept — re-interning an existing key returns
+    /// early, so a later, better-attested sighting ([`Prov::Clang`] after
+    /// [`Prov::Walk`]) does NOT upgrade the recorded provenance.
     pub fn intern(&mut self, kind: SymKind, role: Role, name: &str, prov: Prov) -> String {
         let key = (kind, role, name.to_string());
         if let Some(id) = self.index.get(&key) {
@@ -333,6 +355,9 @@ impl Symbols {
         format!("s{id}")
     }
 
+    /// Every interned symbol in insertion order, each carrying the same `sN`
+    /// id [`intern`](Self::intern) returned. The index IS the id, so iteration
+    /// order is id order.
     pub fn rows(&self) -> impl Iterator<Item = (String, SymKind, Role, &str, Prov)> {
         self.rows
             .iter()
@@ -340,10 +365,13 @@ impl Symbols {
             .map(|(i, (k, r, n, p))| (format!("s{i}"), *k, *r, n.as_str(), *p))
     }
 
+    /// How many DISTINCT symbols have been interned — rows, not calls to
+    /// [`intern`](Self::intern), which is idempotent per key.
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
+    /// Whether nothing has been interned yet.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
