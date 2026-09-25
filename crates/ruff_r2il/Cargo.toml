@@ -7,7 +7,7 @@ publish = false
 # pinned by hand to satisfy BOTH sides: ruff (edition 2024, rust-version per the workspace
 # Cargo.toml, toolchain per rust-toolchain.toml) and r2sleigh (edition 2024).
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.98.1"
 description = "R2IL intake arm: a lossless ore carrier over r2sleigh's r2il/r2ssa object graph, a furnace that melts it into flat facet-addressed concern rows, and an addressed residual (slag) ledger. Ore in, named slag out — no catch-all, nothing dropped."
 
 [lib]

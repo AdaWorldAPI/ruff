@@ -3,7 +3,7 @@ name = "ruff_cpp_spo"
 version = "0.1.0"
 publish = false
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.98.1"
 description = "C++ machine-plane frontend for ruff_spo_triplet. Walks a C++ corpus (Tesseract first) via libclang and fills a language-agnostic ModelGraph, which expands to the same SPO triples as the Python/Odoo and Ruby/Rails frontends. The per-TU walker (`walk_tu`, behind the `libclang` feature) is implemented and tested against real libclang, as are the corpus-tree walkers (`extract_dir`, `extract_tree`); only per-TU include-arg auto-detection (`extract`) remains. C++ source corpora stay UPSTREAM — never vendored into this repo or into tesseract-rs."
 license = "MIT"
 
