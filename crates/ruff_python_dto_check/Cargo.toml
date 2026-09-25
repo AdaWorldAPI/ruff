@@ -3,7 +3,7 @@ name = "ruff_python_dto_check"
 version = "0.1.0"
 publish = false
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.98.1"
 description = "Config-driven extractor over ruff_python_parser. Harvests structured DTO/route/handler facts from a Python source tree into JSON bundles, with a preflight that proposes a config from the tree itself. Additive consumer; touches no other crate."
 license = "MIT"
 

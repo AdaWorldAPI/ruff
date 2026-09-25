@@ -3,7 +3,7 @@ name = "ruff_ruby_spo"
 version = "0.1.0"
 publish = false
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.98.1"
 description = "SCAFFOLD: Ruby/Rails (OpenProject) frontend for ruff_spo_triplet. Walks an app/models tree and fills a language-agnostic ModelGraph, which expands to the same SPO triples as the Python/Odoo frontend. Extraction points are todo!() stubs documented with the exact Rails construct to read; the target triple shape is already locked by a passing test."
 license = "MIT"
 
