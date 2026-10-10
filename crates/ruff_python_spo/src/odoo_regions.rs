@@ -206,10 +206,12 @@ impl ArchTag {
     }
 }
 
-/// One `ir.ui.view` record: its screen label, the local part of its xml id,
-/// its parent's local id (extension views), and its arch-body tags.
+/// One `ir.ui.view` record: its screen label, its xml id both module-qualified
+/// and local, its parent's qualified xml id (extension views), and its
+/// arch-body tags.
 struct ViewRec {
     screen: String,
+    qualified_id: String,
     local_id: String,
     inherit: Option<String>,
     arch: Vec<ArchTag>,
@@ -220,8 +222,26 @@ fn local_id(id: &str) -> String {
     id.rsplit_once('.').map_or(id, |(_, l)| l).to_string()
 }
 
+/// The module a scanned file belongs to: the first component of its path
+/// relative to the addons root (`account/views/x.xml` → `account`), or `""`
+/// when the path has no directory component.
+fn module_of(rel: &str) -> &str {
+    rel.split_once('/').map_or("", |(m, _)| m)
+}
+
+/// An xml id qualified by `module` unless it already names one: Odoo resolves
+/// an unqualified `ref` in the module that declares it.
+fn qualify(id: &str, module: &str) -> String {
+    if id.contains('.') {
+        id.to_string()
+    } else {
+        format!("{module}.{id}")
+    }
+}
+
 /// Split one file into view records, each with its arch-body tags.
 fn collect_views(content: &str, rel: &str, out: &mut Vec<ViewRec>) {
+    let module = module_of(rel);
     let mut cur: Option<ViewRec> = None;
     let mut in_arch = false;
     let mut depth = 0usize;
@@ -231,6 +251,7 @@ fn collect_views(content: &str, rel: &str, out: &mut Vec<ViewRec>) {
                 out.extend(cur.take());
                 cur = id.map(|i| ViewRec {
                     screen: format!("{rel}#{i}"),
+                    qualified_id: qualify(&i, module),
                     local_id: local_id(&i),
                     inherit: None,
                     arch: Vec::new(),
@@ -243,7 +264,7 @@ fn collect_views(content: &str, rel: &str, out: &mut Vec<ViewRec>) {
             }
             ArchTag::InheritRef(r) => {
                 if !in_arch && let Some(v) = cur.as_mut() {
-                    v.inherit = Some(local_id(&r));
+                    v.inherit = Some(qualify(&r, module));
                 }
             }
             ArchTag::ArchOpen { self_closing } => {
@@ -494,10 +515,7 @@ fn walk(view: &ViewRec, parent: &[Anchor]) -> (Vec<RegionFact>, Vec<Anchor>) {
 /// Resolve every view (parents first, through `inherit_id`) and return the
 /// region facts in view order.
 fn regions_of_views(views: &[ViewRec]) -> Vec<RegionFact> {
-    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (i, v) in views.iter().enumerate() {
-        index.entry(v.local_id.as_str()).or_insert(i);
-    }
+    let index = ParentIndex::new(views);
     let mut resolved: Vec<Option<(Vec<RegionFact>, Vec<Anchor>)>> = vec![None; views.len()];
     let mut visiting = vec![false; views.len()];
     for i in 0..views.len() {
@@ -509,13 +527,48 @@ fn regions_of_views(views: &[ViewRec]) -> Vec<RegionFact> {
         .collect()
 }
 
+/// Parent lookup for `inherit_id`. A parent is found by its module-qualified
+/// xml id; when no scanned view carries that exact id (a fixture without
+/// module directories, or a parent outside the scanned modules), the local
+/// part is accepted only if exactly one scanned view has it. An ambiguous
+/// local id stays unresolved rather than picking another module's view.
+struct ParentIndex<'a> {
+    qualified: std::collections::HashMap<&'a str, usize>,
+    /// Local id → the single view carrying it, or `None` if several do.
+    local: std::collections::HashMap<&'a str, Option<usize>>,
+}
+
+impl<'a> ParentIndex<'a> {
+    fn new(views: &'a [ViewRec]) -> Self {
+        let mut qualified = std::collections::HashMap::new();
+        let mut local: std::collections::HashMap<&str, Option<usize>> =
+            std::collections::HashMap::new();
+        for (i, v) in views.iter().enumerate() {
+            qualified.entry(v.qualified_id.as_str()).or_insert(i);
+            local
+                .entry(v.local_id.as_str())
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(i));
+        }
+        Self { qualified, local }
+    }
+
+    fn get(&self, inherit: &str) -> Option<usize> {
+        if let Some(&i) = self.qualified.get(inherit) {
+            return Some(i);
+        }
+        let (_, l) = inherit.rsplit_once('.')?;
+        self.local.get(l).copied().flatten()
+    }
+}
+
 /// Resolve view `i` after its parent; its anchors are its own followed by the
 /// parent chain's. A cycle in `inherit_id` resolves the repeated view with no
 /// parent anchors instead of looping.
 fn resolve_view(
     i: usize,
     views: &[ViewRec],
-    index: &std::collections::HashMap<&str, usize>,
+    index: &ParentIndex<'_>,
     resolved: &mut Vec<Option<(Vec<RegionFact>, Vec<Anchor>)>>,
     visiting: &mut Vec<bool>,
 ) {
@@ -526,7 +579,7 @@ fn resolve_view(
     let parent = views[i]
         .inherit
         .as_deref()
-        .and_then(|p| index.get(p).copied())
+        .and_then(|p| index.get(p))
         .filter(|&p| p != i);
     let parent_anchors = match parent {
         Some(p) => {
@@ -605,14 +658,20 @@ fn xpath_target(expr: &str) -> Option<(String, Option<String>)> {
     Some((tag.to_string(), name))
 }
 
-/// The value of an `@name='…'` / `@name="…"` equality inside an xpath
-/// predicate.
+/// The value of a predicate that is exactly one `[@name='…']` /
+/// `[@name="…"]` equality. Anything more (a second predicate, `and`/`or`,
+/// `not(…)`, a position) is `None`.
 fn name_in_predicate(pred: &str) -> Option<String> {
-    let rest = &pred[pred.find("@name")? + "@name".len()..];
-    let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+    let inner = pred.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let rest = inner.strip_prefix("@name")?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
     let quote = rest.chars().next().filter(|q| *q == '\'' || *q == '"')?;
     let body = &rest[1..];
-    Some(body[..body.find(quote)?].to_string())
+    let end = body.find(quote)?;
+    if !body[end + 1..].trim().is_empty() {
+        return None;
+    }
+    Some(body[..end].to_string())
 }
 
 /// All arch-relevant tags in `content`, in byte-position order. Every `<…>` is
@@ -1105,6 +1164,57 @@ mod tests {
         );
     }
 
+    /// Two modules each define `view_form` with the anchor field in a
+    /// different container; each module's extension must dock against its OWN
+    /// parent, not the first-scanned one.
+    #[test]
+    fn inherit_id_resolves_against_the_qualified_parent() {
+        let parent = |container: &str| {
+            format!(
+                r#"<odoo><record id="view_form" model="ir.ui.view"><field name="arch" type="xml">
+<form><{container} name="c"><field name="anchor"/></{container}></form>
+</field></record></odoo>"#
+            )
+        };
+        let ext = |module: &str| {
+            format!(
+                r#"<odoo><record id="view_form_ext" model="ir.ui.view">
+<field name="inherit_id" ref="{module}.view_form"/><field name="arch" type="xml">
+<field name="anchor" position="after"><field name="added"/></field>
+</field></record></odoo>"#
+            )
+        };
+        let mut views = Vec::new();
+        collect_views(&parent("group"), "module_a/views/a.xml", &mut views);
+        collect_views(&parent("notebook"), "module_b/views/b.xml", &mut views);
+        collect_views(&ext("module_b"), "module_b/views/b_ext.xml", &mut views);
+        collect_views(&ext("module_a"), "module_a/views/a_ext.xml", &mut views);
+        let facts = regions_of_views(&views);
+        let dock = |screen: &str| {
+            facts
+                .iter()
+                .find(|f| f.screen.starts_with(screen) && f.control == "added")
+                .map(|f| f.dock_token.clone())
+        };
+        assert_eq!(
+            dock("module_b/views/b_ext.xml").as_deref(),
+            Some("notebook")
+        );
+        assert_eq!(dock("module_a/views/a_ext.xml").as_deref(), Some("group"));
+
+        // An unqualified-only match is taken when unique, refused when ambiguous.
+        let mut views = Vec::new();
+        collect_views(&parent("group"), "module_a/views/a.xml", &mut views);
+        collect_views(&parent("notebook"), "module_b/views/b.xml", &mut views);
+        collect_views(&ext("module_c"), "module_c/views/c_ext.xml", &mut views);
+        let facts = regions_of_views(&views);
+        let added = facts
+            .iter()
+            .find(|f| f.control == "added")
+            .expect("emitted");
+        assert_eq!(added.dock_token, "root");
+    }
+
     #[test]
     fn xpath_targets_resolve_only_name_or_bare_steps() {
         assert_eq!(
@@ -1120,6 +1230,10 @@ mod tests {
         assert_eq!(xpath_target("//field[@string='Amount']"), None);
         assert_eq!(xpath_target("//*[@name='x']"), None);
         assert_eq!(xpath_target("//field[2]"), None);
+        assert_eq!(xpath_target("//field[@name='x'][2]"), None);
+        assert_eq!(xpath_target("//field[not(@name='x')]"), None);
+        assert_eq!(xpath_target("//field[@name='x' and @invisible='1']"), None);
+        assert_eq!(xpath_target("//field[@name='x' or @name='y']"), None);
     }
 
     #[test]
