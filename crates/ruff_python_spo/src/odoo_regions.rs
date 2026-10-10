@@ -39,6 +39,10 @@
 //! a full arch. It patches its parent with **locators**: an `<xpath
 //! expr="…" position="…">` element, or the shorthand form, any element that
 //! carries a `position` attribute (`<field name="amount" position="after">`).
+//! A missing `position` means `inside`, as in Odoo: on any `<xpath>`, and on a
+//! named `<field>` at the top level of an extension's arch. A shorthand
+//! locator with any attribute besides `name`/`position` is left unresolved
+//! (Odoo matches on all of them; only `name` is tracked).
 //! A locator is never a control itself. The controls it brings dock in the
 //! parent's region at the locator's TARGET:
 //!
@@ -51,9 +55,12 @@
 //! A container opened INSIDE the locator block still wins for the controls it
 //! wraps (a new `<group>` docks its fields at `group`). Targets resolve against
 //! the parent's anchors, then its own parent's, up the `inherit_id` chain, so
-//! an extension of an extension resolves through what the first one added.
-//! References join on the LOCAL part of an xml id (`analytic.view_x` →
-//! `view_x`), the convention [`super::odoo_nav`] uses for cross-file refs.
+//! an extension of an extension resolves through what the first one added;
+//! a later spec also resolves through what an earlier spec in the same view
+//! added. References join on the module-qualified xml id (an unqualified
+//! `ref` is qualified with the declaring module, the first path component
+//! under the scanned root); when no scanned view has that exact id, the
+//! local part is accepted only if exactly one scanned view carries it.
 //!
 //! Only `name`-addressed or bare-tag targets resolve (`//field[@name='x']`,
 //! `//sheet`); an xpath whose last step filters on anything else
@@ -319,6 +326,8 @@ enum Frame {
     Container(String),
     Field,
     Other,
+    /// A `<data>` wrapper around an extension view's specs.
+    Data,
     /// A locator block: where its controls dock (`None` = unresolved → root),
     /// and whether it sits inside a field target (comodel subview).
     Locator {
@@ -335,7 +344,7 @@ fn dock_of(stack: &[Frame]) -> String {
             Frame::Locator { dock, .. } => {
                 return dock.clone().unwrap_or_else(|| "root".to_string());
             }
-            Frame::Field | Frame::Other => {}
+            Frame::Field | Frame::Other | Frame::Data => {}
         }
     }
     "root".to_string()
@@ -349,17 +358,20 @@ fn is_comodel(stack: &[Frame]) -> bool {
         match f {
             Frame::Field => return true,
             Frame::Locator { comodel, .. } => return *comodel,
-            Frame::Container(_) | Frame::Other => {}
+            Frame::Container(_) | Frame::Other | Frame::Data => {}
         }
     }
     false
 }
 
-/// Resolve a locator's target and position against the parent's anchors.
+/// Resolve a locator's target and position. Odoo applies a view's specs in
+/// order, so a target is looked up in the parent chain's anchors first, then
+/// in what this view's earlier specs added.
 fn resolve_locator(
     target: Option<&(String, Option<String>)>,
     position: &str,
     parent: &[Anchor],
+    own: &[Anchor],
 ) -> Frame {
     let unresolved = Frame::Locator {
         dock: None,
@@ -370,6 +382,7 @@ fn resolve_locator(
     };
     let Some(anchor) = parent
         .iter()
+        .chain(own)
         .find(|a| &a.tag == tag && (name.is_none() || &a.name == name))
     else {
         return unresolved;
@@ -409,8 +422,27 @@ fn walk(view: &ViewRec, parent: &[Anchor]) -> (Vec<RegionFact>, Vec<Anchor>) {
     let mut anchors = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     let mut order = 0usize;
+    let is_extension = view.inherit.is_some();
     for tag in &view.arch {
+        // An extension view's top-level elements are specs, not controls.
+        let spec_level = is_extension && stack.iter().all(|f| matches!(f, Frame::Data));
         match tag {
+            ArchTag::OtherOpen {
+                tag, self_closing, ..
+            } if spec_level && tag == "data" => {
+                if !self_closing {
+                    stack.push(Frame::Data);
+                }
+            }
+            ArchTag::FieldOpen {
+                name: Some(n),
+                self_closing,
+            } if spec_level => {
+                if !self_closing {
+                    let target = ("field".to_string(), Some(n.clone()));
+                    stack.push(resolve_locator(Some(&target), "inside", parent, &anchors));
+                }
+            }
             ArchTag::FieldOpen { name, self_closing } => {
                 if !is_comodel(&stack)
                     && let Some(n) = name
@@ -497,7 +529,7 @@ fn walk(view: &ViewRec, parent: &[Anchor]) -> (Vec<RegionFact>, Vec<Anchor>) {
                 self_closing,
             } => {
                 if !self_closing {
-                    stack.push(resolve_locator(target.as_ref(), position, parent));
+                    stack.push(resolve_locator(target.as_ref(), position, parent, &anchors));
                 }
             }
             ArchTag::ElementClose => {
@@ -674,6 +706,35 @@ fn name_in_predicate(pred: &str) -> Option<String> {
     Some(body[..end].to_string())
 }
 
+/// The attribute names on one start tag (`<label for="x" position="after">`
+/// → `["for", "position"]`).
+fn attr_names(tag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = tag.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            quote = Some(b);
+        } else if b == b'=' {
+            let end = tag[..i].trim_end().len();
+            let start = tag[..end]
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':'))
+                .map_or(0, |k| k + 1);
+            if start < end {
+                out.push(tag[start..end].to_string());
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// All arch-relevant tags in `content`, in byte-position order. Every `<…>` is
 /// classified; unknown element opens become [`ArchTag::OtherOpen`] so the
 /// stack stays balanced.
@@ -714,13 +775,27 @@ fn arch_tags(content: &str) -> Vec<ArchTag> {
         let tag = tag_slice(content, idx);
         let self_closing = tag.trim_end().ends_with('/');
 
+        // An `<xpath>` is always a spec (Odoo's default position is
+        // `inside`); any other element is one when it carries `position`.
+        let position = match attr_value(tag, "position") {
+            Some(p) => Some(p),
+            None if name == "xpath" => Some("inside".to_string()),
+            None => None,
+        };
         if name != "record"
-            && let Some(position) = attr_value(tag, "position")
+            && let Some(position) = position
         {
             let target = if name == "xpath" {
                 attr_value(tag, "expr").and_then(|e| xpath_target(&e))
-            } else {
+            } else if attr_names(tag)
+                .iter()
+                .all(|a| a == "name" || a == "position")
+            {
                 Some((name.clone(), attr_value(tag, "name")))
+            } else {
+                // Odoo matches a shorthand spec on ALL its attributes; only
+                // `name` is tracked, so anything more stays unresolved.
+                None
             };
             toks.push((
                 idx,
@@ -756,7 +831,10 @@ fn arch_tags(content: &str) -> Vec<ArchTag> {
             "field" if attr_value(tag, "name").as_deref() == Some("arch") => {
                 toks.push((idx, ArchTag::ArchOpen { self_closing }));
             }
-            "field" if attr_value(tag, "name").as_deref() == Some("inherit_id") => {
+            "field"
+                if attr_value(tag, "name").as_deref() == Some("inherit_id")
+                    && attr_value(tag, "ref").is_some() =>
+            {
                 if let Some(r) = attr_value(tag, "ref") {
                     toks.push((idx, ArchTag::InheritRef(r)));
                 }
@@ -1213,6 +1291,64 @@ mod tests {
             .find(|f| f.control == "added")
             .expect("emitted");
         assert_eq!(added.dock_token, "root");
+    }
+
+    /// Odoo spec semantics the join must follow: a missing `position` means
+    /// `inside`; specs apply in order within one view; a shorthand with more
+    /// identifying attributes than `name` is not matched by tag alone; an
+    /// `inherit_id` field without `ref` inside an arch is an ordinary control.
+    #[test]
+    fn spec_defaults_order_and_identity() {
+        const SRC: &str = r#"<odoo>
+  <record id="base" model="ir.ui.view">
+    <field name="arch" type="xml">
+      <form>
+        <sheet>
+          <group name="money"><field name="amount"/></group>
+          <notebook><label for="first"/><label for="second"/></notebook>
+          <field name="inherit_id"/>
+        </sheet>
+      </form>
+    </field>
+  </record>
+  <record id="ext" model="ir.ui.view">
+    <field name="inherit_id" ref="base"/>
+    <field name="arch" type="xml">
+      <data>
+        <xpath expr="//group[@name='money']">
+          <field name="no_position_xpath"/>
+        </xpath>
+        <field name="amount" position="after">
+          <group name="new_group"/>
+        </field>
+        <xpath expr="//group[@name='new_group']" position="inside">
+          <field name="into_earlier_spec"/>
+        </xpath>
+        <label for="second" position="after">
+          <field name="after_second_label"/>
+        </label>
+      </data>
+    </field>
+  </record>
+</odoo>"#;
+        let facts = extract_regions_from_source(SRC, "m/views/v.xml");
+        let dock = |c: &str| {
+            facts
+                .iter()
+                .find(|f| f.control == c)
+                .map(|f| f.dock_token.clone())
+                .unwrap_or_else(|| panic!("no fact for {c}"))
+        };
+        assert_eq!(dock("no_position_xpath"), "group");
+        assert_eq!(dock("into_earlier_spec"), "group");
+        assert_eq!(dock("after_second_label"), "root");
+        assert_eq!(dock("inherit_id"), "sheet");
+        // The spec-level `amount` locator is not itself a control.
+        assert!(
+            !facts
+                .iter()
+                .any(|f| f.control == "amount" && f.screen.ends_with("#ext"))
+        );
     }
 
     #[test]
