@@ -3,7 +3,7 @@ name = "ruff_sqlalchemy_spo"
 version = "0.1.0"
 publish = false
 edition = "2024"
-rust-version = { workspace = true }
+rust-version = "1.99.0"
 license = "MIT"
 
 [lib]

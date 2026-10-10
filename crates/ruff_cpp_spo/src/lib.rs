@@ -242,6 +242,15 @@ pub struct CppEnum {
 /// [`model_from_class`] unpacks it. It disappears at the IR boundary —
 /// nothing here is serialized into a triple directly.
 #[derive(Debug, Clone)]
+// `large_enum_variant` fires ONLY in the degenerate default-feature config,
+// where the `libclang`-gated variants are compiled out and `Method` is left as
+// the sole large variant (272 vs 48 bytes). Under `--all-features` — the only
+// config in which this crate does real work, and the one CI runs — the lint
+// reports nothing. Boxing `CppMethod` would restructure 21 call sites across
+// 7 files to satisfy a config that harvests nothing, so the suppression is
+// narrower than the fix. `allow` rather than `expect`: an `expect` would
+// itself become an unfulfilled-expectation error under `--all-features`.
+#[allow(clippy::large_enum_variant, reason = "config-conditional; see above")]
 pub enum Declaration {
     /// `class Derived : public Base` — a base-class declaration.
     Base(CppBase),
@@ -644,6 +653,11 @@ mod tests {
     /// of them silently. Both arms are asserted — global scope must stay bare
     /// (the C-library norm, where qualifying would change every identity) and a
     /// namespaced pair must come out distinct.
+    // `CppFunction` only exists under `libclang`, so this test must be gated
+    // the same way. Without the gate a default-feature `cargo check
+    // --all-targets` fails to build the test harness; CI never caught it
+    // because CI only ever runs `--all-features`.
+    #[cfg(feature = "libclang")]
     #[test]
     fn free_function_qualified_name_distinguishes_namespaces() {
         let bare = CppFunction {

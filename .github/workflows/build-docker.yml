@@ -18,6 +18,8 @@ on:
       - .github/workflows/build-docker.yml
 
 env:
+  UV_LOCKED: 1
+  ACTIONS_CACHE_MODE: none
   # Fork note: OCI registry refs must be all-lowercase, but `github.repository_owner`
   # preserves case (`AdaWorldAPI` on this fork; `astral-sh` upstream never hit this).
   # This workflow-level value is a fallback only — every job below overrides it with
@@ -34,7 +36,7 @@ permissions:
 jobs:
   docker-build:
     name: Build Docker image (ghcr.io/astral-sh/ruff) for ${{ matrix.platform }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'astral-sh/ruff' && 'github-ubuntu-24.04-x86_64-4' || 'ubuntu-latest' }}
     environment:
       name: ${{ inputs.plan != '' && !fromJson(inputs.plan).announcement_tag_is_implicit && 'release' || '' }}
     strategy:
@@ -54,7 +56,7 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         if: ${{ inputs.plan != '' && !fromJson(inputs.plan).announcement_tag_is_implicit }}
@@ -100,8 +102,6 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          cache-from: type=gha,scope=ruff-${{ env.PLATFORM_TUPLE }}
-          cache-to: type=gha,mode=min,scope=ruff-${{ env.PLATFORM_TUPLE }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.RUFF_BASE_IMG }},push-by-digest=true,name-canonical=true,push=${{ inputs.plan != '' && !fromJson(inputs.plan).announcement_tag_is_implicit }}
 
@@ -122,7 +122,7 @@ jobs:
 
   docker-publish:
     name: Publish Docker image (ghcr.io/astral-sh/ruff)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'astral-sh/ruff' && 'github-ubuntu-24.04-x86_64-4' || 'ubuntu-latest' }}
     environment:
       name: release
     needs:
@@ -145,7 +145,7 @@ jobs:
           pattern: digests-*
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
@@ -190,14 +190,14 @@ jobs:
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.RUFF_BASE_IMG }}
           subject-digest: ${{ steps.manifest-digest.outputs.digest }}
 
   docker-publish-extra:
     name: Publish additional Docker image based on ${{ matrix.image-mapping }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'astral-sh/ruff' && 'github-ubuntu-24.04-x86_64-4' || 'ubuntu-latest' }}
     environment:
       name: release
     needs:
@@ -222,7 +222,7 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -300,7 +300,7 @@ jobs:
           annotations: ${{ steps.meta.outputs.annotations }}
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.RUFF_BASE_IMG }}
           subject-digest: ${{ steps.build-and-push.outputs.digest }}
@@ -310,7 +310,7 @@ jobs:
   # This works by annotating the original digests (previously non-annotated) which triggers an update to ghcr.io
   docker-republish:
     name: Annotate Docker image (ghcr.io/astral-sh/ruff)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'astral-sh/ruff' && 'github-ubuntu-24.04-x86_64-4' || 'ubuntu-latest' }}
     environment:
       name: release
     needs:
@@ -333,7 +333,7 @@ jobs:
           pattern: digests-*
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
@@ -384,7 +384,7 @@ jobs:
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.RUFF_BASE_IMG }}
           subject-digest: ${{ steps.manifest-digest.outputs.digest }}

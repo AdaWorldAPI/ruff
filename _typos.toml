@@ -2,6 +2,8 @@
 # https://github.com/crate-ci/typos/issues/868
 extend-exclude = [
     "crates/ty_vendored/vendor/**/*",
+    "crates/ruff_unicode_names2/**/*",
+    "crates/ruff_unicode_names2_generator/**/*",
     "**/resources/**/*",
     "**/snapshots/**/*",
     "crates/ruff_linter/src/rules/flake8_implicit_str_concat/rules/collection_literal.rs",
@@ -28,7 +30,6 @@ pn = "pn"  # `import panel as pn` is a thing
 poit = "poit"
 BA = "BA" # acronym for "Bad Allowed", used in testing.
 jod = "jod" # e.g., `jod-thread`
-Numer = "Numer" # Library name 'NumerBlox' in "Who's Using Ruff?"
 CPY = "CPY"  # it's a Ruff rule category
 # P-code / R2IL opcode names, not prose. INT_SCARRY is signed-carry; the
 # hook's "scary" correction silently corrupts an emitted wire tag.

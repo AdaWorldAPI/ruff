@@ -193,12 +193,16 @@ impl BodyWalker {
     fn blank_guarded_field(&self, test: &Expr) -> Option<String> {
         match test {
             Expr::UnaryOp(u) if u.op == UnaryOp::Not => self.relation_path(&u.operand),
-            Expr::Compare(c)
-                if matches!(&*c.ops, [CmpOp::Is])
-                    && matches!(c.comparators.first(), Some(Expr::NoneLiteral(_))) =>
-            {
-                self.relation_path(&c.left)
-            }
+            // Upstream reshaped `ExprCompare` into `ops` + `operands`. Its own
+            // `as_single()` helper means "exactly one operator and two operands",
+            // which is precisely what this arm asserted before via `ops == [Is]`.
+            // It also removes a panic path: the direct replacement for the old
+            // `.comparators` field is `comparators()`, which indexes
+            // `operands[1..]` and panics on a zero-operand node.
+            Expr::Compare(c) => match c.as_single() {
+                Some((left, CmpOp::Is, Expr::NoneLiteral(_))) => self.relation_path(left),
+                _ => None,
+            },
             _ => None,
         }
     }

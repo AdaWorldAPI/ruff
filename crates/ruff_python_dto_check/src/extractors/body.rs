@@ -347,9 +347,13 @@ impl Walker<'_> {
                 }
             }
             Expr::Compare(c) => {
-                self.walk_expr(&c.left);
-                for comp in &c.comparators {
-                    self.walk_expr(comp);
+                // Upstream reshaped `ExprCompare` into `ops` + `operands`, where
+                // `operands` is exactly the old `left` followed by the old
+                // `comparators`. Walking `operands` is the same traversal in the
+                // same order, and unlike `first_operand()` it cannot panic on a
+                // malformed node.
+                for operand in &c.operands {
+                    self.walk_expr(operand);
                 }
             }
             Expr::Name(n) => {

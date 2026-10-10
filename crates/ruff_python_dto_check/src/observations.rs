@@ -354,11 +354,13 @@ fn walk_expr(expr: &Expr, out: &mut String) {
             write!(out, "BoolOp({})", b.values.len()).ok();
         }
         Expr::Compare(c) => {
-            walk_expr(&c.left, out);
-            for comp in &c.comparators {
-                walk_expr(comp, out);
+            // See the note in `extractors::body`: `operands` == old `left` ++ old
+            // `comparators`, so both the traversal order and the emitted arity are
+            // unchanged (`1 + comparators.len() == operands.len()`).
+            for operand in &c.operands {
+                walk_expr(operand, out);
             }
-            write!(out, "Compare({})", 1 + c.comparators.len()).ok();
+            write!(out, "Compare({})", c.operands.len()).ok();
         }
         Expr::If(i) => {
             walk_expr(&i.test, out);
