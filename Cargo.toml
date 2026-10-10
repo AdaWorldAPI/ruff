@@ -1,5 +1,11 @@
 [workspace]
 members = ["crates/*"]
+# ruff_r2il is a workspace-EXCLUDED standalone crate (its own workspace root):
+# it path-deps the r2sleigh sibling checkout (r2il/r2ssa), and exclusion keeps
+# the main workspace and its Cargo.lock sibling-free. Build it via
+# `cargo <cmd> --manifest-path crates/ruff_r2il/Cargo.toml`.
+# See .claude/plans/r2il-behavioral-ir-v1.md.
+exclude = ["crates/ruff_r2il"]
 resolver = "2"
 
 [workspace.package]
@@ -36,12 +42,14 @@ ruff_python_formatter = { version = "0.0.17", path = "crates/ruff_python_formatt
 ruff_python_importer = { version = "0.0.17", path = "crates/ruff_python_importer" }
 ruff_python_index = { version = "0.0.17", path = "crates/ruff_python_index" }
 ruff_python_literal = { version = "0.0.17", path = "crates/ruff_python_literal" }
+ruff_cpp_codegen = { path = "crates/ruff_cpp_codegen" }
 ruff_python_parser = { version = "0.0.17", path = "crates/ruff_python_parser" }
 ruff_python_semantic = { version = "0.0.17", path = "crates/ruff_python_semantic" }
 ruff_python_stdlib = { version = "0.0.17", path = "crates/ruff_python_stdlib" }
 ruff_python_trivia = { version = "0.0.17", path = "crates/ruff_python_trivia" }
 ruff_server = { version = "0.0.17", path = "crates/ruff_server" }
 ruff_source_file = { version = "0.0.17", path = "crates/ruff_source_file" }
+ruff_spo_triplet = { path = "crates/ruff_spo_triplet" }
 ruff_mdtest = { path = "crates/ruff_mdtest" }
 ruff_ranged_value = { version = "0.0.17", path = "crates/ruff_ranged_value" }
 ruff_text_size = { version = "0.0.17", path = "crates/ruff_text_size" }
