@@ -1,0 +1,16 @@
+# No tracked Cargo.lock here (fleet rule). A lock may only ever freeze EXTERNAL
+# dependencies; this crate's lock froze an INTERNAL fork —
+# `AdaWorldAPI/ndarray branch=master#c6262d63ec01d92490343b5698c3cd2727dfea7e`
+# — while `Cargo.toml` correctly asked for the floating branch. Measured
+# 2026-10-10: that commit is not even an ancestor of ndarray's master (it was
+# squashed/rebased away), and master had moved on by six weeks.
+#
+# This ignore lives in the crate directory, not the repository root: the root
+# `.gitignore` is upstream's file, and editing it would add a conflict surface
+# to every future upstream sync for no benefit.
+#
+# The repository root's own `Cargo.lock` and `fuzz/Cargo.lock` are deliberately
+# NOT covered. They are upstream's, they are how a published binary pins its
+# build, and they were measured to contain zero `git+` sources — they lock only
+# external crates.io dependencies, which the rule permits.
+Cargo.lock
