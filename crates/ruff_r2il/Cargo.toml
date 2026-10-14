@@ -44,6 +44,17 @@ a2ui-graph = { path = "../../../a2ui-rs/crates/a2ui-graph", default-features = f
 default = []
 lift = ["dep:r2sleigh-lift", "dep:sleigh-config"]
 
+# r2sleigh vendors its Sleigh crates and swaps them in with `[patch.crates-io]`.
+# A patch applies only inside the workspace that declares it, and this crate is
+# its own workspace, so it repeats the same patch. Without it the crates.io
+# `libsla` is used, which lacks APIs r2sleigh-lift calls (`user_op_names`,
+# `clear_cache`), and the crates.io `sleigh-config` lacks the 6502 processor.
+[patch.crates-io]
+sleigh-config = { path = "../../../r2sleigh/vendor/sleigh-config" }
+libsla = { path = "../../../r2sleigh/vendor/libsla" }
+libsla-sys = { path = "../../../r2sleigh/vendor/libsla-sys" }
+sleigh-compiler = { path = "../../../r2sleigh/vendor/sleigh-compiler" }
+
 [[example]]
 name = "harvest_r2il"
 required-features = ["lift"]
