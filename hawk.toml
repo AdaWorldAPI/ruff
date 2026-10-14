@@ -32,6 +32,54 @@ package = "ty_completion_eval"
 bin = "ty_completion_eval"
 reason = "workspace completion evaluation binary"
 
+# Fork-only SPO/transcode libraries. Their public API is consumed outside this
+# workspace (OGAR and the transcode consumers), so it is a product boundary.
+
+[[production]]
+package = "ruff_cpp_codegen"
+lib = "ruff_cpp_codegen"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
+[[production]]
+package = "ruff_cpp_spo"
+lib = "ruff_cpp_spo"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
+[[production]]
+package = "ruff_csharp_spo"
+lib = "ruff_csharp_spo"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
+[[production]]
+package = "ruff_python_dto_check"
+lib = "ruff_python_dto_check"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
+[[production]]
+package = "ruff_python_spo"
+lib = "ruff_python_spo"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
+[[production]]
+package = "ruff_ruby_spo"
+lib = "ruff_ruby_spo"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
+[[production]]
+package = "ruff_spo_address"
+lib = "ruff_spo_address"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
+[[production]]
+package = "ruff_spo_triplet"
+lib = "ruff_spo_triplet"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
+[[production]]
+package = "ruff_sqlalchemy_spo"
+lib = "ruff_sqlalchemy_spo"
+reason = "fork SPO/transcode library consumed outside this workspace"
+
 # Keep this list in sync with workspace packages that define doctests.
 
 [[doctest]]
