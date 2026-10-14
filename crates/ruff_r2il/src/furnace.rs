@@ -794,7 +794,7 @@ fn object_is_escaped(behavior: &FunctionBehavior, object: r2ssa::ObjectId) -> bo
     behavior
         .objects()
         .object(object)
-        .map(|fact| matches!(fact.kind, ObjectKind::EscapedUnknown))
+        .map(|fact| matches!(fact.kind, ObjectKind::EscapedUnknown { .. }))
         .unwrap_or(true)
 }
 

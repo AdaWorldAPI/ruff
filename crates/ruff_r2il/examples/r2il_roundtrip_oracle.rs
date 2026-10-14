@@ -37,7 +37,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use r2il::R2ILBlock;
-use r2sleigh_lift::{Disassembler, userop_map_for_arch};
+use r2sleigh_lift::Disassembler;
 
 use ruff_r2il::behavior::FunctionBehavior;
 use ruff_r2il::convention::R2ilConvention;
@@ -352,7 +352,7 @@ fn main() {
     );
     println!();
 
-    let mut disasm = match Disassembler::from_sla(
+    let disasm = match Disassembler::from_sla(
         sleigh_config::processor_x86::SLA_X86_64,
         sleigh_config::processor_x86::PSPEC_X86_64,
         "x86-64",
@@ -363,7 +363,6 @@ fn main() {
             return;
         }
     };
-    disasm.set_userop_map(userop_map_for_arch("x86-64"));
 
     for path in corpus_paths() {
         process_binary(&disasm, &path, max_section_bytes, chunk, max_chunks);

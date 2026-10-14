@@ -123,7 +123,7 @@ impl R2ilConvention {
     ///   architecture defines one, else a literal fallback, so an offset the corpus never named
     ///   still resolves — to the space, not to nothing. Custom spaces get NO blanket
     ///   fall-through: an unnamed `Custom(n)` must stay slag;
-    /// * `arch.userops: Vec<UserOpDef{index, name}>` → the userop table;
+    /// * `arch.user_ops: Vec<String>`, indexed by the `CallOther` identifier → the userop table;
     /// * `arch.spaces` (`AddressSpace{id: SpaceId::Custom(n), name}`) → [`CustomSpaceTable`].
     ///
     /// Errors only through [`FacetOverflow`] — config keys must be lossless (see `facet.rs`).
@@ -193,9 +193,10 @@ impl R2ilConvention {
             );
         }
 
+        // `user_ops` is indexed by the identifier a `CallOther` carries.
         let mut userops = BTreeMap::new();
-        for userop in &arch.userops {
-            userops.insert(userop.index, userop.name.clone());
+        for (index, name) in (0u32..).zip(&arch.user_ops) {
+            userops.insert(index, name.clone());
         }
 
         Ok(Self {
@@ -347,7 +348,6 @@ fn toml_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::facet::project;
-    use r2il::serialize::UserOpDef;
     use r2il::{AddressSpace, RegisterDef, Varnode};
 
     #[test]
@@ -497,12 +497,14 @@ mod tests {
     fn toml_rendering_is_byte_stable_and_starts_every_row_unmeasured() {
         let mut arch = ArchSpec::new("test-arch");
         arch.registers = vec![RegisterDef::new("rax", 0, 8), RegisterDef::new("rbx", 8, 8)];
-        arch.userops = vec![UserOpDef {
-            index: 42,
-            name: "syscall_helper".to_string(),
-        }];
+        arch.user_ops = vec!["sysenter".to_string(), "syscall_helper".to_string()];
         let conv = R2ilConvention::from_arch(&arch, [OpTag::Copy, OpTag::IntAdd])
             .expect("no custom spaces, must not overflow");
+
+        // A `CallOther` identifier is the name's position in `user_ops`.
+        assert_eq!(conv.userop_name(1), Some("syscall_helper"));
+        assert_eq!(conv.userop_name(0), Some("sysenter"));
+        assert_eq!(conv.userop_name(2), None);
 
         let rendered_once = conv.to_toml();
         let rendered_twice = conv.to_toml();

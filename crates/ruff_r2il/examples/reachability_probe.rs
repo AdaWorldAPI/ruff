@@ -72,7 +72,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use r2il::{R2ILOp, SpaceId};
-use r2sleigh_lift::{Disassembler, build_arch_spec, userop_map_for_arch};
+use r2sleigh_lift::{Disassembler, build_arch_spec};
 use ruff_r2il::absref::absolute_refs;
 use sleigh_compiler::{SleighCompiler, SleighCompilerOptions};
 
@@ -334,8 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sla = compile_slaspec(&spec_path)?;
     let pspec = fs::read_to_string(spec_path.with_extension("pspec"))?;
     let spec = build_arch_spec(&sla, &pspec, "6502")?;
-    let mut disasm = Disassembler::from_sla(&sla, &pspec, "6502")?;
-    disasm.set_userop_map(userop_map_for_arch("6502"));
+    let disasm = Disassembler::from_sla(&sla, &pspec, "6502")?;
     let _ = &spec;
 
     let dir = corpus_dir();

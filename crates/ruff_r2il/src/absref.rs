@@ -117,12 +117,7 @@ mod tests {
     use super::*;
 
     fn vn(space: SpaceId, offset: u64, size: u32) -> Varnode {
-        Varnode {
-            space,
-            offset,
-            size,
-            meta: None,
-        }
+        Varnode::new(space, offset, size)
     }
 
     /// The measured `STA $ce00,y` at `$1d27`, op for op.
