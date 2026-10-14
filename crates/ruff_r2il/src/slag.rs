@@ -90,6 +90,10 @@ pub enum ResidualReason {
     /// The varnode's `SpaceId::Custom(raw)` is not in the convention's
     /// [`crate::facet::CustomSpaceTable`].
     CustomSpaceNotInConvention { raw: u32 },
+    /// The varnode's space is `SpaceId::Unresolved`: the lifter could not name it,
+    /// so no stable facet coordinate exists for it. Every such varnode compares
+    /// equal, so there is no payload to distinguish them.
+    UnresolvedSpace,
     /// The `Custom(raw)` space exists in the arch data but exceeds the
     /// interned-ordinal budget at CONFIG-KEY construction time (§4's
     /// promoted falsifier) — a typed overflow, never a silent truncation.
@@ -126,6 +130,7 @@ impl ResidualReason {
         "no_convention_row_at_address",
         "userop_not_in_convention",
         "custom_space_not_in_convention",
+        "unresolved_space",
         "facet_overflow_at_key",
         "variadic_arity",
         "phi_fan_in_exceeds_predecessors",
@@ -143,6 +148,7 @@ impl ResidualReason {
             ResidualReason::NoConventionRowAtAddress => "no_convention_row_at_address",
             ResidualReason::UserOpNotInConvention { .. } => "userop_not_in_convention",
             ResidualReason::CustomSpaceNotInConvention { .. } => "custom_space_not_in_convention",
+            ResidualReason::UnresolvedSpace => "unresolved_space",
             ResidualReason::FacetOverflowAtKey { .. } => "facet_overflow_at_key",
             ResidualReason::VariadicArity { .. } => "variadic_arity",
             ResidualReason::PhiFanInExceedsPredecessors { .. } => "phi_fan_in_exceeds_predecessors",
@@ -172,6 +178,7 @@ impl ResidualReason {
             ResidualReason::CustomSpaceNotInConvention { raw } => {
                 bytes.extend_from_slice(&raw.to_le_bytes());
             }
+            ResidualReason::UnresolvedSpace => {}
             ResidualReason::FacetOverflowAtKey { raw } => {
                 bytes.extend_from_slice(&raw.to_le_bytes());
             }
@@ -463,13 +470,14 @@ mod tests {
         // `ResidualReason`, this fails to COMPILE until this test (and
         // `ResidualReason::ALL`) are updated to match. That non-compiling
         // failure mode is the falsifier for "no catch-all reason".
-        let sample: [ResidualReason; 11] = [
+        let sample: [ResidualReason; 12] = [
             ResidualReason::OpcodeNotInConvention {
                 opcode: OpTag::Copy,
             },
             ResidualReason::NoConventionRowAtAddress,
             ResidualReason::UserOpNotInConvention { userop: 0 },
             ResidualReason::CustomSpaceNotInConvention { raw: 0 },
+            ResidualReason::UnresolvedSpace,
             ResidualReason::FacetOverflowAtKey { raw: 0 },
             ResidualReason::VariadicArity { arity: 0 },
             ResidualReason::PhiFanInExceedsPredecessors {
@@ -492,6 +500,7 @@ mod tests {
                 ResidualReason::NoConventionRowAtAddress => 1,
                 ResidualReason::UserOpNotInConvention { .. } => 1,
                 ResidualReason::CustomSpaceNotInConvention { .. } => 1,
+                ResidualReason::UnresolvedSpace => 1,
                 ResidualReason::FacetOverflowAtKey { .. } => 1,
                 ResidualReason::VariadicArity { .. } => 1,
                 ResidualReason::PhiFanInExceedsPredecessors { .. } => 1,
@@ -502,7 +511,7 @@ mod tests {
                 // Deliberately NO `_ =>` arm.
             };
         }
-        assert_eq!(variant_count, 11);
+        assert_eq!(variant_count, 12);
         assert_eq!(ResidualReason::ALL.len(), variant_count);
 
         let mut sorted = ResidualReason::ALL.to_vec();

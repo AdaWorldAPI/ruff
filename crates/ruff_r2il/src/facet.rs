@@ -125,6 +125,11 @@ pub enum FacetOverflow {
     /// back to `raw as u16` (`65541` and `5` both truncate to `5`, silently colliding two
     /// distinct architecture-defined spaces).
     UnknownCustomSpace { raw: u32 },
+    /// The varnode's space is `SpaceId::Unresolved`: the lifter could not name it, so it has
+    /// no stable discriminant. Projection REFUSES rather than assign one, because every
+    /// unresolved space compares equal and a shared discriminant would merge spaces that may
+    /// be distinct.
+    UnresolvedSpace,
     /// The set of distinct custom-space raw ids exceeds [`MAX_CUSTOM_ORDINAL`]. Overflow is
     /// EVIDENCE a route needs factoring, never silent truncation (the `mint_factored`
     /// principle).
@@ -136,6 +141,12 @@ impl core::fmt::Display for FacetOverflow {
         match self {
             FacetOverflow::UnknownCustomSpace { raw } => {
                 write!(f, "custom space {raw} is not in the interned table")
+            }
+            FacetOverflow::UnresolvedSpace => {
+                write!(
+                    f,
+                    "the varnode's address space was not resolved by the lifter"
+                )
             }
             FacetOverflow::CustomOrdinalExhausted { count } => {
                 write!(
@@ -228,6 +239,7 @@ pub fn project(vn: &Varnode, spaces: &CustomSpaceTable) -> Result<VarnodeFacet, 
         SpaceId::Custom(raw) => spaces
             .ordinal_of(raw)
             .ok_or(FacetOverflow::UnknownCustomSpace { raw })?,
+        SpaceId::Unresolved => return Err(FacetOverflow::UnresolvedSpace),
     };
     let classid = ((PROVISIONAL_R2IL_VARNODE as u32) << 16) | discriminant as u32;
     let offset_lo = (vn.offset & 0xFFFF_FFFF) as u32;
@@ -303,6 +315,21 @@ mod tests {
         assert_eq!(facet.space_discriminant(), CUSTOM_ORDINAL_BASE + 1);
         let back = unproject(&facet, &table).expect("must unproject");
         assert_eq!(back, vn);
+    }
+
+    #[test]
+    fn unresolved_space_is_refused_rather_than_given_a_discriminant() {
+        // Every unresolved space compares equal, so no table, however populated, can
+        // give one a discriminant without risking a merge of two different spaces.
+        let table = CustomSpaceTable::from_ids([0, 5]).expect("2 ids is within budget");
+        let vn = Varnode::new(SpaceId::Unresolved, 0x10, 4);
+        assert_eq!(project(&vn, &table), Err(FacetOverflow::UnresolvedSpace));
+        assert_eq!(
+            project(&vn, &CustomSpaceTable::default()),
+            Err(FacetOverflow::UnresolvedSpace)
+        );
+        // The same offset and size in a named space still projects.
+        assert!(project(&Varnode::new(SpaceId::Ram, 0x10, 4), &table).is_ok());
     }
 
     #[test]

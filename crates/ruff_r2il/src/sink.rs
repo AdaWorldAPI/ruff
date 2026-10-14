@@ -497,6 +497,7 @@ fn reason_payload_cols(r: &ResidualReason) -> (String, String) {
             (expected.as_str().to_string(), found.as_str().to_string())
         }
         ResidualReason::NoConventionRowAtAddress
+        | ResidualReason::UnresolvedSpace
         | ResidualReason::MemoryObjectEscaped
         | ResidualReason::IndirectTarget
         | ResidualReason::NoFacetCoordinate => (String::new(), String::new()),
@@ -526,6 +527,7 @@ fn parse_reason(name: &str, p1: &str, p2: &str) -> io::Result<ResidualReason> {
         "custom_space_not_in_convention" => ResidualReason::CustomSpaceNotInConvention {
             raw: parse_u32(p1)?,
         },
+        "unresolved_space" => ResidualReason::UnresolvedSpace,
         "facet_overflow_at_key" => ResidualReason::FacetOverflowAtKey {
             raw: parse_u32(p1)?,
         },

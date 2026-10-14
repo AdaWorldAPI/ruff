@@ -479,6 +479,7 @@ pub fn permissive_convention(blocks: &[R2ILBlock]) -> Result<R2ilConvention, Fac
             valid_ranges: Vec::new(),
             bank_id: None,
             segment_id: None,
+            aliases: None,
         });
     }
 

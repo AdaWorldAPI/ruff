@@ -661,6 +661,7 @@ struct Pass2Stats {
     vocab_interned_id_bytes: Vec<usize>,
     facet_ok: usize,
     facet_unknown_custom_space: usize,
+    facet_unresolved_space: usize,
     facet_ordinal_exhausted: usize,
     smelt_harvested: usize,
     smelt_classified: usize,
@@ -723,12 +724,15 @@ fn print_pass2(stats: &Pass2Stats) {
     print_distribution("vocab.ssa_name_bytes", &stats.vocab_ssa_name_bytes);
     print_distribution("vocab.interned_id_bytes", &stats.vocab_interned_id_bytes);
 
-    let facet_total =
-        stats.facet_ok + stats.facet_unknown_custom_space + stats.facet_ordinal_exhausted;
+    let facet_total = stats.facet_ok
+        + stats.facet_unknown_custom_space
+        + stats.facet_unresolved_space
+        + stats.facet_ordinal_exhausted;
     println!(
-        "    facet::project sweep: ok={} FacetOverflow(UnknownCustomSpace)={} FacetOverflow(CustomOrdinalExhausted)={} total={}",
+        "    facet::project sweep: ok={} FacetOverflow(UnknownCustomSpace)={} FacetOverflow(UnresolvedSpace)={} FacetOverflow(CustomOrdinalExhausted)={} total={}",
         stats.facet_ok,
         stats.facet_unknown_custom_space,
+        stats.facet_unresolved_space,
         stats.facet_ordinal_exhausted,
         facet_total
     );
@@ -931,6 +935,9 @@ fn run_pass2_over(
                         Ok(_) => stats.facet_ok += 1,
                         Err(facet::FacetOverflow::UnknownCustomSpace { .. }) => {
                             stats.facet_unknown_custom_space += 1;
+                        }
+                        Err(facet::FacetOverflow::UnresolvedSpace) => {
+                            stats.facet_unresolved_space += 1;
                         }
                         Err(facet::FacetOverflow::CustomOrdinalExhausted { .. }) => {
                             stats.facet_ordinal_exhausted += 1;
