@@ -563,6 +563,11 @@ impl OpTag {
             "cast" => OpTag::Cast,
             "extract" => OpTag::Extract,
             "insert" => OpTag::Insert,
+            "block_transfer" => OpTag::BlockTransfer,
+            "select" => OpTag::Select,
+            "switch" => OpTag::Switch,
+            "call_restore" => OpTag::CallRestore,
+            "call_use" => OpTag::CallUse,
             _ => return None,
         })
     }
@@ -660,6 +665,11 @@ mod op_tag_str_tests {
             OpTag::Cast,
             OpTag::Extract,
             OpTag::Insert,
+            OpTag::BlockTransfer,
+            OpTag::Select,
+            OpTag::Switch,
+            OpTag::CallRestore,
+            OpTag::CallUse,
         ];
         for tag in all {
             let s = tag.as_str();
