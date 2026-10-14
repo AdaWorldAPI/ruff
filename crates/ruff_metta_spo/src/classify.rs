@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperon_atom::Atom;
 
-use crate::builtins::{self, Category};
+use crate::builtins::{self, Category, Natives};
 use crate::harvest::{Module, Rule};
 
 /// Why a rule head is interpreter-only. The first reason found, in clause order and
@@ -18,9 +18,12 @@ pub enum Reason {
         /// What the native name does.
         category: Category,
     },
-    /// The body calls through a variable, `($f $x)`: the callee is only known at run
-    /// time.
-    VariableCall,
+    /// The body has an expression headed by a variable, `($f $x)`. If the variable
+    /// binds to a function this is a call through it; if it binds to data the
+    /// expression is a tuple, as in `(= (flip ($a $b)) ($b $a))`. Which one is decided
+    /// at run time, so the verdict is conservative: such a rule may in fact be
+    /// lowerable.
+    VariableHead,
     /// The body calls a head that is interpreter-only. For a cycle this names the
     /// first tainted callee in the clause.
     Calls {
@@ -60,10 +63,11 @@ struct Body {
     callees: Vec<String>,
 }
 
-/// Classify every rule head in `modules`. Names resolve across all modules, as they
-/// would in one space; pass [`crate::hyperon_stdlib`] to resolve the stdlib.
+/// Classify every rule head in `modules` against one engine's native names. Names
+/// resolve across all modules, as they would in one space. For Hyperon, pass
+/// [`crate::hyperon_stdlib`] among the modules to resolve the stdlib.
 #[must_use]
-pub fn classify(modules: &[Module]) -> Classification {
+pub fn classify(natives: &Natives, modules: &[Module]) -> Classification {
     let mut clauses: BTreeMap<&str, Vec<&Rule>> = BTreeMap::new();
     let mut out = Classification::default();
     for rule in modules.iter().flat_map(|m| &m.rules) {
@@ -77,7 +81,13 @@ pub fn classify(modules: &[Module]) -> Classification {
     for (&head, rules) in &clauses {
         let mut body = Body::default();
         for rule in rules {
-            walk(&rule.rhs, &clauses, &mut body, &mut out.constructors);
+            walk(
+                &rule.rhs,
+                natives,
+                &clauses,
+                &mut body,
+                &mut out.constructors,
+            );
         }
         out.calls
             .insert(head.to_string(), body.callees.iter().cloned().collect());
@@ -124,6 +134,7 @@ pub fn classify(modules: &[Module]) -> Classification {
 /// first occurrence, and unresolved expression heads.
 fn walk(
     atom: &Atom,
+    natives: &Natives,
     clauses: &BTreeMap<&str, Vec<&Rule>>,
     body: &mut Body,
     constructors: &mut BTreeSet<String>,
@@ -148,8 +159,8 @@ fn walk(
                         // (match space pattern template): the pattern is matched,
                         // never evaluated. The template is evaluated afterwards.
                         "match" if args.len() == 3 => {
-                            walk(&args[0], clauses, body, constructors);
-                            walk(&args[2], clauses, body, constructors);
+                            walk(&args[0], natives, clauses, body, constructors);
+                            walk(&args[2], natives, clauses, body, constructors);
                             return;
                         }
                         // `quote` stops evaluation of its argument.
@@ -158,10 +169,10 @@ fn walk(
                     }
                     if clauses.contains_key(name) {
                         callee(body, name);
-                    } else if let Some((native, category)) = builtins::lookup(name) {
+                    } else if let Some(category) = natives.category(name) {
                         if category != Category::Relational && body.taint.is_none() {
                             body.taint = Some(Reason::Builtin {
-                                name: native.to_string(),
+                                name: name.to_string(),
                                 category,
                             });
                         }
@@ -171,13 +182,13 @@ fn walk(
                 }
                 Atom::Variable(_) => {
                     if body.taint.is_none() {
-                        body.taint = Some(Reason::VariableCall);
+                        body.taint = Some(Reason::VariableHead);
                     }
                 }
-                other => walk(other, clauses, body, constructors),
+                other => walk(other, natives, clauses, body, constructors),
             }
             for arg in args {
-                walk(arg, clauses, body, constructors);
+                walk(arg, natives, clauses, body, constructors);
             }
         }
         Atom::Variable(_) | Atom::Grounded(_) => {}

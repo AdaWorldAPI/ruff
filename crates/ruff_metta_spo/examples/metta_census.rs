@@ -3,17 +3,30 @@
 //!
 //! ```text
 //! cargo run --manifest-path crates/ruff_metta_spo/Cargo.toml --example metta_census -- \
-//!     [--no-stdlib] <dir-or-file>...
+//!     [--dialect hyperon|petta] [--no-stdlib] <dir-or-file>...
 //! ```
 //!
-//! Every `.metta` file under the given paths is one module; all modules (and the
-//! Hyperon stdlib, unless `--no-stdlib`) are classified together. The stdlib's own
-//! heads are counted separately, so the corpus numbers are the corpus's.
+//! Every `.metta` file under the given paths is one module; all modules are
+//! classified together against one engine's native names. With `--dialect hyperon`
+//! (the default) the Hyperon stdlib is classified alongside, unless `--no-stdlib`;
+//! only the corpus's own heads are counted. With `--dialect petta` the natives come
+//! from PeTTa's builtin registry and no stdlib is added: pass PeTTa's `lib/` among
+//! the paths if the corpus imports it.
+
+// ruff/clippy.toml's disallowed-methods list is directory-scoped and aimed at the
+// ty crates, which must go through their `System` abstraction. This example reads a
+// corpus from disk and has no `System`.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "a corpus reader with no ty System; see the comment above"
+)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ruff_metta_spo::{Category, Module, Reason, Verdict, classify, hyperon_stdlib, parse_module};
+use ruff_metta_spo::{
+    Category, Module, Natives, Reason, Verdict, classify, hyperon_stdlib, parse_module,
+};
 
 fn collect(path: &Path, out: &mut Vec<PathBuf>) {
     if path.is_dir() {
@@ -32,12 +45,21 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
 
 fn main() {
     let mut with_stdlib = true;
+    let mut natives = Natives::hyperon();
     let mut files = Vec::new();
-    for arg in std::env::args().skip(1) {
-        if arg == "--no-stdlib" {
-            with_stdlib = false;
-        } else {
-            collect(Path::new(&arg), &mut files);
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--no-stdlib" => with_stdlib = false,
+            "--dialect" => match args.next().as_deref() {
+                Some("hyperon") => natives = Natives::hyperon(),
+                Some("petta") => {
+                    natives = Natives::petta_fork();
+                    with_stdlib = false;
+                }
+                other => panic!("--dialect hyperon|petta, got {other:?}"),
+            },
+            _ => collect(Path::new(&arg), &mut files),
         }
     }
     let mut modules: Vec<Module> = Vec::new();
@@ -54,7 +76,11 @@ fn main() {
     }
     let corpus_heads: std::collections::BTreeSet<String> = modules
         .iter()
-        .flat_map(|m| m.rules.iter().filter_map(|r| r.head_name().map(str::to_string)))
+        .flat_map(|m| {
+            m.rules
+                .iter()
+                .filter_map(|r| r.head_name().map(str::to_string))
+        })
         .collect();
     let rules: usize = modules.iter().map(|m| m.rules.len()).sum();
     let types: usize = modules.iter().map(|m| m.types.len()).sum();
@@ -63,7 +89,7 @@ fn main() {
     if with_stdlib {
         modules.insert(0, hyperon_stdlib());
     }
-    let c = classify(&modules);
+    let c = classify(&natives, &modules);
 
     println!(
         "files {} (parse errors {parse_errors}), rules {rules}, rule heads {}, `:` declarations {types}, facts {facts}, `!` queries {queries}, unnamed-head rules {}",
@@ -83,7 +109,9 @@ fn main() {
                         *by_native.entry((*category, name.clone())).or_default() += 1;
                         format!("native {category:?}")
                     }
-                    Reason::VariableCall => "variable call".to_string(),
+                    Reason::VariableHead => {
+                        "variable head (call or tuple, decided at run time)".to_string()
+                    }
                     Reason::Calls { .. } => "calls an interpreter-only head".to_string(),
                 };
                 *by_reason.entry(key).or_default() += 1;
@@ -91,7 +119,9 @@ fn main() {
         }
     }
     println!(
-        "heads lowerable {lowerable}, interpreter-only {} (stdlib {})",
+        "dialect {} ({} natives), heads lowerable {lowerable}, interpreter-only {} (stdlib {})",
+        natives.dialect(),
+        natives.len(),
         corpus_heads.len() - lowerable,
         if with_stdlib { "included" } else { "excluded" }
     );

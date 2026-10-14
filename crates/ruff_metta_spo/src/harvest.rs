@@ -126,8 +126,6 @@ fn is_symbol(atom: &Atom, name: &str) -> bool {
 pub fn hyperon_stdlib() -> Module {
     parse_module(
         "stdlib",
-        include_str!(
-            "../../../../hyperon-experimental/lib/src/metta/runner/stdlib/stdlib.metta"
-        ),
+        include_str!("../../../../hyperon-experimental/lib/src/metta/runner/stdlib/stdlib.metta"),
     )
 }

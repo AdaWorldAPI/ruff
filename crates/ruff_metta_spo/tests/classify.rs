@@ -1,13 +1,17 @@
 //! Behaviour of the harvest and the rule classifier, on small MeTTa programs.
 
 use ruff_metta_spo::{
-    Category, Reason, Verdict, classify, hyperon_stdlib, parse_module, to_model_graph,
+    Category, Natives, Reason, Verdict, classify, hyperon_stdlib, parse_module, to_model_graph,
 };
+
+fn hyperon() -> Natives {
+    Natives::hyperon()
+}
 
 fn verdict_of(src: &str, head: &str) -> Verdict {
     let module = parse_module("t", src);
     assert!(module.parse_error.is_none(), "{:?}", module.parse_error);
-    classify(&[module])
+    classify(&hyperon(), &[module])
         .verdicts
         .get(head)
         .cloned()
@@ -60,14 +64,17 @@ fn arithmetic_makes_a_rule_interpreter_only() {
 #[test]
 fn calling_an_interpreter_only_rule_is_interpreter_only() {
     let module = parse_module("t", "(= (a $x) (b $x))\n(= (b $x) (+ $x 1))\n");
-    let c = classify(&[module]);
+    let c = classify(&hyperon(), &[module]);
     assert_eq!(
         c.verdicts["a"],
         Verdict::InterpreterOnly(Reason::Calls {
             callee: "b".to_string()
         })
     );
-    assert!(matches!(c.verdicts["b"], Verdict::InterpreterOnly(Reason::Builtin { .. })));
+    assert!(matches!(
+        c.verdicts["b"],
+        Verdict::InterpreterOnly(Reason::Builtin { .. })
+    ));
 }
 
 /// The taint has to travel more than one step: `a` -> `b` -> `c` -> `+`.
@@ -77,7 +84,7 @@ fn taint_travels_the_whole_call_chain() {
         "t",
         "(= (a $x) (b $x))\n(= (b $x) (c $x))\n(= (c $x) (+ $x 1))\n",
     );
-    let c = classify(&[module]);
+    let c = classify(&hyperon(), &[module]);
     for head in ["a", "b", "c"] {
         assert!(
             matches!(c.verdicts[head], Verdict::InterpreterOnly(_)),
@@ -95,7 +102,10 @@ fn recursion_through_match_stays_lowerable() {
         "(= (anc $x) (match &self (parent $x $y) $y))\n\
          (= (anc $x) (anc (match &self (parent $x $y) $y)))\n",
     );
-    assert_eq!(classify(&[module]).verdicts["anc"], Verdict::Lowerable);
+    assert_eq!(
+        classify(&hyperon(), &[module]).verdicts["anc"],
+        Verdict::Lowerable
+    );
 }
 
 /// A recursive cycle that touches a builtin anywhere is tainted as a whole.
@@ -105,7 +115,7 @@ fn a_tainted_cycle_taints_every_member() {
         "t",
         "(= (even $x) (odd $x))\n(= (odd $x) (even (- $x 1)))\n",
     );
-    let c = classify(&[module]);
+    let c = classify(&hyperon(), &[module]);
     assert!(matches!(c.verdicts["even"], Verdict::InterpreterOnly(_)));
     assert!(matches!(c.verdicts["odd"], Verdict::InterpreterOnly(_)));
 }
@@ -124,7 +134,10 @@ fn builtins_in_a_match_template_taint() {
     let v = verdict_of("(= (next $x) (match &self (n $x $y) (+ $y 1)))", "next");
     assert!(matches!(
         v,
-        Verdict::InterpreterOnly(Reason::Builtin { category: Category::Arithmetic, .. })
+        Verdict::InterpreterOnly(Reason::Builtin {
+            category: Category::Arithmetic,
+            ..
+        })
     ));
 }
 
@@ -134,14 +147,14 @@ fn one_tainted_clause_taints_the_head() {
         "t",
         "(= (f $x) (match &self (p $x $y) $y))\n(= (f $x) (if $x a b))\n",
     );
-    let c = classify(&[module]);
+    let c = classify(&hyperon(), &[module]);
     // `if` is unresolved without the prelude, so it is a constructor; check with it.
     assert_eq!(c.verdicts["f"], Verdict::Lowerable);
     let module = parse_module(
         "t",
         "(= (f $x) (match &self (p $x $y) $y))\n(= (f $x) (let $y $x $y))\n",
     );
-    let c = classify(&[hyperon_stdlib(), module]);
+    let c = classify(&hyperon(), &[hyperon_stdlib(), module]);
     assert!(matches!(c.verdicts["f"], Verdict::InterpreterOnly(_)));
 }
 
@@ -150,21 +163,21 @@ fn one_tainted_clause_taints_the_head() {
 #[test]
 fn unresolved_heads_are_reported_as_constructors() {
     let module = parse_module("t", "(= (wrap $x) (Box $x))\n");
-    let c = classify(&[module]);
+    let c = classify(&hyperon(), &[module]);
     assert_eq!(c.verdicts["wrap"], Verdict::Lowerable);
     assert!(c.constructors.contains("Box"));
     assert!(!c.constructors.contains("wrap"));
 }
 
 #[test]
-fn a_variable_in_call_position_is_interpreter_only() {
+fn a_variable_headed_expression_is_conservatively_interpreter_only() {
     let v = verdict_of("(= (apply $f $x) ($f $x))", "apply");
-    assert_eq!(v, Verdict::InterpreterOnly(Reason::VariableCall));
+    assert_eq!(v, Verdict::InterpreterOnly(Reason::VariableHead));
 }
 
 #[test]
 fn the_hyperon_stdlib_classifies_through_its_minimal_instructions() {
-    let c = classify(&[hyperon_stdlib()]);
+    let c = classify(&hyperon(), &[hyperon_stdlib()]);
     // `let` is `unify`, a minimal-MeTTa instruction.
     assert_eq!(
         c.verdicts["let"],
@@ -173,13 +186,24 @@ fn the_hyperon_stdlib_classifies_through_its_minimal_instructions() {
             category: Category::Instruction,
         })
     );
-    assert!(matches!(c.verdicts["collapse"], Verdict::InterpreterOnly(_)));
+    assert!(matches!(
+        c.verdicts["collapse"],
+        Verdict::InterpreterOnly(_)
+    ));
     // `id` returns its argument and `if` is two pattern clauses.
     assert_eq!(c.verdicts["id"], Verdict::Lowerable);
     assert_eq!(c.verdicts["if"], Verdict::Lowerable);
     // Anti-vacuity: the stdlib is not classified wholesale one way.
-    let lowerable = c.verdicts.values().filter(|v| **v == Verdict::Lowerable).count();
-    assert!(lowerable > 0 && lowerable * 2 < c.verdicts.len(), "{lowerable} of {}", c.verdicts.len());
+    let lowerable = c
+        .verdicts
+        .values()
+        .filter(|v| **v == Verdict::Lowerable)
+        .count();
+    assert!(
+        lowerable > 0 && lowerable * 2 < c.verdicts.len(),
+        "{lowerable} of {}",
+        c.verdicts.len()
+    );
 }
 
 #[test]
@@ -208,4 +232,21 @@ fn projection_emits_one_function_per_rule_head() {
 fn a_parse_error_is_recorded_not_panicked() {
     let module = parse_module("bad", "(= (f $x) (g $x)\n");
     assert!(module.parse_error.is_some());
+}
+
+/// One rule, two engines. Hyperon's `if` is two pattern clauses in its stdlib;
+/// PeTTa's registry lists `if` as a compiler form.
+#[test]
+fn the_same_rule_gets_a_verdict_per_engine() {
+    let program = parse_module("t", "(= (pick $c) (if $c yes no))\n");
+    let hyperon = classify(&Natives::hyperon(), &[hyperon_stdlib(), program.clone()]);
+    assert_eq!(hyperon.verdicts["pick"], Verdict::Lowerable);
+    let petta = classify(&Natives::petta_fork(), &[program]);
+    assert_eq!(
+        petta.verdicts["pick"],
+        Verdict::InterpreterOnly(Reason::Builtin {
+            name: "if".to_string(),
+            category: Category::Instruction,
+        })
+    );
 }

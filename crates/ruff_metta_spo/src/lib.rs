@@ -11,7 +11,8 @@
 //!   (mask-risc / Quack in lance-graph) can take.
 //! - **Interpreter-only**, with the first [`Reason`]: a minimal-MeTTa instruction
 //!   (`chain`, `unify`, `eval`, ...), a grounded operation (`+`, `println!`,
-//!   `add-atom`, ...), a variable in call position, or a call to another
+//!   `add-atom`, ...), an expression headed by a variable (a call or a tuple, decided
+//!   at run time, so counted conservatively), or a call to another
 //!   interpreter-only head.
 //!
 //! The verdict is computed over the whole call graph, to a fixpoint. A rule that
@@ -26,8 +27,12 @@
 //! [`Classification::constructors`] so an unknown function shows up instead of
 //! silently counting as lowerable.
 //!
-//! [`hyperon_stdlib`] parses the stdlib that ships with the fork, so `let`, `case`,
-//! `collapse` and the rest are classified by the same rule instead of by a list.
+//! Native names are per engine ([`Natives`]). For Hyperon they are the minimal
+//! instructions and grounded tokens, and [`hyperon_stdlib`] parses the stdlib that
+//! ships with the fork, so `let`, `case`, `collapse` and the rest are classified
+//! from their own definitions. For PeTTa they are read from its Prolog builtin
+//! registry, where `if`, `let`, `case` and many more are native. The same rule can
+//! therefore be lowerable under one engine and interpreter-only under the other.
 //!
 //! [`to_model_graph`] projects modules into the shared `ModelGraph` (one model per
 //! module, one function per rule head). The classification and call edges are not
@@ -39,7 +44,7 @@ mod classify;
 mod harvest;
 mod project;
 
-pub use builtins::Category;
+pub use builtins::{Category, Natives};
 pub use classify::{Classification, Reason, Verdict, classify};
 pub use harvest::{Module, Rule, TypeDecl, hyperon_stdlib, parse_module};
 pub use project::to_model_graph;
