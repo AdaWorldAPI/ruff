@@ -391,6 +391,18 @@ pub fn smelt(
                             prov,
                         );
                     }
+                    Err(FacetOverflow::UnresolvedSpace) => {
+                        // Same fallback as an unknown custom space: the residual is anchored
+                        // at the enclosing op's block so it still carries an address.
+                        let at = any_anchor_facet(behavior, prov, conv);
+                        push_named_residual(
+                            &mut ledger,
+                            ResidualReason::UnresolvedSpace,
+                            at,
+                            conv,
+                            prov,
+                        );
+                    }
                     Err(FacetOverflow::CustomOrdinalExhausted { count }) => {
                         // Structurally unreachable for a validly-constructed `CustomSpaceTable`
                         // (the budget is enforced at `from_ids`/`from_arch` time) — handled
