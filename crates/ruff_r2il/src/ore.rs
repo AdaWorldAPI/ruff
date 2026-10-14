@@ -180,12 +180,22 @@ pub enum OpTag {
     Cast,
     Extract,
     Insert,
+    /// One repeated string operation, held as the block it is.
+    BlockTransfer,
+    /// Conditional merge of two values from instruction-local p-code control.
+    Select,
+    /// SSA only: multiway branch on a selector; the block's terminator carries the cases.
+    Switch,
+    /// SSA only: the stack adjustment a callee's return refunds, synthesized at a call.
+    CallRestore,
+    /// SSA only: a call's read of a convention argument register, synthesized at a call.
+    CallUse,
 }
 
 impl OpTag {
     /// One arm per `SSAOp` variant (`r2ssa/src/op.rs`), total match — a variant added upstream
     /// without a corresponding arm here fails to compile, which is the point.
-    pub fn from_op(op: &SSAOp) -> Self {
+    pub fn from_op<V>(op: &SSAOp<V>) -> Self {
         match op {
             SSAOp::Phi { .. } => OpTag::Phi,
             SSAOp::Copy { .. } => OpTag::Copy,
@@ -269,6 +279,11 @@ impl OpTag {
             SSAOp::Cast { .. } => OpTag::Cast,
             SSAOp::Extract { .. } => OpTag::Extract,
             SSAOp::Insert { .. } => OpTag::Insert,
+            SSAOp::BlockTransfer(_) => OpTag::BlockTransfer,
+            SSAOp::Select(_) => OpTag::Select,
+            SSAOp::Switch { .. } => OpTag::Switch,
+            SSAOp::CallRestore { .. } => OpTag::CallRestore,
+            SSAOp::CallUse { .. } => OpTag::CallUse,
         }
     }
 
@@ -360,6 +375,8 @@ impl OpTag {
             R2ILOp::Cast { .. } => OpTag::Cast,
             R2ILOp::Extract { .. } => OpTag::Extract,
             R2ILOp::Insert { .. } => OpTag::Insert,
+            R2ILOp::BlockTransfer(_) => OpTag::BlockTransfer,
+            R2ILOp::Select { .. } => OpTag::Select,
         }
     }
 
@@ -448,6 +465,11 @@ impl OpTag {
             OpTag::Cast => "cast",
             OpTag::Extract => "extract",
             OpTag::Insert => "insert",
+            OpTag::BlockTransfer => "block_transfer",
+            OpTag::Select => "select",
+            OpTag::Switch => "switch",
+            OpTag::CallRestore => "call_restore",
+            OpTag::CallUse => "call_use",
         }
     }
 
@@ -831,7 +853,7 @@ pub fn enumerate(behavior: &FunctionBehavior, blocks: &[R2ILBlock]) -> Vec<OreFa
                         prov,
                         opcode: OpTag::Phi,
                         ordinal: inst.ordinal,
-                        input_arity: inst.inputs.len(),
+                        input_arity: graph.inputs(inst_id).len(),
                         has_output: inst.output.is_some(),
                     });
                 }
@@ -848,7 +870,7 @@ pub fn enumerate(behavior: &FunctionBehavior, blocks: &[R2ILBlock]) -> Vec<OreFa
                         prov: base_prov,
                         opcode,
                         ordinal: inst.ordinal,
-                        input_arity: inst.inputs.len(),
+                        input_arity: graph.inputs(inst_id).len(),
                         has_output: inst.output.is_some(),
                     });
 
@@ -880,7 +902,7 @@ pub fn enumerate(behavior: &FunctionBehavior, blocks: &[R2ILBlock]) -> Vec<OreFa
                     }
 
                     for (index, varnode) in source_op.inputs().into_iter().enumerate() {
-                        let value = inst.inputs.get(index).copied();
+                        let value = graph.inputs(inst_id).get(index).copied();
                         facts.push(OreFact::Operand {
                             prov: FactProvenance { value, ..base_prov },
                             position: OperandPos::Input(index),
@@ -935,8 +957,10 @@ pub fn enumerate(behavior: &FunctionBehavior, blocks: &[R2ILBlock]) -> Vec<OreFa
                     op_site: None,
                     value: inst.output,
                 };
-                for (index, (&pred, &value)) in
-                    predecessors.iter().zip(inst.inputs.iter()).enumerate()
+                for (index, (&pred, &value)) in predecessors
+                    .iter()
+                    .zip(graph.inputs(inst_id).iter())
+                    .enumerate()
                 {
                     facts.push(OreFact::PhiInput {
                         prov: FactProvenance {
@@ -952,9 +976,9 @@ pub fn enumerate(behavior: &FunctionBehavior, blocks: &[R2ILBlock]) -> Vec<OreFa
         }
     }
 
-    // Function-wide facts — every container is a BTreeMap, so iteration order is already the
-    // required ascending-id order; nothing is re-sorted here.
-    for (&inst_id, uses) in &behavior.memory().uses_by_inst {
+    // Function-wide facts — every container iterates in ascending id order (a `BTreeMap`, or
+    // upstream's `IdMap`, which walks its id bitset), so nothing is re-sorted here.
+    for (inst_id, uses) in &behavior.memory().uses_by_inst {
         let block = graph.inst(inst_id).map(|inst| inst.block);
         let op_site = behavior.op_site(inst_id);
         for use_fact in uses {
@@ -971,7 +995,7 @@ pub fn enumerate(behavior: &FunctionBehavior, blocks: &[R2ILBlock]) -> Vec<OreFa
             });
         }
     }
-    for (&inst_id, defs) in &behavior.memory().defs_by_inst {
+    for (inst_id, defs) in &behavior.memory().defs_by_inst {
         let block = graph.inst(inst_id).map(|inst| inst.block);
         let op_site = behavior.op_site(inst_id);
         for def_fact in defs {
@@ -1042,21 +1066,18 @@ fn find_source_op(blocks: &[R2ILBlock], addr: u64, idx: usize) -> Option<&R2ILOp
 
 /// The native instruction address an ore fact came from, when the lifter recorded one.
 ///
-/// SSA does not carry it — `SSAOp` has no address field at all — so this is the
-/// `(block_addr, op_idx)` sidecar rejoin against `R2ILBlock::op_metadata`, the SAME key
-/// `SsaGraph::op_inst_by_site` uses (and the same key [`FactProvenance::op_site`] already
-/// carries). `None` when `prov.op_site` is `None` (a phi, a `CallDefine`, or a function-wide
-/// fact with no single op site), when the site's block is not in `blocks`, or when the lifter
-/// recorded no per-op metadata at that index (e.g. a single-instruction lift, where the block
-/// address itself already IS the instruction address).
+/// `SSAOp` has no address field, so this rejoins the fact's `(block_addr, op_idx)` site
+/// ([`FactProvenance::op_site`]) to the source block and asks it which instruction that op was
+/// lifted from (`R2ILBlock::instruction_of`, backed by the block's `InstructionRuns`). `None`
+/// when `prov.op_site` is `None` (a phi, a `CallDefine`, or a function-wide fact with no single
+/// op site), when the site's block is not in `blocks`, or when the lifter stamped no instruction
+/// on that op (e.g. a hand-built block).
 pub fn instruction_addr(prov: &FactProvenance, blocks: &[R2ILBlock]) -> Option<u64> {
     let (addr, idx) = prov.op_site?;
     blocks
         .iter()
         .find(|block| block.addr == addr)?
-        .op_metadata
-        .get(&idx)?
-        .instruction_addr
+        .instruction_of(idx)
 }
 
 /// Classify one CFG edge. `JUDGMENT` (undocumented upstream, no dedicated edge-kind type
@@ -1160,7 +1181,7 @@ mod tests {
         let mut b1 = R2ILBlock::new(0x2004, 4);
         b1.push(R2ILOp::Multiequal {
             dst: reg(0x00, 8),
-            inputs: vec![reg(0x08, 8), reg(0x10, 8), reg(0x18, 8)],
+            inputs: vec![reg(0x08, 8)],
         });
         b1.push(R2ILOp::Return {
             target: reg(0x00, 8),
@@ -1271,7 +1292,7 @@ mod tests {
         //   B1 (0x2004): Op(Phi) [no operand rows: phi payload, no join target]    = 1
         //                Op(Return) + JoinFailure (no Operand rows: mismatch)      = 2
         //     (Return has no successors -> 0 Edge rows)
-        //     PhiInput (1 phi, fan-in truncated to the single CFG predecessor)     = 1
+        //     PhiInput (1 phi, fan-in = the single CFG predecessor)                = 1
         //   memory / predicates / call sites: none in this fixture                = 0
         // total                                                                    = 7
         assert_eq!(
@@ -1283,16 +1304,10 @@ mod tests {
     }
 
     #[test]
-    fn instruction_addr_rejoins_op_metadata_by_op_site_and_is_none_without_it() {
+    fn instruction_addr_rejoins_the_instruction_stamp_by_op_site_and_is_none_without_it() {
         let mut blocks = linear_fixture();
-        // op index 1 of block 0x1000 is the `Branch` — attach a real instruction address to it.
-        blocks[0].set_op_metadata(
-            1,
-            r2il::OpMetadata {
-                instruction_addr: Some(0xDEAD_BEEF),
-                ..Default::default()
-            },
-        );
+        // op index 1 of block 0x1000 is the `Branch` — stamp a real instruction address on it.
+        blocks[0].stamp_instruction(1, 0xDEAD_BEEF);
         let behavior =
             FunctionBehavior::from_blocks_raw(&blocks, None).expect("linear fixture ingests");
         let facts = enumerate(&behavior, &blocks);
@@ -1311,10 +1326,10 @@ mod tests {
         assert_eq!(
             instruction_addr(&branch_prov, &blocks),
             Some(0xDEAD_BEEF),
-            "op index 1 carries metadata and must rejoin to its instruction address"
+            "op index 1 carries a stamp and must rejoin to its instruction address"
         );
 
-        // Two-sided: op index 0 (the IntAdd) has NO metadata attached — a stub that always
+        // Two-sided: op index 0 (the IntAdd) has NO stamp — a stub that always
         // returns the same address, or that ignores op_idx, fails this half.
         let int_add_prov = facts
             .iter()
@@ -1330,7 +1345,7 @@ mod tests {
         assert_eq!(
             instruction_addr(&int_add_prov, &blocks),
             None,
-            "op index 0 carries no metadata and must rejoin to None, not the sibling's address"
+            "op index 0 carries no stamp and must rejoin to None, not the sibling's address"
         );
     }
 }

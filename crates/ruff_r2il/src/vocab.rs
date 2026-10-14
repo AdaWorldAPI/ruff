@@ -113,20 +113,21 @@ pub struct VocabHarvest {
     /// of the same physical register (e.g. two writes to `reg:38`) intern to the same
     /// [`VocabId`].
     pub ssa_names: VocabTable,
-    /// `SSAOp`'s own `space: String` field, present on the seven memory ops (`Load`, `Store`,
-    /// `LoadLinked`, `StoreConditional`, `AtomicCAS`, `LoadGuarded`, `StoreGuarded`).
-    /// Debug-formatted upstream (`"Ram"`, `"Custom(7)"`, …) — see [`parse_custom_space_id`]'s doc
-    /// comment for the exact upstream call site this mirrors.
+    /// The `space` of the seven memory ops (`Load`, `Store`, `LoadLinked`, `StoreConditional`,
+    /// `AtomicCAS`, `LoadGuarded`, `StoreGuarded`), in `SpaceId`'s display form (`"ram"`,
+    /// `"space7"`, …). Upstream once carried this as a string; it is now a typed `SpaceId`.
     pub op_spaces: VocabTable,
-    /// `ObjectKind::Global { space, .. }`'s `space` string, over every object in the function's
-    /// `ObjectModel`.
+    /// `ObjectKind::Global { space, .. }`'s `space`, in `SpaceId`'s display form, over every
+    /// object in the function's `ObjectModel`.
     pub object_spaces: VocabTable,
     /// `CallOther`'s `userop: u32` — **counted, not interned** (see the module docs). Key =
     /// userop index, value = number of `CallOther` sites mentioning it.
     pub userops: BTreeMap<u32, usize>,
-    /// [`parse_custom_space_id`] applied to every observed `op_spaces` string, kept only where it
-    /// parsed. The STRING-recovered half of the [`custom_space_ids_from_blocks`] measurement —
-    /// compare against that typed oracle, never trust this set alone.
+    /// Every `SpaceId::Custom(n)` seen in a memory op's `space`. This used to be recovered by
+    /// parsing upstream's space string, and compared against the typed
+    /// [`custom_space_ids_from_blocks`] oracle to measure what the string lost. Upstream now
+    /// carries the typed `SpaceId` on the op, so the id is read directly and the two sets agree
+    /// by construction; the name is kept so callers are unchanged.
     pub custom_spaces_from_strings: BTreeSet<u32>,
 
     // Private bookkeeping so `stats()` can report the interning-savings measurement without
@@ -150,8 +151,8 @@ impl VocabHarvest {
         let mut ssa_name_list: Vec<String> = Vec::with_capacity(graph.values.len());
         for value in &graph.values {
             total_ssa_values += 1;
-            ssa_name_bytes_raw += value.var.name.len();
-            ssa_name_list.push(value.var.name.clone());
+            ssa_name_bytes_raw += value.var.name().len();
+            ssa_name_list.push(value.var.name().to_owned());
         }
         let ssa_names = VocabTable::from_names(ssa_name_list);
 
@@ -165,7 +166,7 @@ impl VocabHarvest {
             };
             if let Some(space) = ssa_op_memory_space(op) {
                 op_space_names.insert(space.to_string());
-                if let Some(id) = parse_custom_space_id(space) {
+                if let SpaceId::Custom(id) = space {
                     custom_spaces_from_strings.insert(id);
                 }
             }
@@ -178,7 +179,7 @@ impl VocabHarvest {
         let mut object_space_names: BTreeSet<String> = BTreeSet::new();
         for fact in behavior.objects().objects.values() {
             if let ObjectKind::Global { space, .. } = &fact.kind {
-                object_space_names.insert(space.clone());
+                object_space_names.insert(space.to_string());
             }
         }
         let object_spaces = VocabTable::from_names(object_space_names);
@@ -239,15 +240,15 @@ pub struct VocabStats {
 /// The address-space field carried directly by the seven memory [`SSAOp`] variants (distinct from
 /// the space of any operand — an op's `addr` var is typically register/const-space and holds an
 /// address value; this field says which memory space that address refers *into*).
-fn ssa_op_memory_space(op: &SSAOp) -> Option<&str> {
+fn ssa_op_memory_space<V>(op: &SSAOp<V>) -> Option<SpaceId> {
     match op {
         SSAOp::Load { space, .. }
         | SSAOp::Store { space, .. }
         | SSAOp::LoadLinked { space, .. }
         | SSAOp::StoreConditional { space, .. }
-        | SSAOp::AtomicCAS { space, .. }
         | SSAOp::LoadGuarded { space, .. }
-        | SSAOp::StoreGuarded { space, .. } => Some(space.as_str()),
+        | SSAOp::StoreGuarded { space, .. } => Some(*space),
+        SSAOp::AtomicCAS(cas) => Some(cas.space),
         _ => None,
     }
 }

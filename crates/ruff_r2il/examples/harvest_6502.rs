@@ -37,7 +37,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SpaceId};
-use r2sleigh_lift::{Disassembler, build_arch_spec, userop_map_for_arch};
+use r2sleigh_lift::{Disassembler, build_arch_spec};
 use sleigh_compiler::{SleighCompiler, SleighCompilerOptions};
 
 use ruff_r2il::behavior::FunctionBehavior;
@@ -447,15 +447,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("read {}: {e}", pspec_path.display()))?;
 
     let spec: ArchSpec = build_arch_spec(&sla_bytes, &pspec, "6502")?;
-    let mut disasm = Disassembler::from_sla(&sla_bytes, &pspec, "6502")?;
-    disasm.set_userop_map(userop_map_for_arch("6502"));
+    let disasm = Disassembler::from_sla(&sla_bytes, &pspec, "6502")?;
 
     let conv = R2ilConvention::from_arch(&spec, pass_one_seven())
         .map_err(|e| format!("R2ilConvention::from_arch(6502) failed: {e}"))?;
     eprintln!(
         "[harvest-6502] convention built from {} registers, {} userops",
         spec.registers.len(),
-        spec.userops.len()
+        spec.user_ops.len()
     );
 
     let mut entries: Vec<CorpusEntry> = Vec::new();

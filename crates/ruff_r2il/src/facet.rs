@@ -42,9 +42,7 @@ pub const MAX_CUSTOM_ORDINAL: u16 = u16::MAX - CUSTOM_ORDINAL_BASE;
 /// - `8..12`  offset, high 32 bits
 /// - `12..16` `size: u32`
 ///
-/// `Varnode::meta` is **documented-excluded** (advisory plane) — matching upstream, where
-/// `Varnode`'s `PartialEq`/`Hash` already ignore it (`r2il/src/varnode.rs:149-163`). Two
-/// varnodes that differ only in `meta` project to byte-identical facets.
+/// A `Varnode` is exactly `(space, offset, size)`, so the projection is total and lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VarnodeFacet(pub [u8; 16]);
 
@@ -253,8 +251,7 @@ pub fn project(vn: &Varnode, spaces: &CustomSpaceTable) -> Result<VarnodeFacet, 
     Ok(VarnodeFacet(bytes))
 }
 
-/// Recover a `Varnode` from a drill key. The inverse of [`project`]; `meta` is always `None`
-/// on the result (it was never part of the projection — see [`VarnodeFacet`]'s docs).
+/// Recover a `Varnode` from a drill key. The inverse of [`project`].
 pub fn unproject(f: &VarnodeFacet, spaces: &CustomSpaceTable) -> Result<Varnode, FacetOverflow> {
     let discriminant = f.space_discriminant();
     let space = match discriminant {
@@ -275,7 +272,6 @@ pub fn unproject(f: &VarnodeFacet, spaces: &CustomSpaceTable) -> Result<Varnode,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use r2il::{ScalarKind, VarnodeMetadata};
 
     #[test]
     fn fixed_spaces_round_trip_byte_for_byte() {
@@ -393,21 +389,6 @@ mod tests {
 
         let back = unproject(&facet, &table).expect("must unproject");
         assert_eq!(back, vn);
-    }
-
-    #[test]
-    fn meta_is_excluded_from_the_projection() {
-        // Mirrors r2il::Varnode, whose PartialEq/Hash already ignore `meta`
-        // (r2il/src/varnode.rs:149-163) — the facet projection preserves that contract.
-        let table = CustomSpaceTable::default();
-        let plain = Varnode::register(0x18, 4);
-        let with_meta = plain.clone().with_meta(VarnodeMetadata {
-            scalar_kind: Some(ScalarKind::SignedInt),
-            ..Default::default()
-        });
-        let f_plain = project(&plain, &table).expect("project plain");
-        let f_meta = project(&with_meta, &table).expect("project with meta");
-        assert_eq!(f_plain, f_meta, "meta must not change the projected bytes");
     }
 
     #[test]

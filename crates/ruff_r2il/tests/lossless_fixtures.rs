@@ -13,8 +13,8 @@
 use std::collections::BTreeSet;
 
 use r2il::{
-    ArchSpec, AtomicKind, MemoryOrdering, OpMetadata, PointerHint, R2ILBlock, R2ILOp, RegisterDef,
-    ScalarKind, SpaceId, Varnode, VarnodeMetadata,
+    ArchSpec, AtomicKind, MemoryOrdering, OpMetadata, R2ILBlock, R2ILOp, RegisterDef, SpaceId,
+    Varnode,
 };
 use r2ssa::{CompareKind, InstPayload, SSAOp};
 
@@ -210,17 +210,6 @@ fn fixture_function() -> Vec<R2ILBlock> {
         },
     );
 
-    // Varnode metadata on op 3's dst (the LoadGuarded).
-    if let R2ILOp::LoadGuarded { dst, .. } = &mut b2.ops[3] {
-        dst.set_meta(VarnodeMetadata {
-            scalar_kind: Some(ScalarKind::UnsignedInt),
-            pointer_hint: Some(PointerHint::PointerLike),
-            ..Default::default()
-        });
-    } else {
-        unreachable!("op index 3 must be the LoadGuarded pushed above");
-    }
-
     // B3 @ 0x1018 size 8 -- merge, 3 predecessors, terminator Return (the reverse
     // scan hits Return before Call; correct and intended).
     let mut b3 = R2ILBlock::new(0x1018, 8);
@@ -234,10 +223,9 @@ fn fixture_function() -> Vec<R2ILBlock> {
     vec![b0, b1, b2, b3]
 }
 
-/// Own 2-block fixture: B0 branches unconditionally into B1, but B1's `Multiequal`
-/// declares 3 inputs even though the CFG gives it only 1 real predecessor. This is
-/// the phi-zip stressor test 8 probes.
-fn multiequal_fixture() -> Vec<R2ILBlock> {
+/// Own 2-block fixture: B0 branches unconditionally into B1, whose `Multiequal`
+/// declares `inputs` inputs against the CFG's single predecessor. Test 8 probes it.
+fn multiequal_fixture_with(inputs: usize) -> Vec<R2ILBlock> {
     let mut b0 = R2ILBlock::new(0x2000, 4);
     b0.push(R2ILOp::Branch {
         target: con(0x2004, 8),
@@ -246,13 +234,18 @@ fn multiequal_fixture() -> Vec<R2ILBlock> {
     let mut b1 = R2ILBlock::new(0x2004, 4);
     b1.push(R2ILOp::Multiequal {
         dst: reg(0x00, 8),
-        inputs: vec![reg(0x08, 8), reg(0x10, 8), reg(0x18, 8)],
+        inputs: (0..inputs).map(|i| reg(0x08 * (i as u64 + 1), 8)).collect(),
     });
     b1.push(R2ILOp::Return {
         target: reg(0x00, 8),
     });
 
     vec![b0, b1]
+}
+
+/// A well-formed `Multiequal`: one input for the block's one predecessor.
+fn multiequal_fixture() -> Vec<R2ILBlock> {
+    multiequal_fixture_with(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -389,59 +382,91 @@ fn facts_are_populated_and_counted_against_upstreams_own_classification() {
         "B0 compares via IntLess, B1 via IntSLess"
     );
 
-    // Memory counts, computed from upstream's OWN classification rule (never
+    // Memory facts, checked against upstream's OWN classification rule (never
     // hardcoded): uses <- Load/LoadLinked/LoadGuarded/AtomicCAS/StoreConditional;
     // defs <- Store/StoreGuarded/StoreConditional/AtomicCAS; both <- Call/CallInd.
+    // The instructions carrying memory facts must be exactly those, every memory op
+    // carries exactly one, and a call carries at least one: upstream records one fact
+    // per memory object a call may touch, which the opcode alone does not determine.
     let graph = behavior.values();
-    let mut expected_uses = 0usize;
-    let mut expected_defs = 0usize;
+    let mut expected_uses: BTreeSet<r2ssa::InstId> = BTreeSet::new();
+    let mut expected_defs: BTreeSet<r2ssa::InstId> = BTreeSet::new();
+    let mut calls: BTreeSet<r2ssa::InstId> = BTreeSet::new();
     for inst in &graph.insts {
         let InstPayload::Op(op) = &inst.payload else {
             continue;
         };
         match op {
             SSAOp::Load { .. } | SSAOp::LoadLinked { .. } | SSAOp::LoadGuarded { .. } => {
-                expected_uses += 1;
+                expected_uses.insert(inst.id);
             }
             SSAOp::AtomicCAS { .. } | SSAOp::StoreConditional { .. } => {
-                expected_uses += 1;
-                expected_defs += 1;
+                expected_uses.insert(inst.id);
+                expected_defs.insert(inst.id);
             }
             SSAOp::Store { .. } | SSAOp::StoreGuarded { .. } => {
-                expected_defs += 1;
+                expected_defs.insert(inst.id);
             }
             SSAOp::Call { .. } | SSAOp::CallInd { .. } => {
-                expected_uses += 1;
-                expected_defs += 1;
+                expected_uses.insert(inst.id);
+                expected_defs.insert(inst.id);
+                calls.insert(inst.id);
             }
             _ => {}
         }
     }
     assert!(
-        expected_uses >= 5,
+        expected_uses.len() >= 5,
         "anti-vacuity: the fixture must exercise enough memory uses"
+    );
+    assert!(
+        !calls.is_empty(),
+        "anti-vacuity: the fixture must make a call"
     );
 
     let memory = behavior.memory();
-    let observed_uses: usize = memory.uses_by_inst.values().map(Vec::len).sum();
-    let observed_defs: usize = memory.defs_by_inst.values().map(Vec::len).sum();
+    let observed_uses: BTreeSet<r2ssa::InstId> = (&memory.uses_by_inst)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let observed_defs: BTreeSet<r2ssa::InstId> = (&memory.defs_by_inst)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     assert_eq!(observed_uses, expected_uses);
     assert_eq!(observed_defs, expected_defs);
+    let use_counts = (&memory.uses_by_inst)
+        .into_iter()
+        .map(|(id, facts)| (id, facts.len()));
+    let def_counts = (&memory.defs_by_inst)
+        .into_iter()
+        .map(|(id, facts)| (id, facts.len()));
+    for (id, facts) in use_counts.chain(def_counts) {
+        if calls.contains(&id) {
+            assert!(facts >= 1, "a call carries at least one memory fact");
+        } else {
+            assert_eq!(facts, 1, "a memory op carries exactly one fact per kind");
+        }
+    }
 
-    // Objects: the 64-bit RAM literal in B2 must resolve to a global object.
-    //
-    // NOTE (measurement, not an assertion): the resolved `GlobalObjectKey.space`
-    // is upstream's own Debug-formatted `SpaceId::Ram` ("Ram"), produced by
-    // `r2ssa::rename`'s function-level renaming. That formatting is upstream's,
-    // not ours, so it is recorded here rather than asserted on.
+    // Objects: the B2 Load reads its address out of RAM at the 64-bit literal, so the
+    // memory it touches is not known statically. Upstream models it as escaped, not
+    // as a global at the literal, and the fixture's guarded ops escape into Custom(7).
     let objects = behavior.objects();
     assert!(
-        objects
-            .global_objects
-            .keys()
-            .any(|key| key.address == 0x1234_5678_9ABC_DEF0),
-        "the exact 64-bit RAM literal must resolve to a global object"
+        objects.global_objects.is_empty(),
+        "no access in the fixture names a global statically"
     );
+    let escaped: Vec<SpaceId> = objects
+        .objects
+        .values()
+        .filter_map(|fact| match fact.kind {
+            r2ssa::ObjectKind::EscapedUnknown { space } => Some(space),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(escaped.len(), 2, "one escaped object per touched space");
+    assert!(escaped.contains(&SpaceId::Ram) && escaped.contains(&SpaceId::Custom(7)));
 }
 
 // ---------------------------------------------------------------------------
@@ -457,14 +482,14 @@ fn phi_fan_in_equals_the_predecessor_count_at_the_three_way_merge() {
     assert_eq!(preds.len(), 3, "B3 merges three blocks");
 
     let block = behavior
-        .control()
-        .get_block(0x1018)
+        .values()
+        .named_block(0x1018)
         .expect("the merge block must exist");
     assert!(
-        !block.phis.is_empty(),
+        !block.phis().is_empty(),
         "reg:0 is live-into B3 with three distinct definitions, so at least one phi must exist"
     );
-    for phi in &block.phis {
+    for phi in block.phis() {
         assert_eq!(phi.sources.len(), 3);
         assert_eq!(phi.sources.len(), preds.len());
     }
@@ -479,8 +504,8 @@ fn custom_space_and_every_memory_ordering_survive_into_typed_ssa_ops() {
     let blocks = fixture_function();
     let behavior = FunctionBehavior::from_blocks_raw(&blocks, None).unwrap();
 
-    let mut load_guarded_space: Option<String> = None;
-    let mut store_guarded_space: Option<String> = None;
+    let mut load_guarded_space: Option<SpaceId> = None;
+    let mut store_guarded_space: Option<SpaceId> = None;
     let mut load_guarded_ordering: Option<MemoryOrdering> = None;
     let mut store_guarded_ordering: Option<MemoryOrdering> = None;
     let mut orderings: BTreeSet<&'static str> = BTreeSet::new();
@@ -493,19 +518,19 @@ fn custom_space_and_every_memory_ordering_survive_into_typed_ssa_ops() {
             SSAOp::LoadGuarded {
                 space, ordering, ..
             } => {
-                load_guarded_space = Some(space.clone());
+                load_guarded_space = Some(*space);
                 load_guarded_ordering = Some(*ordering);
                 orderings.insert(ordering_key(*ordering));
             }
             SSAOp::StoreGuarded {
                 space, ordering, ..
             } => {
-                store_guarded_space = Some(space.clone());
+                store_guarded_space = Some(*space);
                 store_guarded_ordering = Some(*ordering);
                 orderings.insert(ordering_key(*ordering));
             }
-            SSAOp::AtomicCAS { ordering, .. } => {
-                orderings.insert(ordering_key(*ordering));
+            SSAOp::AtomicCAS(cas) => {
+                orderings.insert(ordering_key(cas.ordering));
             }
             SSAOp::StoreConditional { ordering, .. } => {
                 orderings.insert(ordering_key(*ordering));
@@ -519,7 +544,11 @@ fn custom_space_and_every_memory_ordering_survive_into_typed_ssa_ops() {
 
     let lg_space = load_guarded_space.expect("LoadGuarded must survive ingest");
     let sg_space = store_guarded_space.expect("StoreGuarded must survive ingest");
-    assert!(!lg_space.is_empty(), "the custom space must carry a name");
+    assert_eq!(
+        lg_space,
+        SpaceId::Custom(7),
+        "the fixture places the guarded ops in Custom(7)"
+    );
     assert_eq!(
         lg_space, sg_space,
         "LoadGuarded and StoreGuarded share the same custom space"
@@ -577,51 +606,6 @@ fn op_metadata_rejoins_by_op_site_even_though_ssa_does_not_carry_it() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. varnode_metadata_is_advisory_and_does_not_change_ingest
-// ---------------------------------------------------------------------------
-
-#[test]
-fn varnode_metadata_is_advisory_and_does_not_change_ingest() {
-    fn one_op_block(with_meta: bool) -> Vec<R2ILBlock> {
-        let mut dst = reg(0x30, 8);
-        if with_meta {
-            dst.set_meta(VarnodeMetadata {
-                scalar_kind: Some(ScalarKind::UnsignedInt),
-                pointer_hint: Some(PointerHint::PointerLike),
-                ..Default::default()
-            });
-        }
-        let mut block = R2ILBlock::new(0x3000, 4);
-        block.push(R2ILOp::IntAdd {
-            dst,
-            a: reg(0x00, 8),
-            b: con(1, 8),
-        });
-        block.push(R2ILOp::Return {
-            target: reg(0x30, 8),
-        });
-        vec![block]
-    }
-
-    let plain = FunctionBehavior::from_blocks_raw(&one_op_block(false), None)
-        .expect("plain fixture must ingest");
-    let annotated = FunctionBehavior::from_blocks_raw(&one_op_block(true), None)
-        .expect("annotated fixture must ingest");
-
-    let value_triples = |behavior: &FunctionBehavior| -> Vec<(String, u32, u32)> {
-        behavior
-            .values()
-            .values
-            .iter()
-            .map(|v| (v.var.name.clone(), v.var.version, v.var.size))
-            .collect()
-    };
-
-    assert_eq!(value_triples(&plain), value_triples(&annotated));
-    assert_eq!(plain.values().insts.len(), annotated.values().insts.len());
-}
-
-// ---------------------------------------------------------------------------
 // 8. multiequal_ingest_becomes_a_phi_zipped_to_the_predecessor_count
 // ---------------------------------------------------------------------------
 
@@ -632,28 +616,34 @@ fn multiequal_ingest_becomes_a_phi_zipped_to_the_predecessor_count() {
 
     let preds = behavior.control().predecessors(0x2004);
     let block = behavior
-        .control()
-        .get_block(0x2004)
+        .values()
+        .named_block(0x2004)
         .expect("the multiequal block must exist");
 
     assert_eq!(
-        block.phis.len(),
+        block.phis().len(),
         1,
         "exactly one phi at the multiequal site"
     );
-    let phi = &block.phis[0];
+    let phi = &block.phis()[0];
 
-    // State the rule, not the number: fan-in is truncated to zip against the
-    // CFG's own predecessor count, even though the source Multiequal declared 3
-    // inputs against a block with only 1 real predecessor.
+    // State the rule, not the number: the phi's fan-in is the CFG's own
+    // predecessor count.
     assert_eq!(phi.sources.len(), preds.len());
 
-    for op in &block.ops {
+    for op in block.ops() {
         assert!(
             !matches!(op, SSAOp::Phi { .. }),
             "phi-shaped ops must never remain in block.ops"
         );
     }
+
+    // A Multiequal whose input count disagrees with the block's predecessors
+    // is refused at ingest; it is not truncated to fit.
+    assert!(
+        FunctionBehavior::from_blocks_raw(&multiequal_fixture_with(3), None).is_none(),
+        "3 inputs against 1 predecessor must not ingest"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -665,12 +655,14 @@ fn sixty_four_bit_offsets_are_not_truncated_on_ingest() {
     let blocks = fixture_function();
     let behavior = FunctionBehavior::from_blocks_raw(&blocks, None).unwrap();
 
-    let objects = behavior.objects();
+    // The Load's address operand is the RAM varnode at the 64-bit literal; it must
+    // survive as an SSA value carrying the whole address.
     assert!(
-        objects
-            .global_objects
-            .keys()
-            .any(|key| key.address == 0x1234_5678_9ABC_DEF0),
+        behavior
+            .values()
+            .values
+            .iter()
+            .any(|v| v.var.name() == "ram:123456789abcdef0"),
         "the exact 64-bit address must survive"
     );
 
@@ -681,7 +673,7 @@ fn sixty_four_bit_offsets_are_not_truncated_on_ingest() {
             .values()
             .values
             .iter()
-            .all(|v| v.var.name != truncated_name),
+            .all(|v| v.var.name() != truncated_name),
         "no SSAVar name may equal the 32-bit-truncated form"
     );
 }

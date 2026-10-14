@@ -41,7 +41,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use r2il::{ArchSpec, R2ILBlock, R2ILOp, SpaceId};
-use r2sleigh_lift::{Disassembler, build_arch_spec, userop_map_for_arch};
+use r2sleigh_lift::{Disassembler, build_arch_spec};
 
 use ruff_r2il::behavior::FunctionBehavior;
 use ruff_r2il::convention::R2ilConvention;
@@ -896,9 +896,9 @@ fn run_pass2_over(
 
         stats.functions_processed += 1;
         stats.blocks_per_fn.push(bbs.len());
-        for block in behavior.control().blocks() {
-            stats.ops_per_block.push(block.ops.len());
-            for phi in &block.phis {
+        for block in behavior.values().named_blocks() {
+            stats.ops_per_block.push(block.ops().len());
+            for phi in block.phis() {
                 stats.phi_fanin.push(phi.sources.len());
             }
         }
@@ -986,7 +986,7 @@ fn main() {
         }
     };
 
-    let mut disasm = match Disassembler::from_sla(
+    let disasm = match Disassembler::from_sla(
         sleigh_config::processor_x86::SLA_X86_64,
         sleigh_config::processor_x86::PSPEC_X86_64,
         "x86-64",
@@ -997,7 +997,6 @@ fn main() {
             return;
         }
     };
-    disasm.set_userop_map(userop_map_for_arch("x86-64"));
 
     // The pass-1 seven, bootstrapped from the real x86-64 ArchSpec so Pass 2's smelt/facet
     // sweep can also resolve register operands (see impl-spec §10 test 12). Falls back to the

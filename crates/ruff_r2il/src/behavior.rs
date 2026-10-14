@@ -10,9 +10,10 @@
 use std::collections::BTreeMap;
 
 use r2il::{ArchSpec, R2ILBlock};
+use r2ssa::interproc::InterprocSummarySchemaError;
 use r2ssa::{
-    CallSiteFacts, FunctionSemanticSummary, InstId, InterprocFunctionId, InterprocFunctionInput,
-    InterprocSolveConfig, MemorySSAFacts, ObjectModel, PredicateFacts, PreparedFunctionFacts,
+    Arch, CallSiteFacts, FunctionSemanticSummary, InstId, InterprocFunctionId,
+    InterprocFunctionInput, MemorySSAFacts, ObjectModel, PredicateFacts, PreparedFunctionFacts,
     SSAFunction, SSAVar, SsaArtifact, SsaGraph, UseSite, ValueId, solve_interproc_summary_set,
 };
 
@@ -42,7 +43,9 @@ pub struct FunctionIdentity {
 /// `&SsaArtifact` — a hand-assembled triple could never produce the `summary` the same struct
 /// declares. Holding the artifact keeps all five concerns verbatim as accessors. Nothing is
 /// copied.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: upstream's `SsaArtifact` is not, because it carries a sealing authority.
+#[derive(Debug)]
 pub struct FunctionBehavior {
     identity: FunctionIdentity,
     artifact: SsaArtifact,
@@ -56,7 +59,7 @@ impl FunctionBehavior {
     ///
     /// This is the losslessness-claiming ingest path — no optimization pass runs.
     pub fn from_blocks_raw(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        let artifact = SsaArtifact::raw(blocks, arch)?;
+        let artifact = SsaArtifact::raw(blocks, arch.map(arch_of).as_ref())?;
         let function = artifact.function();
         let identity = FunctionIdentity {
             entry: function.entry,
@@ -73,7 +76,7 @@ impl FunctionBehavior {
     /// GENERIC ingest (`SsaArtifact::from_blocks`) — applies constructor-time SCCP and can
     /// REWRITE ops. Never use it for anything claiming losslessness.
     pub fn from_blocks(blocks: &[R2ILBlock], arch: Option<&ArchSpec>) -> Option<Self> {
-        let artifact = SsaArtifact::from_blocks(blocks, arch)?;
+        let artifact = SsaArtifact::from_blocks(blocks, arch.map(arch_of).as_ref())?;
         let function = artifact.function();
         let identity = FunctionIdentity {
             entry: function.entry,
@@ -104,26 +107,28 @@ impl FunctionBehavior {
 
     /// Solve one [`FunctionSemanticSummary`] for this function in isolation: one
     /// `InterprocFunctionInput { id, name, prepared: self.artifact() }` →
-    /// `solve_interproc_summary_set(&[input], arch, Some(id), &BTreeMap::new(),
-    /// InterprocSolveConfig::default())` → `set.summaries.remove(&id)`.
+    /// `solve_interproc_summary_set(&[input], Some(id), &BTreeMap::new())` →
+    /// `set.summaries.remove(&id)`.
+    ///
+    /// The architecture is the one the artifact was built with; upstream no longer takes it
+    /// again here. The solve validates the seed summaries, and with none to seed it can only
+    /// fail on a summary it produced itself, which the error reports.
     ///
     /// Single-function scope: `has_unknown_calls` true whenever the function calls anything is
     /// CORRECT under this scope, not a defect — a wider call graph is out of scope for the ore
     /// carrier and belongs to a caller that assembles multiple `FunctionBehavior`s itself.
-    pub fn solve_summary(&mut self, id: InterprocFunctionId, arch: Option<&ArchSpec>) {
+    pub fn solve_summary(
+        &mut self,
+        id: InterprocFunctionId,
+    ) -> Result<(), InterprocSummarySchemaError> {
         let input = InterprocFunctionInput {
             id,
             name: self.identity.name.clone(),
             prepared: &self.artifact,
         };
-        let mut set = solve_interproc_summary_set(
-            &[input],
-            arch,
-            Some(id),
-            &BTreeMap::new(),
-            InterprocSolveConfig::default(),
-        );
+        let mut set = solve_interproc_summary_set(&[input], Some(id), &BTreeMap::new())?;
         self.summary = set.summaries.remove(&id);
+        Ok(())
     }
 
     /// Identity metadata (entry / name / advisory arch provenance).
@@ -185,17 +190,22 @@ impl FunctionBehavior {
 
     // ---- provenance helpers -------------------------------------------------------------
 
-    /// `InstId` → `(block_addr, op_idx)`, via `SsaGraph::op_site_for_inst`.
+    /// `InstId` → `(block_addr, op_idx)`: the block's address and the operation's place among
+    /// that block's operations, phis not counted (`SsaGraph::block_addr_of` and
+    /// `SsaGraph::op_ordinal`). `None` for a phi.
     pub fn op_site(&self, inst: InstId) -> Option<(u64, usize)> {
-        self.artifact.graph().op_site_for_inst(inst)
+        let graph = self.artifact.graph();
+        Some((graph.block_addr_of(inst)?, graph.op_ordinal(inst)?))
     }
 
-    /// `(block_addr, op_idx)` → `InstId`, via `SsaGraph::inst_id_for_op_site`. The inverse of
-    /// [`Self::op_site`] — see §8 test 6's round trip.
+    /// `(block_addr, op_idx)` → `InstId`. The inverse of [`Self::op_site`] — see §8 test 6's
+    /// round trip.
     pub fn inst_at(&self, block_addr: u64, op_idx: usize) -> Option<InstId> {
-        self.artifact
-            .graph()
-            .inst_id_for_op_site(block_addr, op_idx)
+        let graph = self.artifact.graph();
+        graph
+            .op_insts(graph.block_id_for_addr(block_addr)?)
+            .get(op_idx)
+            .copied()
     }
 
     /// `ValueId` → the `SSAVar` it interns, via `SsaGraph::value`.
@@ -215,6 +225,12 @@ impl FunctionBehavior {
     pub fn use_sites(&self, value: ValueId) -> &[UseSite] {
         self.artifact.graph().use_sites(value)
     }
+}
+
+/// Upstream's analysis takes an [`Arch`], which indexes an [`ArchSpec`]; this carrier keeps
+/// taking the spec so its callers are unchanged.
+fn arch_of(spec: &ArchSpec) -> Arch {
+    Arch::new(spec.clone())
 }
 
 #[cfg(test)]
