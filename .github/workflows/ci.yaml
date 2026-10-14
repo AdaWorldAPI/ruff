@@ -385,7 +385,21 @@ jobs:
           curl --proto '=https' --tlsv1.2 -LsSf \
             "https://github.com/astral-sh/hawk/releases/download/${HAWK_VERSION}/cargo-hawk-installer.sh" | sh
       - name: "Hawk"
-        run: cargo +1.99.0 hawk check --target-dir target/hawk --color=always -D warnings
+        # The fork SPO/transcode libraries are an external API: OGAR and the
+        # transcode consumers call them from outside this workspace, which a
+        # closed-world analysis cannot see. Hawk compiles them but does not
+        # report their public declarations.
+        run: >-
+          cargo +1.99.0 hawk check --target-dir target/hawk --color=always -D warnings
+          --exclude-crate ruff_cpp_codegen
+          --exclude-crate ruff_cpp_spo
+          --exclude-crate ruff_csharp_spo
+          --exclude-crate ruff_python_dto_check
+          --exclude-crate ruff_python_spo
+          --exclude-crate ruff_ruby_spo
+          --exclude-crate ruff_spo_address
+          --exclude-crate ruff_spo_triplet
+          --exclude-crate ruff_sqlalchemy_spo
 
   cargo-publish-dry-run:
     name: "cargo publish dry-run"
