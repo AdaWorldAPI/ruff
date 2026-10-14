@@ -2,6 +2,86 @@
 
 This repository contains both Ruff (a Python linter and formatter) and ty (a Python type checker). The crates follow a naming convention: `ruff_*` for Ruff-specific code and `ty_*` for ty-specific code. ty reuses several Ruff crates, including the Python parser (`ruff_python_parser`) and AST definitions (`ruff_python_ast`).
 
+The `ruff_*_spo` crates (`ruff_ruby_spo`, `ruff_python_spo`, `ruff_csharp_spo`, `ruff_cpp_spo`, `ruff_spo_triplet`, …) are the AdaWorldAPI **SPO/transcode** side — AST → `(subject, predicate, object)` fact harvest feeding the OGAR transpiler. Methods for that side are curated in `.claude/knowledge/` (each with a `READ BY:` header) and applied by agents in `.claude/agents/`. **Before harvesting method-body facts or lowering a behaviour arm, read `.claude/knowledge/fuzzy-recipe-codebook.md`** — it teaches how to cook a `(verb, criteria)` recipe codebook and correlate fuzzy imperative bodies to declarative recipes, rather than transcribing bodies. The `fuzzy-proposer` agent carries that method. **Before starting (or resuming) any whole legacy-app→Rust transcode — odoo→odoo-rs, redmine/OpenProject→openproject-nexgen-rs, WoA→woa-rs (worked reference: MedCare→MedCare-rs) — read `.claude/knowledge/consumer-transcode-furnace-playbook.md`** — it frames the loop *around* the codebook: the ore/slag furnace, the two parity oracles (value + Klickwege structure), the three-axis mint gate, the no-hand-roll rule, and a per-consumer portability map.
+
+## Delegation: grindwork goes to Haiku and Sonnet agents
+
+Fan mechanical work out to Sonnet subagents rather than running it on the main
+thread. The split is by SHAPE of the work, not by how hard it looks:
+
+**Sonnet agents** — find every call site of X; quote a definition; trace a
+constant's readers; check whether a symbol exists anywhere; run a scoped command
+and report the tail; census a corpus.
+
+**Main thread** — whether a review finding is actually correct; what a
+measurement means; designing a falsifier; deciding a divergence is defensible
+rather than a defect.
+
+The rule bites on SWEEPS — "every site that reads this", "does this exist",
+"which of these five shapes are real". For a single lookup where the file and
+symbol are already known, going direct is cheaper than briefing an agent.
+
+Haiku is now allowed for grindwork (operator, 2026-10-14: "Use Haiku 5.5 for
+grindwork"). This replaces the earlier "never Haiku" line. Use it for the
+mechanical end of the list above: running a pre-written, scoped command and
+reporting the tail; listing candidate call sites; counting; quoting text with
+line numbers. Haiku never edits source, never concludes, and never judges
+whether a result means what it appears to. The main thread checks every Haiku
+result it relies on: it reads the cited lines itself, re-runs at least one
+reported count, and never takes "no hits" as proof of absence. Sweeps that
+need several sources held together still go to Sonnet. This follows the Haiku
+tier already used in the sibling `lance-graph` and `tesseract-rs` workspaces.
+
+## Session traps (each one cost real time in this repo)
+
+**Commit BEFORE you disable, not after.** The disable-verification cycle is
+`break the guard → watch the test fail → restore`, and the restore is
+`git checkout <file>`. That reverts to the last COMMIT, not to the state you
+started from — so if the work under test is uncommitted, the restore deletes
+it. Measured: a fix plus its new test were both eaten this way, and the loss
+was only noticed because a later grep showed the old code back in place.
+Order is: commit, then disable, then checkout.
+
+**A disable that does not apply is indistinguishable from a guard that is not
+load-bearing.** Both look like "the test still passes". Twice here a patch
+script anchored on text that `cargo fmt` had since reformatted, the edit
+silently no-opped, and the green run nearly went into the record as evidence
+that a guard was inert. Always assert the replacement actually happened:
+
+```python
+assert s.count(old) == 1, "anchor moved"
+```
+
+Related: turning a knob is only a disable if the knob BINDS. Zeroing a
+constant proves nothing when the guarded quantity can reach the same outcome
+by another route, or when a different `min()` term is the binding one.
+
+**`git status` reports CLEAN, not CURRENT.** A stale branch does not merely
+give stale answers — it manufactures findings that do not exist on `main`.
+Before the first measurement in a fresh container, and after any rebase:
+
+```sh
+git fetch origin main && git log --oneline -1 origin/main
+git merge-base --is-ancestor origin/main HEAD || echo "STALE — re-measure after rebase"
+```
+
+Re-run the measurement after a rebase; a conclusion drawn before it does not
+survive it, and has previously outlived the rebase in a PR body.
+
+**`prek` cannot run in this sandbox, so Markdown edits ship unchecked.** The
+local `uv run --locked prek` fails on a `uv` version that cannot parse this
+repo's `exclude-newer`, so the hook set never runs here — and CI's `prek` job
+then fails on formatting the edit introduced. It has already happened once, on
+the commit that added *this* section. Avoid Markdown constructs `mdformat`
+rewrites (pipe tables are padded to the widest cell); prefer prose and bullets,
+which it leaves alone. A `prek` green on commit N says nothing about commit N+1.
+
+**A green fixture proves the shape it contains, nothing else.** Several fixes
+in this crate were correct for the case in the fixture and wrong for the case
+that was not — a bare `lines.each` fixture passing while `self.lines.each`
+was silently broken. When a fix distinguishes two shapes, the test carries
+both, and asserts they differ.
+
 ## Before contributing
 
 Before starting work on an issue and again before opening a pull request, follow the
@@ -221,7 +301,7 @@ Parts of `.github/workflows/release.yml` are generated by cargo-dist from `dist-
 - Before writing significant amounts of new code, look for existing utilities or mechanisms that could solve the problem. Avoid expanding the task to unrelated issues, but do not confuse keeping the task focused with minimizing the size of the implementation. Prefer addressing the underlying architectural problem over adding a localized workaround, even when doing so requires a substantial refactor or rearchitecture. Ask the user for guidance if in doubt about whether to attempt a larger refactor or not.
 - Try hard to avoid patterns that require `panic!`, `unreachable!`, `.unwrap()` or `.expect()`. Instead, try to encode those constraints in the type system. Don't be afraid to write code that's more verbose or requires largeish refactors if it enables you to avoid these unsafe calls.
 - Prefer let chains (`if let` combined with `&&`) and let guards (`PAT if let ... =>`) over nested `if let` statements to reduce indentation and improve readability. At the end of a task, always check your work to see if you missed opportunities to use `let` chains or `let` guards.
-- If you _have_ to suppress a Clippy lint, prefer to use `#[expect()]` over `[allow()]`, where possible. But if a lint is complaining about unused/dead code, it's usually best to just delete the unused code.
+- If you *have* to suppress a Clippy lint, prefer to use `#[expect()]` over `[allow()]`, where possible. But if a lint is complaining about unused/dead code, it's usually best to just delete the unused code.
 - Don't use comments to narrate code, but do use them to explain invariants and why something unusual was done a particular way. Make sure that a comment will make sense to somebody who's reading the code for the first time. Prefer plain language, avoid jargon, and don't be afraid to be more verbose if it's necessary to explain something well. Giving examples of the kind of Python code we're trying to model at this particular point in Ruff or ty can often be very helpful for future readers of the code.
 - Run `cargo dev generate-all` after changing configuration options, CLI arguments, lint rules, or environment variable definitions, as these changes require regeneration of schemas, docs, and CLI references.
 - Don't prefix tests with `test_`.

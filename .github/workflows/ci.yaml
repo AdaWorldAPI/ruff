@@ -408,7 +408,12 @@ jobs:
     runs-on: ${{ github.repository == 'astral-sh/ruff' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     needs: determine_changes
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-test') && (needs.determine_changes.outputs.code == 'true' || github.ref == 'refs/heads/main') }}
-    timeout-minutes: 20
+    # The runner above is chosen per repository; the budget must be too. A fork
+    # drops from the 16-core Depot machine to `ubuntu-latest` and keeps a limit
+    # calibrated for the larger one, so the job is killed mid-build every time.
+    # 40 rather than a guess: this job measured 22m04s on a fork runner once it
+    # was allowed to finish, so the fork budget is ~1.8x its observed cost.
+    timeout-minutes: ${{ github.repository == 'astral-sh/ruff' && 20 || 40 }}
     env:
       # Line-tables-only debug info: faster builds, backtraces still work.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -526,7 +531,10 @@ jobs:
     runs-on: ${{ matrix.platform }}
     needs: determine_changes
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-test') && (needs.determine_changes.outputs.code == 'true' || github.ref == 'refs/heads/main') }}
-    timeout-minutes: 20
+    # Same reason as `cargo-test-linux`: the matrix above already picks a
+    # smaller runner for forks, so the budget has to follow it. Measured on a
+    # fork: 24m36s on windows-latest, 14m45s on macos-latest.
+    timeout-minutes: ${{ github.repository == 'astral-sh/ruff' && 20 || 40 }}
     env:
       # Line-tables-only debug info: faster builds, backtraces still work.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -559,9 +567,30 @@ jobs:
           checksum: "cfe454573412ff7380d15fc7dae5997ab53ffce72fce0a78e91ddbc84001acd2"
           enable-cache: "true"
       - name: "Run tests"
+        shell: bash
+        env:
+          # Passed via env, not interpolated directly into the script below —
+          # `${{ matrix.platform }}` inline in a `run:` block is a template-
+          # injection vector zizmor flags (medium severity): the substitution
+          # happens before bash ever sees the script, so a value containing
+          # shell metacharacters could break out of the string context. An
+          # env var is plain string data to bash regardless of its content.
+          RUFF_CI_PLATFORM: ${{ matrix.platform }}
         run: |
-          uv run --locked --only-dev cargo nextest run --all-features --profile ci
-          cargo test --all-features --doc
+          # `ruff_cpp_spo` (fork-only, not present upstream) gates its libclang
+          # walker behind the `libclang` feature, which `--all-features` turns
+          # on here. The `clang` crate dlopens libclang at runtime, and on
+          # windows-latest that currently crashes with 0xc0000005 (Invalid
+          # access to memory location) rather than failing the test cleanly.
+          # Exclude the crate's tests on Windows only — macos-latest runs them
+          # fine — instead of dropping `--all-features` workspace-wide.
+          if [[ "$RUFF_CI_PLATFORM" == *windows* ]]; then
+            uv run --locked --only-dev cargo nextest run --all-features --profile ci -E 'not package(ruff_cpp_spo)'
+            cargo test --all-features --doc --workspace --exclude ruff_cpp_spo
+          else
+            uv run --locked --only-dev cargo nextest run --all-features --profile ci
+            cargo test --all-features --doc
+          fi
 
   cargo-test-wasm:
     name: "cargo test (wasm)"
@@ -754,7 +783,11 @@ jobs:
         needs.determine_changes.outputs.linter == 'true' ||
         needs.determine_changes.outputs.formatter == 'true'
       )
-    timeout-minutes: 20
+    # Same split as the `cargo test` jobs: 8-core Depot upstream, `ubuntu-latest`
+    # on a fork, one budget for both. It was cancelled at 20m27s on the run that
+    # proved the others, so >20 is measured; how much more is not, hence the
+    # deliberately loose 45.
+    timeout-minutes: ${{ github.repository == 'astral-sh/ruff' && 20 || 45 }}
     env:
       # Line-tables-only debug info: faster builds, backtraces still work.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -1040,7 +1073,15 @@ jobs:
 
   pgo:
     name: "PGO"
-    runs-on: depot-ubuntu-24.04-8
+    # Unlike the other bare `depot-*` jobs in this file, this job's own `if:`
+    # does NOT gate on `github.repository == 'astral-sh/ruff'` — it fires
+    # whenever release-relevant files changed, fork or not. `depot-*` labels
+    # are Depot.dev custom runners registered only for the upstream org; on
+    # a fork nothing can ever claim that label, so the job queues forever
+    # (confirmed: stuck 40+ min with zero runner pickup on two separate
+    # attempts, blocking the whole run from ever reaching a clean terminal
+    # state for a failed-jobs rerun).
+    runs-on: ${{ github.repository == 'astral-sh/ruff' && 'depot-ubuntu-24.04-8' || 'ubuntu-latest' }}
     needs: determine_changes
     if: ${{ needs.determine_changes.outputs.release == 'true' && !contains(github.event.pull_request.labels.*.name, 'no-build') }}
     timeout-minutes: 20

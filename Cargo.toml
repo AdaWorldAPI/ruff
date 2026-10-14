@@ -1,11 +1,17 @@
 [workspace]
 members = ["crates/*"]
+# ruff_r2il is a workspace-EXCLUDED standalone crate (its own workspace root):
+# it path-deps the r2sleigh sibling checkout (r2il/r2ssa), and exclusion keeps
+# the main workspace and its Cargo.lock sibling-free. Build it via
+# `cargo <cmd> --manifest-path crates/ruff_r2il/Cargo.toml`.
+# See .claude/plans/r2il-behavioral-ir-v1.md.
+exclude = ["crates/ruff_r2il"]
 resolver = "2"
 
 [workspace.package]
 # Please update rustfmt.toml when bumping the Rust edition
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.99"
 homepage = "https://docs.astral.sh/ruff"
 documentation = "https://docs.astral.sh/ruff"
 repository = "https://github.com/astral-sh/ruff"
@@ -18,6 +24,7 @@ ruff = { version = "0.17.0", path = "crates/ruff" }
 ruff_annotate_snippets = { version = "0.0.17", path = "crates/ruff_annotate_snippets" }
 ruff_cache = { version = "0.0.17", path = "crates/ruff_cache" }
 ruff_command_line = { version = "0.0.17", path = "crates/ruff_command_line" }
+ruff_cpp_codegen = { path = "crates/ruff_cpp_codegen" }
 ruff_db = { version = "0.0.17", path = "crates/ruff_db", default-features = false }
 ruff_diagnostics = { version = "0.0.17", path = "crates/ruff_diagnostics" }
 ruff_formatter = { version = "0.0.17", path = "crates/ruff_formatter" }
@@ -42,6 +49,7 @@ ruff_python_stdlib = { version = "0.0.17", path = "crates/ruff_python_stdlib" }
 ruff_python_trivia = { version = "0.0.17", path = "crates/ruff_python_trivia" }
 ruff_server = { version = "0.0.17", path = "crates/ruff_server" }
 ruff_source_file = { version = "0.0.17", path = "crates/ruff_source_file" }
+ruff_spo_triplet = { path = "crates/ruff_spo_triplet" }
 ruff_mdtest = { path = "crates/ruff_mdtest" }
 ruff_ranged_value = { version = "0.0.17", path = "crates/ruff_ranged_value" }
 ruff_text_size = { version = "0.0.17", path = "crates/ruff_text_size" }
