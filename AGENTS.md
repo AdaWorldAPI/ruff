@@ -4,7 +4,7 @@ This repository contains both Ruff (a Python linter and formatter) and ty (a Pyt
 
 The `ruff_*_spo` crates (`ruff_ruby_spo`, `ruff_python_spo`, `ruff_csharp_spo`, `ruff_cpp_spo`, `ruff_spo_triplet`, …) are the AdaWorldAPI **SPO/transcode** side — AST → `(subject, predicate, object)` fact harvest feeding the OGAR transpiler. Methods for that side are curated in `.claude/knowledge/` (each with a `READ BY:` header) and applied by agents in `.claude/agents/`. **Before harvesting method-body facts or lowering a behaviour arm, read `.claude/knowledge/fuzzy-recipe-codebook.md`** — it teaches how to cook a `(verb, criteria)` recipe codebook and correlate fuzzy imperative bodies to declarative recipes, rather than transcribing bodies. The `fuzzy-proposer` agent carries that method. **Before starting (or resuming) any whole legacy-app→Rust transcode — odoo→odoo-rs, redmine/OpenProject→openproject-nexgen-rs, WoA→woa-rs (worked reference: MedCare→MedCare-rs) — read `.claude/knowledge/consumer-transcode-furnace-playbook.md`** — it frames the loop *around* the codebook: the ore/slag furnace, the two parity oracles (value + Klickwege structure), the three-axis mint gate, the no-hand-roll rule, and a per-consumer portability map.
 
-## Delegation: grindwork goes to Sonnet agents
+## Delegation: grindwork goes to Haiku and Sonnet agents
 
 Fan mechanical work out to Sonnet subagents rather than running it on the main
 thread. The split is by SHAPE of the work, not by how hard it looks:
@@ -21,8 +21,16 @@ The rule bites on SWEEPS — "every site that reads this", "does this exist",
 "which of these five shapes are real". For a single lookup where the file and
 symbol are already known, going direct is cheaper than briefing an agent.
 
-Never Haiku for any of it. This mirrors the grindwork/accumulation split
-already codified in the sibling `lance-graph` workspace.
+Haiku is now allowed for grindwork (operator, 2026-10-14: "Use Haiku 5.5 for
+grindwork"). This replaces the earlier "never Haiku" line. Use it for the
+mechanical end of the list above: running a pre-written, scoped command and
+reporting the tail; listing candidate call sites; counting; quoting text with
+line numbers. Haiku never edits source, never concludes, and never judges
+whether a result means what it appears to. The main thread checks every Haiku
+result it relies on: it reads the cited lines itself, re-runs at least one
+reported count, and never takes "no hits" as proof of absence. Sweeps that
+need several sources held together still go to Sonnet. This follows the Haiku
+tier already used in the sibling `lance-graph` and `tesseract-rs` workspaces.
 
 ## Session traps (each one cost real time in this repo)
 
