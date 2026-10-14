@@ -347,9 +347,8 @@ impl Walker<'_> {
                 }
             }
             Expr::Compare(c) => {
-                self.walk_expr(&c.left);
-                for comp in &c.comparators {
-                    self.walk_expr(comp);
+                for operand in &c.operands {
+                    self.walk_expr(operand);
                 }
             }
             Expr::Name(n) => {
