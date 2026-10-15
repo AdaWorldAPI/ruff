@@ -1,0 +1,31 @@
+[package]
+name = "ruff_metta_spo"
+version = "0.1.0"
+publish = false
+# Excluded from the ruff workspace (root `exclude`), like ruff_r2il: it path-depends on
+# the hyperon-experimental sibling checkout, and exclusion keeps the main workspace and
+# its Cargo.lock sibling-free. Nothing here can inherit from [workspace.*], so
+# edition/rust-version are pinned by hand to match the workspace Cargo.toml.
+edition = "2024"
+rust-version = "1.99"
+description = "MeTTa frontend for ruff_spo_triplet. Parses .metta files with the Hyperon parser (AdaWorldAPI fork), harvests `=` rules, `:` type declarations, facts and `!` queries, and classifies every rule head as lowerable (pattern matching and calls to lowerable rules only) or interpreter-only, with the reason. The classification is transitive over the call graph, so a rule that calls an interpreter-only rule is interpreter-only too."
+license = "MIT"
+
+[lib]
+name = "ruff_metta_spo"
+
+[dependencies]
+# The AdaWorldAPI fork checkout, consumed by path (fork rule). Only the parser is used.
+# `default-features = false` drops `das`, which would pull a git dependency on
+# singnet/das. `pkg_mgmt` stays on: without it the crate does not compile, because
+# `runner/builtin_mods/json.rs` uses `serde_json`, which only `pkg_mgmt` enables.
+hyperon = { path = "../../../hyperon-experimental/lib", default-features = false, features = ["pkg_mgmt"] }
+hyperon-atom = { path = "../../../hyperon-experimental/hyperon-atom" }
+ruff_spo_triplet = { path = "../ruff_spo_triplet" }
+
+[[example]]
+name = "metta_census"
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"

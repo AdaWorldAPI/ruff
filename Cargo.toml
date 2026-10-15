@@ -5,7 +5,9 @@ members = ["crates/*"]
 # the main workspace and its Cargo.lock sibling-free. Build it via
 # `cargo <cmd> --manifest-path crates/ruff_r2il/Cargo.toml`.
 # See .claude/plans/r2il-behavioral-ir-v1.md.
-exclude = ["crates/ruff_r2il"]
+# ruff_metta_spo is excluded for the same reason: it path-deps the
+# hyperon-experimental sibling checkout (the Hyperon MeTTa parser).
+exclude = ["crates/ruff_r2il", "crates/ruff_metta_spo"]
 resolver = "2"
 
 [workspace.package]
