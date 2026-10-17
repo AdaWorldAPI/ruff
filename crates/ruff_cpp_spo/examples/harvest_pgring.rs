@@ -1,6 +1,11 @@
 //! Harvest the PG-Ring graph query engine (Gómez-Brandón, Hogan, Navarro,
 //! ISWC 2026, arXiv 2608.03840) into a structural manifest: classes, their
-//! fields and method signatures, and the call graph of every function body.
+//! fields and method signatures, and the call graph of every free function
+//! and out-of-line method definition.
+//!
+//! Methods defined inside a class body (inline, the common case in a
+//! header-only library) appear only as signatures: the function walker does
+//! not descend into class bodies, so their callees are not in the call graph.
 //!
 //! PG-Ring is GPL-3.0. This example reads the source only to extract the
 //! STRUCTURE (which iterators exist, which methods they offer, who calls whom)
@@ -18,7 +23,11 @@
 //! Outputs (directory `OUT_DIR`, default `/tmp/pgring_harvest`):
 //! - `manifest.ndjson`: the SPO triples of every class (shared IR).
 //! - `<file>.txt`: one readable summary per source file: classes with bases,
-//!   fields and method signatures, then every function with its callees.
+//!   fields and method signatures, then every function defined in that file
+//!   with its callees.
+//! - `_diagnostics.txt`: translation units with parse errors. A class is taken
+//!   from such a unit only when no unit without errors declares it, and the
+//!   classes taken that way are listed.
 
 #![expect(
     clippy::print_stderr,
@@ -30,8 +39,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ruff_cpp_spo::{
-    CppClass, Declaration, NAMESPACE, model_from_class, walk_free_functions_with_diagnostics,
-    walk_tu_with_diagnostics,
+    CppClass, CppFunction, Declaration, NAMESPACE, model_from_class,
+    walk_free_functions_with_diagnostics, walk_tu_with_diagnostics,
 };
 use ruff_spo_triplet::{ModelGraph, expand, to_ndjson};
 
@@ -114,6 +123,22 @@ fn defining_file<'a>(name: &str, texts: &'a [(String, String)]) -> Option<&'a st
     })
 }
 
+/// The identity of a harvested function. An out-of-line method is named
+/// `Class::method` by the walker and also carries `Class` as its last scope
+/// component; joining the two would repeat the class (`Class::Class::method`).
+fn function_identity(func: &CppFunction) -> String {
+    match func.namespace.split_last() {
+        Some((owner, outer)) if func.name.starts_with(&format!("{owner}::")) => {
+            if outer.is_empty() {
+                func.name.clone()
+            } else {
+                format!("{}::{}", outer.join("::"), func.name)
+            }
+        }
+        _ => func.qualified_name(),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = PathBuf::from(
         std::env::var("PGRING_SRC").unwrap_or_else(|_| "/home/user/adaworldapi/pg-ring".into()),
@@ -150,6 +175,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut all: Vec<CppClass> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    // Classes seen only in translation units with parse errors: a partial AST,
+    // used only for a class that no clean unit declares.
+    let mut from_errored: Vec<CppClass> = Vec::new();
     let mut functions: Vec<(String, String)> = Vec::new();
     let mut seen_fn: BTreeSet<String> = BTreeSet::new();
     let mut diag_report = String::new();
@@ -164,7 +192,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 for c in classes {
-                    if !is_foreign(&c.qualified_name()) && seen.insert(c.qualified_name()) {
+                    if is_foreign(&c.qualified_name()) {
+                        continue;
+                    }
+                    if !diags.is_empty() {
+                        from_errored.push(c);
+                    } else if seen.insert(c.qualified_name()) {
                         all.push(c);
                     }
                 }
@@ -176,20 +209,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match walk_free_functions_with_diagnostics(f, &args) {
             Ok((fns, _)) => {
                 for func in fns {
-                    let q = func.qualified_name();
+                    let q = function_identity(&func);
                     let sig = format!("{q}({})", func.param_types.join(", "));
                     if is_foreign(&q) || !seen_fn.insert(sig.clone()) {
                         continue;
                     }
                     let ret = func.return_type.as_deref().unwrap_or("void");
-                    let line = format!("fn {sig} -> {ret}\n  calls: {}\n", func.calls.join(", "));
-                    // The file whose text holds `name(` attributes the
-                    // definition; the walk sees it in every including TU.
-                    let tail = func.name.clone();
-                    let home = texts
-                        .iter()
-                        .find(|(_, t)| t.contains(&format!("{tail}(")))
-                        .map_or_else(|| rel.clone(), |(r, _)| r.clone());
+                    // Callees of a method are spelled `Class::method` (no
+                    // namespace); print that spelling too so a definition
+                    // joins its call edges.
+                    let key = if func.name == q {
+                        String::new()
+                    } else {
+                        format!("  callee name: {}\n", func.name)
+                    };
+                    let line = format!(
+                        "fn {sig} -> {ret}\n{key}  calls: {}\n",
+                        func.calls.join(", ")
+                    );
+                    // The definition's own location attributes it; the walk
+                    // sees an inline header function in every including TU.
+                    let home = func
+                        .file
+                        .as_deref()
+                        .map(|p| p.strip_prefix(&root).unwrap_or(p).display().to_string())
+                        .unwrap_or_else(|| rel.clone());
                     functions.push((home, line));
                 }
             }
@@ -198,6 +242,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    let mut recovered: Vec<String> = Vec::new();
+    for c in from_errored {
+        if seen.insert(c.qualified_name()) {
+            recovered.push(c.qualified_name());
+            all.push(c);
+        }
+    }
+    let _ = writeln!(
+        diag_report,
+        "\nclasses taken from units with parse errors (partial AST): {recovered:?}"
+    );
 
     for (rel, _) in &texts {
         let mut s = format!("# {rel}\n");
