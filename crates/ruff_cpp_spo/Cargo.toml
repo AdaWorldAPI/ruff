@@ -57,6 +57,10 @@ required-features = ["libclang"]
 name = "harvest_ladybug"
 required-features = ["libclang"]
 
+[[example]]
+name = "harvest_pgring"
+required-features = ["libclang"]
+
 [dev-dependencies]
 # End-to-end pipeline test only (harvest -> reassemble -> ruff_cpp_codegen emit).
 # The harvester does NOT depend on the codegen at runtime — this is the test
