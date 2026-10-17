@@ -120,9 +120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let sdsl = std::env::var("SDSL_INCLUDE")
         .unwrap_or_else(|_| "/home/user/adaworldapi/sdsl-lite/include".into());
-    let out_dir = PathBuf::from(
-        std::env::var("OUT_DIR").unwrap_or_else(|_| "/tmp/pgring_harvest".into()),
-    );
+    let out_dir =
+        PathBuf::from(std::env::var("OUT_DIR").unwrap_or_else(|_| "/tmp/pgring_harvest".into()));
     std::fs::create_dir_all(&out_dir)?;
 
     let mut files = Vec::new();
@@ -219,10 +218,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|c| defining_file(&c.name, &texts).is_none())
         .map(|c| c.name.as_str())
         .collect();
-    let _ = writeln!(diag_report, "\nclasses with no defining file found: {unattributed:?}");
+    let _ = writeln!(
+        diag_report,
+        "\nclasses with no defining file found: {unattributed:?}"
+    );
     std::fs::write(out_dir.join("_diagnostics.txt"), &diag_report)?;
     let n_functions = functions.len();
-    let warned = diag_report.lines().filter(|l| l.contains(" error(s)")).count();
+    let warned = diag_report
+        .lines()
+        .filter(|l| l.contains(" error(s)"))
+        .count();
 
     let mut graph = ModelGraph::new(NAMESPACE);
     for c in &all {
