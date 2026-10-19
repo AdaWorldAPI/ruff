@@ -34,6 +34,9 @@ CPY = "CPY"  # it's a Ruff rule category
 # P-code / R2IL opcode names, not prose. INT_SCARRY is signed-carry; the
 # hook's "scary" correction silently corrupts an emitted wire tag.
 scarry = "scarry"
+# `anc` is an intentional MeTTa predicate for ancestor in a recursive
+# Datalog-style test. Replacing it with `and` changes the program's meaning.
+anc = "anc"
 # Tesseract really does ship `src/ccstruct/statistc.h` under that spelling.
 # "Correcting" it points the harvest docs at a file that does not exist.
 statistc = "statistc"

@@ -22,7 +22,10 @@ license = "MIT"
 
 [workspace.dependencies]
 char_str = { version = "0.0.4", default-features = false, features = ["std"] }
-ruff = { version = "0.17.0", path = "crates/ruff" }
+# Internal release train: keep published tarball dependency versions
+# identical to these local paths; ^0.17.0 allows 0.17.1 and mixes 0.0.18
+# ruff_* crates with this workspace's 0.0.17 ABI during cargo publish --dry-run.
+ruff = { version = "=0.17.0", path = "crates/ruff" }
 ruff_annotate_snippets = { version = "0.0.17", path = "crates/ruff_annotate_snippets" }
 ruff_cache = { version = "0.0.17", path = "crates/ruff_cache" }
 ruff_command_line = { version = "0.0.17", path = "crates/ruff_command_line" }
@@ -32,7 +35,7 @@ ruff_diagnostics = { version = "0.0.17", path = "crates/ruff_diagnostics" }
 ruff_formatter = { version = "0.0.17", path = "crates/ruff_formatter" }
 ruff_graph = { version = "0.0.17", path = "crates/ruff_graph" }
 ruff_index = { version = "0.0.17", path = "crates/ruff_index" }
-ruff_linter = { version = "0.17.0", path = "crates/ruff_linter" }
+ruff_linter = { version = "=0.17.0", path = "crates/ruff_linter" }
 ruff_macros = { version = "0.0.17", path = "crates/ruff_macros" }
 ruff_markdown = { version = "0.0.17", path = "crates/ruff_markdown" }
 ruff_memory_usage = { version = "0.0.17", path = "crates/ruff_memory_usage" }

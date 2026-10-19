@@ -184,6 +184,14 @@ pub struct CppFunction {
     /// obtain by overloading. See `examples/harvest_openggs.rs` for the mapping
     /// that omits it, and why omission is a truer encoding than either value.
     pub is_static: bool,
+    /// The file that holds this DEFINITION, from the cursor's own location.
+    ///
+    /// The walker reports a function in every translation unit that includes
+    /// its definition (an inline header function reaches every `.cpp`), so the
+    /// TU being walked is not where the function lives, and a text search for
+    /// its name finds declarations and call sites first. `None` only when
+    /// libclang reports no file for the cursor.
+    pub file: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "libclang")]

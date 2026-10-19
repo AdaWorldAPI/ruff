@@ -320,6 +320,10 @@ fn collect_functions(entity: &Entity, out: &mut Vec<CppFunction>) {
                     // member question and is false for a free function, so the
                     // storage class is the right source here.
                     let is_static = child.get_storage_class() == Some(StorageClass::Static);
+                    let file = child
+                        .get_location()
+                        .and_then(|l| l.get_file_location().file)
+                        .map(|f| f.get_path());
                     out.push(CppFunction {
                         namespace: enclosing_scopes(&child),
                         name,
@@ -327,6 +331,7 @@ fn collect_functions(entity: &Entity, out: &mut Vec<CppFunction>) {
                         return_type,
                         param_types,
                         is_static,
+                        file,
                     });
                 }
             }
@@ -2377,6 +2382,14 @@ void Widget::dispatch() {
             .find(|f| f.name == "Widget::dispatch")
             .unwrap_or_else(|| panic!("Widget::dispatch missing; got {funcs:?}"));
         assert_eq!(dispatch.namespace, vec!["Widget".to_string()]);
+
+        // The definition's own file is recorded, so a caller can attribute it
+        // without searching text for the name.
+        assert_eq!(
+            dispatch.file.as_deref().and_then(|f| f.file_name()),
+            path.file_name(),
+            "the definition must carry the file it is defined in"
+        );
 
         // Fix 1 + codex P2 (#57): in-TU dispatch between two out-of-line
         // methods resolves CLASS-QUALIFIED, so same-named methods of
