@@ -80,6 +80,7 @@ mod quad;
 mod reassemble;
 mod recipe;
 mod region;
+mod role;
 mod structured_names;
 mod surface_schema;
 mod triple;
@@ -105,6 +106,7 @@ pub use quad::{MenuQuad, PurposeRole, PurposeRule, classify_purpose};
 pub use reassemble::{cpp_projection, reassemble};
 pub use recipe::{BodyFacts, RecipeCentroid, classify, is_recoverable};
 pub use region::{RegionFact, RegionSubject, region_triples};
+pub use role::{PredicateRole, RoleCensus, role_census};
 pub use structured_names::{
     NameGrammar, StructuredName, Tier, parse_structured_name, part_of_edges,
 };
