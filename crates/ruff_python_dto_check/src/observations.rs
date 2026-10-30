@@ -2,7 +2,8 @@
 //!
 //! # AST hash algorithm
 //!
-//! Post-order walk of the function body (a `Suite`), emitting one token per
+//! Post-order walk of the body (a `Suite`) of the function or class starting
+//! on the bundle's `line_start`, emitting one token per
 //! node of the form `<NodeKind>(<child-count>)`. SHA-256 of the concatenated
 //! token string becomes `ast_hash_self`. This is deterministic, captures
 //! structural shape, and does not depend on identifier names or whitespace.
@@ -23,6 +24,8 @@ use sha2::{Digest, Sha256};
 
 use ruff_python_ast::{Expr, ExprContext, Stmt};
 use ruff_python_parser::parse_module;
+use ruff_source_file::LineIndex;
+use ruff_text_size::Ranged;
 
 use crate::bundle::{ComparisonWithinFamily, Distribution, EmittedBundle};
 
@@ -160,12 +163,17 @@ fn compute_ast_hash(bundle: &EmittedBundle, source_map: &BTreeMap<String, String
         return hex_sha256(b"");
     };
 
+    let line_index = LineIndex::from_source_text(source);
     let mut tokens = String::new();
     for stmt in &parsed.syntax().body {
-        if let Stmt::FunctionDef(func) = stmt
-            && func.name.id.as_str() == bundle.function_name
-        {
-            for s in &func.body {
+        let body = match stmt {
+            Stmt::FunctionDef(func) => &func.body,
+            Stmt::ClassDef(class) => &class.body,
+            _ => continue,
+        };
+        let start_line = line_index.line_index(stmt.range().start()).get();
+        if u32::try_from(start_line).is_ok_and(|l| l == bundle.line_start) {
+            for s in body {
                 walk_stmt(s, &mut tokens);
             }
             break;

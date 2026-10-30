@@ -99,7 +99,7 @@ pub struct MatchRule {
     pub id: String,
     /// AST shape this rule targets.
     pub kind: MatchKind,
-    /// Optional decorator selector (required for `function_with_decorator`).
+    /// Optional decorator selector (required for `function_with_decorator` and `class_with_decorator`).
     pub decorator: Option<DecoratorSelector>,
     /// Output field name → dot-path expression. Stable key order preserved.
     pub emit: BTreeMap<String, String>,
@@ -108,6 +108,7 @@ pub struct MatchRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchKind {
     FunctionWithDecorator,
+    ClassWithDecorator,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -191,9 +192,10 @@ struct RawFamilyFromFilename {
 fn validate_match_rule(raw: RawMatchRule, idx: usize) -> Result<MatchRule, ConfigError> {
     let kind = match raw.kind.as_str() {
         "function_with_decorator" => MatchKind::FunctionWithDecorator,
+        "class_with_decorator" => MatchKind::ClassWithDecorator,
         other => {
             return Err(ConfigError::Validation(format!(
-                "match[{idx}].kind: unknown value {other:?}; only \"function_with_decorator\" is implemented"
+                "match[{idx}].kind: unknown value {other:?}; expected \"function_with_decorator\" or \"class_with_decorator\""
             )));
         }
     };

@@ -7,18 +7,19 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ruff_python_ast::{Decorator, Expr, Stmt, StmtFunctionDef};
+use ruff_python_ast::{Stmt, StmtFunctionDef};
 use ruff_python_parser::parse_module;
 use ruff_source_file::LineIndex;
 use ruff_text_size::Ranged;
 use serde_json::Value;
 
 use crate::bundle::EmittedBundle;
-use crate::config::{Config, DecoratorSelector, MatchRule};
+use crate::config::{Config, MatchKind, MatchRule};
 use crate::emit::{FunctionContext, eval_path};
+use crate::matcher::decorator::find_matching_decorator;
 
 /// Parse one Python source file and emit one [`EmittedBundle`] per matched
-/// function-with-decorator rule combination.
+/// `function_with_decorator` rule and function. Rules of other kinds are skipped.
 pub fn harvest_module_with_config(
     source_file: &str,
     source: &str,
@@ -34,7 +35,11 @@ pub fn harvest_module_with_config(
         let Stmt::FunctionDef(func) = stmt else {
             continue;
         };
-        for rule in &config.match_rules {
+        for rule in config
+            .match_rules
+            .iter()
+            .filter(|r| r.kind == MatchKind::FunctionWithDecorator)
+        {
             if let Some(bundle) =
                 try_match_function(source_file, source, &line_index, func, rule, config)
             {
@@ -54,7 +59,7 @@ fn try_match_function(
     rule: &MatchRule,
     config: &Config,
 ) -> Option<EmittedBundle> {
-    let matched_dec = find_matching_decorator(func, rule)?;
+    let matched_dec = find_matching_decorator(&func.decorator_list, rule.decorator.as_ref())?;
 
     let ctx = FunctionContext {
         func,
@@ -100,81 +105,6 @@ fn try_match_function(
         fields,
         comparison_within_family: None,
     })
-}
-
-/// Find the first decorator on `func` that satisfies the rule's selector.
-fn find_matching_decorator<'a>(
-    func: &'a StmtFunctionDef,
-    rule: &MatchRule,
-) -> Option<&'a Decorator> {
-    let sel = rule.decorator.as_ref();
-    func.decorator_list
-        .iter()
-        .find(|&dec| decorator_matches(dec, sel))
-}
-
-/// Check if a decorator satisfies a selector.
-fn decorator_matches(dec: &Decorator, sel: Option<&DecoratorSelector>) -> bool {
-    let Some(sel) = sel else {
-        // No selector → match any decorated function.
-        return true;
-    };
-    if sel.any {
-        return true;
-    }
-
-    let min_pos = sel.min_positional_args.unwrap_or(0);
-
-    if let Some(attr_name) = &sel.attribute {
-        if decorator_has_attribute(dec, attr_name) {
-            return call_has_min_positional(dec, min_pos);
-        }
-    }
-
-    if let Some(bare_name) = &sel.name {
-        if decorator_has_bare_name(dec, bare_name) {
-            return call_has_min_positional(dec, min_pos);
-        }
-    }
-
-    false
-}
-
-/// `@bp.route(...)` → attribute = "route"
-fn decorator_has_attribute(dec: &Decorator, attr_name: &str) -> bool {
-    if let Expr::Call(call) = &dec.expression
-        && let Expr::Attribute(attr) = &*call.func
-    {
-        return attr.attr.id.as_str() == attr_name;
-    }
-    // Non-call decorator with attribute access: `@bp.route` (no parens).
-    if let Expr::Attribute(attr) = &dec.expression {
-        return attr.attr.id.as_str() == attr_name;
-    }
-    false
-}
-
-/// `@login_required` → name = "`login_required`"
-fn decorator_has_bare_name(dec: &Decorator, name: &str) -> bool {
-    if let Expr::Call(call) = &dec.expression
-        && let Expr::Name(n) = &*call.func
-    {
-        return n.id.as_str() == name;
-    }
-    if let Expr::Name(n) = &dec.expression {
-        return n.id.as_str() == name;
-    }
-    false
-}
-
-fn call_has_min_positional(dec: &Decorator, min: u32) -> bool {
-    if min == 0 {
-        return true;
-    }
-    if let Expr::Call(call) = &dec.expression {
-        return u32::try_from(call.arguments.args.len()).unwrap_or(u32::MAX) >= min;
-    }
-    false
 }
 
 /// Resolve family name from `source_file` path using the config's group rule.

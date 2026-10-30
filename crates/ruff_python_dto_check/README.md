@@ -79,10 +79,13 @@ detection without calling anything a duplicate).
 
 Current implementation:
 
-- One matcher kind: `function_with_decorator`
+- Two matcher kinds: `function_with_decorator` and `class_with_decorator`
+  (top-level definitions only; the class name is reported in `function_name`)
 - Flask-style route detection via `@<expr>.route(...)` in the default profile
 - Config-driven emit fields (`def.name`, `def.params`, `def.body.source`,
-    `decorator.args[0]`, `decorator.kwargs.<name>`, etc.)
+    `decorator.args[0]`, `decorator.kwargs.<name>`, etc.; for classes
+    `class.name`, `class.bases`, `class.decorators`, `class.fields`,
+    `class.methods`, `class.body.source`, `class.range.line_start`/`line_end`)
 - Per-family observation block with set-algebra comparisons and percentile
     distributions (no advisory English strings — pure content encoding)
 - Preflight subcommand with decorator histogram + framework fingerprint
