@@ -47,8 +47,8 @@
         },
         "kind": {
           "type": "string",
-          "enum": ["function_with_decorator"],
-          "description": "AST shape to match. Only function_with_decorator is implemented in this iteration."
+          "enum": ["function_with_decorator", "class_with_decorator"],
+          "description": "AST shape to match: a top-level decorated function or a top-level decorated class."
         },
         "decorator": {
           "$ref": "#/$defs/DecoratorSelector",

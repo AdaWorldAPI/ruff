@@ -1,0 +1,19 @@
+{
+  "match": [
+    {
+      "id": "dataclass",
+      "kind": "class_with_decorator",
+      "decorator": { "name": "dataclass" },
+      "emit": {
+        "name": "class.name",
+        "bases": "class.bases",
+        "fields": "class.fields",
+        "methods": "class.methods",
+        "decorators": "class.decorators"
+      }
+    }
+  ],
+  "group": {
+    "family_from_filename": { "regex": "^(?P<family>.+)\\.py$" }
+  }
+}

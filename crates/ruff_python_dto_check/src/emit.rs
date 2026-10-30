@@ -1,4 +1,4 @@
-//! Dot-path expression evaluator over a matched AST function context.
+//! Dot-path expression evaluator over a matched AST function or class context.
 //!
 //! Supported dot-paths for `function_with_decorator`:
 //! - `def.name`              → function name string
@@ -11,10 +11,24 @@
 //! - `decorator.kwargs.<k>`  → keyword argument by name
 //! - `decorator.raw`         → full decorator text including `@`
 //!
+//! Supported dot-paths for `class_with_decorator`:
+//! - `class.name`            → class name string
+//! - `class.bases`           → JSON array of the raw source text of each base
+//!   and keyword (`"Base"`, `"metaclass=M"`), in source order
+//! - `class.decorators`      → JSON array of decorator raw strings
+//! - `class.range.line_start` / `class.range.line_end` → 1-based lines
+//! - `class.body.source`     → raw source text of the body
+//! - `class.fields`          → JSON array of `{name, annotation, default}` for
+//!   each top-level body `AnnAssign` whose target is a bare name; annotation
+//!   and default are raw source text (default is `null` when absent).
+//!   `ClassVar` and similar annotations are not filtered out.
+//! - `class.methods`         → JSON array of top-level `def` names in the body
+//! - `decorator.raw`, `decorator.args[<int>]`, `decorator.kwargs.<k>` as above
+//!
 //! Path is emitted as `null` if absent. Type mismatches emit the raw value
 //! and a `_type_note` sibling field — never panics.
 
-use ruff_python_ast::{Expr, StmtFunctionDef};
+use ruff_python_ast::{Decorator, Expr, Stmt, StmtClassDef, StmtFunctionDef};
 use ruff_source_file::LineIndex;
 use ruff_text_size::Ranged;
 use serde_json::Value;
@@ -28,13 +42,22 @@ pub struct FunctionContext<'a> {
     pub line_index: &'a LineIndex,
 }
 
+/// All context available when evaluating emit paths for a matched class.
+pub struct ClassContext<'a> {
+    pub class: &'a StmtClassDef,
+    /// The specific decorator that triggered the match rule.
+    pub matched_decorator: &'a Decorator,
+    pub source: &'a str,
+    pub line_index: &'a LineIndex,
+}
+
 /// Evaluate a dot-path expression against a function context.
 /// Returns `Value::Null` if the path is absent or evaluates to nothing.
 pub fn eval_path(path: &str, ctx: &FunctionContext<'_>) -> Value {
     if let Some(rest) = path.strip_prefix("def.") {
         eval_def_path(rest, ctx)
     } else if let Some(rest) = path.strip_prefix("decorator.") {
-        eval_decorator_path(rest, ctx)
+        eval_decorator_path(rest, ctx.matched_decorator, ctx.source)
     } else {
         Value::Null
     }
@@ -103,18 +126,121 @@ fn eval_def_path(path: &str, ctx: &FunctionContext<'_>) -> Value {
     }
 }
 
-fn eval_decorator_path(path: &str, ctx: &FunctionContext<'_>) -> Value {
+/// Evaluate a dot-path expression against a class context.
+/// Returns `Value::Null` if the path is absent or evaluates to nothing.
+pub fn eval_class_path(path: &str, ctx: &ClassContext<'_>) -> Value {
+    if let Some(rest) = path.strip_prefix("class.") {
+        eval_class_member(rest, ctx)
+    } else if let Some(rest) = path.strip_prefix("decorator.") {
+        eval_decorator_path(rest, ctx.matched_decorator, ctx.source)
+    } else {
+        Value::Null
+    }
+}
+
+fn eval_class_member(path: &str, ctx: &ClassContext<'_>) -> Value {
+    let class = ctx.class;
+    match path {
+        "name" => Value::String(class.name.id.to_string()),
+        "bases" => {
+            let mut parts: Vec<(usize, String)> = Vec::new();
+            if let Some(arguments) = &class.arguments {
+                parts.extend(
+                    arguments
+                        .args
+                        .iter()
+                        .map(|a| (a.range().start().to_usize(), raw_text(a, ctx.source))),
+                );
+                parts.extend(
+                    arguments
+                        .keywords
+                        .iter()
+                        .map(|k| (k.range().start().to_usize(), raw_text(k, ctx.source))),
+                );
+            }
+            parts.sort_by_key(|(start, _)| *start);
+            Value::Array(parts.into_iter().map(|(_, t)| Value::String(t)).collect())
+        }
+        "body.source" => {
+            if let Some(first_stmt) = class.body.first() {
+                let start = first_stmt.range().start().to_usize();
+                let end = class.range().end().to_usize();
+                if start <= end && end <= ctx.source.len() {
+                    return Value::String(ctx.source[start..end].to_string());
+                }
+            }
+            Value::Null
+        }
+        "decorators" => Value::Array(
+            class
+                .decorator_list
+                .iter()
+                .map(|d| Value::String(raw_text(d, ctx.source)))
+                .collect(),
+        ),
+        "range.line_start" => {
+            let line = ctx.line_index.line_index(class.range().start()).get();
+            Value::Number(line.into())
+        }
+        "range.line_end" => {
+            let line = ctx.line_index.line_index(class.range().end()).get();
+            Value::Number(line.into())
+        }
+        "fields" => Value::Array(
+            class
+                .body
+                .iter()
+                .filter_map(|stmt| {
+                    let Stmt::AnnAssign(ann) = stmt else {
+                        return None;
+                    };
+                    let Expr::Name(target) = &*ann.target else {
+                        return None;
+                    };
+                    let default = ann
+                        .value
+                        .as_deref()
+                        .map_or(Value::Null, |v| Value::String(raw_text(v, ctx.source)));
+                    let mut field = serde_json::Map::new();
+                    field.insert("name".to_string(), Value::String(target.id.to_string()));
+                    field.insert(
+                        "annotation".to_string(),
+                        Value::String(raw_text(ann.annotation.as_ref(), ctx.source)),
+                    );
+                    field.insert("default".to_string(), default);
+                    Some(Value::Object(field))
+                })
+                .collect(),
+        ),
+        "methods" => Value::Array(
+            class
+                .body
+                .iter()
+                .filter_map(|stmt| match stmt {
+                    Stmt::FunctionDef(f) => Some(Value::String(f.name.id.to_string())),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => Value::Null,
+    }
+}
+
+/// Raw source text of a node.
+fn raw_text(node: &impl Ranged, source: &str) -> String {
+    source[node.range().to_std_range()].to_string()
+}
+
+fn eval_decorator_path(path: &str, dec: &Decorator, source: &str) -> Value {
     if path == "raw" {
-        let start = ctx.matched_decorator.range().start().to_usize();
-        let end = ctx.matched_decorator.range().end().to_usize();
-        return Value::String(ctx.source[start..end].to_string());
+        return Value::String(raw_text(dec, source));
     }
 
     // decorator.args[<index>]
     if let Some(rest) = path.strip_prefix("args[") {
         if let Some(idx_str) = rest.strip_suffix(']') {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                return eval_decorator_arg(idx, ctx);
+                return eval_decorator_arg(idx, dec, source);
             }
         }
         return Value::Null;
@@ -122,24 +248,24 @@ fn eval_decorator_path(path: &str, ctx: &FunctionContext<'_>) -> Value {
 
     // decorator.kwargs.<name>
     if let Some(kw_name) = path.strip_prefix("kwargs.") {
-        return eval_decorator_kwarg(kw_name, ctx);
+        return eval_decorator_kwarg(kw_name, dec, source);
     }
 
     Value::Null
 }
 
-fn eval_decorator_arg(idx: usize, ctx: &FunctionContext<'_>) -> Value {
-    let Expr::Call(call) = &ctx.matched_decorator.expression else {
+fn eval_decorator_arg(idx: usize, dec: &Decorator, source: &str) -> Value {
+    let Expr::Call(call) = &dec.expression else {
         return Value::Null;
     };
     let Some(arg) = call.arguments.args.get(idx) else {
         return Value::Null;
     };
-    expr_to_value(arg, ctx.source)
+    expr_to_value(arg, source)
 }
 
-fn eval_decorator_kwarg(name: &str, ctx: &FunctionContext<'_>) -> Value {
-    let Expr::Call(call) = &ctx.matched_decorator.expression else {
+fn eval_decorator_kwarg(name: &str, dec: &Decorator, source: &str) -> Value {
+    let Expr::Call(call) = &dec.expression else {
         return Value::Null;
     };
     for kw in &call.arguments.keywords {
@@ -147,7 +273,7 @@ fn eval_decorator_kwarg(name: &str, ctx: &FunctionContext<'_>) -> Value {
             continue;
         };
         if kw_name.id.as_str() == name {
-            return expr_to_value(&kw.value, ctx.source);
+            return expr_to_value(&kw.value, source);
         }
     }
     Value::Null

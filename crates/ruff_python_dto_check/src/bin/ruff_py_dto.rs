@@ -147,7 +147,7 @@ fn run_harvest(
 ) -> Result<()> {
     use ruff_python_dto_check::bundle::write_family_bundles;
     use ruff_python_dto_check::config::Config;
-    use ruff_python_dto_check::matcher::function_with_decorator::harvest_module_with_config;
+    use ruff_python_dto_check::matcher::harvest_with_config;
     use ruff_python_dto_check::observations::attach_observations;
 
     let cfg = Config::from_path(config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -189,7 +189,7 @@ fn run_harvest(
         let Ok(source) = std::fs::read_to_string(path) else {
             continue;
         };
-        let bundles = harvest_module_with_config(&rel, &source, &cfg);
+        let bundles = harvest_with_config(&rel, &source, &cfg);
         if !bundles.is_empty() {
             source_map.insert(rel.clone(), source);
             for b in bundles {
@@ -249,11 +249,11 @@ fn run_preflight(root: &std::path::Path, out: Option<&std::path::Path>) -> Resul
 
 fn run_harvest_one(config_path: &std::path::Path, rel: &str, file: &std::path::Path) -> Result<()> {
     use ruff_python_dto_check::config::Config;
-    use ruff_python_dto_check::matcher::function_with_decorator::harvest_module_with_config;
+    use ruff_python_dto_check::matcher::harvest_with_config;
 
     let cfg = Config::from_path(config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let source = std::fs::read_to_string(file)?;
-    let bundles = harvest_module_with_config(rel, &source, &cfg);
+    let bundles = harvest_with_config(rel, &source, &cfg);
     let json = serde_json::to_string_pretty(&bundles)?;
     // Binary output to stdout is expected behavior for harvest-one subcommand.
     #[expect(
