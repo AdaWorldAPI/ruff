@@ -80,7 +80,7 @@ detection without calling anything a duplicate).
 Current implementation:
 
 - Two matcher kinds: `function_with_decorator` and `class_with_decorator`
-  (top-level definitions only; the class name is reported in `function_name`)
+    (top-level definitions only; the class name is reported in `function_name`)
 - Flask-style route detection via `@<expr>.route(...)` in the default profile
 - Config-driven emit fields (`def.name`, `def.params`, `def.body.source`,
     `decorator.args[0]`, `decorator.kwargs.<name>`, etc.; for classes
