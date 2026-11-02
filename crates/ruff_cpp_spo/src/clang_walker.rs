@@ -2466,6 +2466,48 @@ void drive(A &a, B &b) {
         );
     }
 
+    /// Identity gates (S2, N2/N3): a resolved callee keeps its namespace, so
+    /// `a::f` and `b::f` never collapse; a call libclang leaves as an
+    /// unresolved lookup set (`g` below, overloaded, called with a dependent
+    /// argument) is never reported as a resolved call; a call through a
+    /// function pointer is never reported as a call to the pointer's name.
+    const CALL_IDENTITY_SRC: &str = r"
+namespace a { int f(int x) { return x; } }
+namespace b { int f(int x) { return x + 1; } }
+int g(int);
+int g(double);
+int use_ns(int x) { return a::f(x) + b::f(x); }
+int use_broken(int x) { auto v = undeclared_symbol; return g(v); }
+int via_ptr(int (*fp)(int), int x) { return fp(x); }
+";
+
+    #[test]
+    fn call_identity_keeps_namespaces_and_never_resolves_a_lookup_set() {
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("call_identity", CALL_IDENTITY_SRC);
+        let funcs = walk_free_functions(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+        let get = |n: &str| {
+            funcs
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("{n} missing; got {funcs:?}"))
+        };
+        assert_eq!(get("use_ns").calls, ["a::f", "b::f"], "namespaces kept");
+        assert!(
+            !get("use_broken").calls.contains(&"g".to_string()),
+            "an unresolved lookup set is not a resolved call: {:?}",
+            get("use_broken").calls
+        );
+        assert!(
+            !get("via_ptr").calls.contains(&"fp".to_string()),
+            "a call through a pointer is not a call to the pointer: {:?}",
+            get("via_ptr").calls
+        );
+    }
+
     /// A PLAIN free function (no class involved) keeps its existing
     /// zero-fallback behavior: `call_callee_name` only engages when
     /// `get_name()` is empty, so a healthy, already-resolved call is
