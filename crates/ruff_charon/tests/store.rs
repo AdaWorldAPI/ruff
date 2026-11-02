@@ -308,3 +308,27 @@ fn leftover_temporary_files_do_not_block_an_import() {
             .expect("rows")
     );
 }
+
+/// The crate row records whether Charon reported errors, so a reader can tell
+/// a crate whose absent rows are evidence of absence from one that is partial.
+#[test]
+fn the_crate_row_records_charon_errors() {
+    let status = |has_errors: bool| {
+        let store = Store::new(temp(&format!("crate_status_{has_errors}")));
+        let mut l = llbc("cg_lib.llbc");
+        l.has_errors = has_errors;
+        store.import(&l, "cg_lib").expect("import");
+        store
+            .rows("cg_lib")
+            .expect("rows")
+            .into_iter()
+            .filter(|r| r.predicate == "CRATE")
+            .map(|r| (r.subject, r.object))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        status(false),
+        [("cg_lib".to_owned(), "COMPLETE".to_owned())]
+    );
+    assert_eq!(status(true), [("cg_lib".to_owned(), "PARTIAL".to_owned())]);
+}
