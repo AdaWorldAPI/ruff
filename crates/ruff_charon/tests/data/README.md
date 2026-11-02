@@ -2,6 +2,7 @@
 
 - `cg_lib.llbc`, `cg_app.llbc`: Charon LLBC of the two crates of lance-graph `crates/sag-ra-probe/fixtures/codegraph/rev1`.
 - `cg_lib_rev2.llbc`, `cg_app_rev2.llbc`: the same for `rev2`, which deletes `triple` and `area_dyn` from `cg_lib` and drops the `area_dyn` call from `cg_app` (the store tests).
+- `trprobe.llbc`: Charon LLBC of `trprobe.rs` (a one-file crate with a trait, a default method and one impl), used to build calls through a known impl, which Charon does not emit for any of these sources.
 - `*.llbc_calls.txt`: the reference output, written by lance-graph `crates/sag-ra-probe/tools/llbc_calls.py <file> <crate>`, never by this crate.
 
 The LLBC was produced with the AdaWorldAPI Charon fork (`c69e231`, toolchain `nightly-2026-09-17`, built `--no-default-features --features rustc`), from the fixture revision's directory:

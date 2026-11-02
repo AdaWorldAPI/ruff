@@ -127,3 +127,205 @@ fn kythe_entries_carry_the_call_and_its_file() {
                 && e.contains("\"path\":\"cg_lib/src/macro_use.rs\""))
     );
 }
+
+/// Rewrite every call in `fun` from `FnPtrKind::Fun(from)` into a call through
+/// `TraitImpl(impl_id)` of trait `shape`, method `method`. Returns how many
+/// calls were rewritten.
+fn rewrite_to_trait_impl(
+    llbc: &mut ruff_charon::Llbc,
+    fun: &str,
+    from: charon_lib::ast::FunDeclId,
+    impl_id: charon_lib::ast::TraitImplId,
+    shape: charon_lib::ast::TraitDeclId,
+    method: charon_lib::ast::TraitMethodId,
+) -> usize {
+    use charon_lib::ast::llbc_ast::{Statement, StatementKind};
+    use charon_lib::ast::visitor::AstVisitable;
+    use charon_lib::ast::*;
+    let id = llbc
+        .krate
+        .fun_decls
+        .iter()
+        .find(|f| path_name(&f.item_meta.name) == fun)
+        .expect("fun")
+        .def_id;
+    let decl = llbc.krate.fun_decls.get_mut(id).expect("decl");
+    let Body::Structured(body) = &mut decl.body else {
+        panic!("{fun} has no structured body")
+    };
+    let mut n = 0;
+    body.body.dyn_visit_mut(|st: &mut Statement| {
+        if let StatementKind::Call { call, .. } = &mut st.kind
+            && let FnOperand::Regular(ptr) = &mut call.func
+            && matches!(ptr.kind.as_ref(), FnPtrKind::Fun(f) if *f == from)
+        {
+            let tr = TraitRef::new(
+                TraitRefKind::TraitImpl(TraitImplRef {
+                    id: impl_id,
+                    generics: Box::new(GenericArgs::empty()),
+                }),
+                TraitDeclRef {
+                    id: shape,
+                    generics: Box::new(GenericArgs::empty()),
+                },
+            );
+            *ptr.kind = FnPtrKind::Trait(tr, method);
+            n += 1;
+        }
+    });
+    n
+}
+
+/// A call through a known impl names the function it resolves to: the
+/// impl's own method, or the trait's default when the impl lacks it. An impl
+/// that is not in the LLBC is a residual, never a row pointing at the trait.
+#[test]
+fn a_call_through_a_known_impl_names_the_resolved_function() {
+    let mut llbc = load(&data("trprobe.llbc")).expect("llbc");
+    let k = &llbc.krate;
+    let fun_id = |p: &str| {
+        k.fun_decls
+            .iter()
+            .find(|f| path_name(&f.item_meta.name) == p)
+            .unwrap_or_else(|| panic!("{p}"))
+            .def_id
+    };
+    let (area_impl, twice) = (
+        fun_id("trprobe::Impl::area"),
+        fun_id("trprobe::Shape::twice"),
+    );
+    let shape = k
+        .trait_decls
+        .iter()
+        .find(|t| path_name(&t.item_meta.name) == "trprobe::Shape")
+        .expect("Shape")
+        .def_id;
+    let method = |name: &str| {
+        k.trait_decls
+            .get(shape)
+            .expect("decl")
+            .methods
+            .iter_indexed()
+            .find(|(_, m)| m.skip_binder.name.0.as_str() == name)
+            .expect("method")
+            .0
+    };
+    let (area, twice_m) = (method("area"), method("twice"));
+    let impl_id = k
+        .trait_impls
+        .iter()
+        .find(|i| i.impl_trait.id == shape)
+        .expect("impl")
+        .def_id;
+    let names = |llbc: &ruff_charon::Llbc| {
+        (
+            qualified_name(
+                &llbc.krate,
+                &llbc
+                    .krate
+                    .fun_decls
+                    .get(area_impl)
+                    .expect("f")
+                    .item_meta
+                    .name,
+            ),
+            qualified_name(
+                &llbc.krate,
+                &llbc.krate.fun_decls.get(twice).expect("f").item_meta.name,
+            ),
+        )
+    };
+    let (area_name, twice_name) = names(&llbc);
+    assert_eq!(
+        rewrite_to_trait_impl(
+            &mut llbc,
+            "trprobe::method_call",
+            area_impl,
+            impl_id,
+            shape,
+            area
+        ),
+        1
+    );
+    assert_eq!(
+        rewrite_to_trait_impl(
+            &mut llbc,
+            "trprobe::default_method",
+            twice,
+            impl_id,
+            shape,
+            twice_m
+        ),
+        1
+    );
+    // An impl id the crate does not have.
+    let missing = charon_lib::ast::TraitImplId::new(10_000);
+    assert_eq!(
+        rewrite_to_trait_impl(
+            &mut llbc,
+            "trprobe::qualified_call",
+            area_impl,
+            missing,
+            shape,
+            area
+        ),
+        1
+    );
+    let (rows, residual, receipt) = relations(&llbc.krate, "trprobe");
+    let objects = |subject: &str| -> Vec<String> {
+        find(&rows, "CALLS_RESOLVED", subject)
+            .iter()
+            .map(|r| r.object.clone())
+            .collect()
+    };
+    assert_eq!(
+        objects("trprobe::method_call"),
+        [area_name],
+        "the impl's own method"
+    );
+    assert_eq!(
+        objects("trprobe::default_method"),
+        [twice_name],
+        "the trait's default method"
+    );
+    assert!(objects("trprobe::qualified_call").is_empty());
+    assert!(
+        rows.iter().all(|r| !r.object.contains(" via TraitImpl")),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        residual.iter().map(|r| r.reason).collect::<Vec<_>>(),
+        ["TRAIT_IMPL_METHOD_NOT_FOUND"]
+    );
+    assert!(receipt.conserved(), "{receipt:?}");
+}
+
+/// A local function without a structured body is one definition (a DEFINES
+/// row) plus one body nobody can read (a residual): the receipt still
+/// conserves, and `rows` would not exit 3.
+#[test]
+fn an_opaque_body_keeps_the_receipt_conserved() {
+    let mut llbc = load(&data("cg_lib.llbc")).expect("llbc");
+    let (_, _, before) = relations(&llbc.krate, "cg_lib");
+    let id = llbc
+        .krate
+        .fun_decls
+        .iter()
+        .find(|f| path_name(&f.item_meta.name) == "cg_lib::util::unit")
+        .expect("unit")
+        .def_id;
+    llbc.krate.fun_decls.get_mut(id).expect("unit").body = charon_lib::ast::Body::Opaque;
+    let (rows, residual, receipt) = relations(&llbc.krate, "cg_lib");
+    assert_eq!(residual.len(), 1);
+    assert_eq!(residual[0].reason, "BODY_NOT_STRUCTURED");
+    assert!(
+        find(&rows, "DEFINES", &residual[0].subject).len() == 1,
+        "the definition stays represented"
+    );
+    assert!(receipt.conserved(), "{receipt:?}");
+    assert_eq!(
+        receipt.harvested,
+        before.harvested + 1,
+        "the body is harvested as its own item"
+    );
+}
