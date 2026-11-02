@@ -42,7 +42,7 @@ use std::path::Path;
 use clang::diagnostic::Severity;
 use clang::{
     Accessibility, Clang, Entity, EntityKind, ExceptionSpecification, Index, RefQualifier,
-    StorageClass,
+    StorageClass, TypeKind,
 };
 use ruff_spo_triplet::{
     CppAccess, CppBase, CppField, CppFriend, CppMethod, CppRefQualifier, CppTemplate,
@@ -414,13 +414,25 @@ fn collect_calls(node: &Entity, out: &mut FoundCalls) {
 /// A call that references anything else (a function pointer variable, a
 /// parameter, a field) is [`CallTarget::Dynamic`]: the program text does not
 /// name the target, and the variable's name is not a callee.
+///
+/// A constructor or destructor call names its target statically and is
+/// resolved like a method (`A::A`). A call whose callee expression is itself
+/// a call returning a function pointer (`factory()(1)`) is
+/// [`CallTarget::Dynamic`], even though libclang reports the inner function
+/// as the outer call's reference; the inner call is a separate `CallExpr`
+/// and keeps its own resolved edge.
 #[cfg(feature = "libclang")]
 fn call_target(call: &Entity) -> CallTarget {
     if let Some(referenced) = call.get_reference() {
+        if calls_a_returned_function(call, &referenced) {
+            return CallTarget::Dynamic;
+        }
         return match referenced.get_kind() {
-            EntityKind::Method => referenced.get_name().map_or(CallTarget::Dynamic, |name| {
-                CallTarget::Resolved(qualify_with_class(&referenced, name))
-            }),
+            EntityKind::Method | EntityKind::Constructor | EntityKind::Destructor => {
+                referenced.get_name().map_or(CallTarget::Dynamic, |name| {
+                    CallTarget::Resolved(qualify_with_class(&referenced, name))
+                })
+            }
             EntityKind::FunctionDecl
             | EntityKind::FunctionTemplate
             | EntityKind::ConversionFunction => CallTarget::Resolved(qualified_name(&referenced)),
@@ -430,6 +442,48 @@ fn call_target(call: &Entity) -> CallTarget {
     }
     find_overloaded_decl_ref(call)
         .map_or(CallTarget::Dynamic, |o| CallTarget::Lookup(lookup_set(&o)))
+}
+
+/// Is `call`'s callee expression the result of another call to `referenced`,
+/// a function returning a function pointer or reference? Then `call` invokes
+/// whatever that function returned, not `referenced` itself.
+///
+/// Both conditions are needed. The callee is the `CallExpr`'s first child,
+/// but an operator call (`g() + x`) or a constructor (`A a(make())`) can also
+/// have a call as its first child; neither references a function returning a
+/// function pointer.
+#[cfg(feature = "libclang")]
+fn calls_a_returned_function(call: &Entity, referenced: &Entity) -> bool {
+    let returns_function = referenced.get_result_type().is_some_and(|t| {
+        let t = t.get_canonical_type();
+        let pointee = match t.get_kind() {
+            TypeKind::Pointer | TypeKind::LValueReference | TypeKind::RValueReference => {
+                t.get_pointee_type()
+            }
+            TypeKind::MemberPointer => return true,
+            _ => None,
+        };
+        pointee.is_some_and(|p| {
+            matches!(
+                p.get_canonical_type().get_kind(),
+                TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype
+            )
+        })
+    });
+    if !returns_function {
+        return false;
+    }
+    let mut callee = call.get_children().into_iter().next();
+    while let Some(node) = callee {
+        match node.get_kind() {
+            EntityKind::CallExpr => return true,
+            EntityKind::UnexposedExpr | EntityKind::ParenExpr => {
+                callee = node.get_children().into_iter().next();
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The lookup set of an `OverloadedDeclRef` cursor: its spelled name and its
@@ -2590,6 +2644,54 @@ int via_ptr(int (*fp)(int), int x) { return fp(x); }
         // count.
         assert!(get("use_ns").unresolved_calls.is_empty());
         assert_eq!(get("use_ns").dynamic_calls, 0);
+    }
+
+    /// A constructor names its target statically, so it stays a resolved
+    /// call; a call through a function pointer RETURNED by another call is
+    /// dynamic, while the inner call keeps its resolved edge. Twins: a
+    /// constructor whose first argument is a call, and an overloaded operator
+    /// whose left operand is a call, both stay resolved with no dynamic count.
+    const CALL_SHAPES_SRC: &str = r"
+struct A { A(int); };
+int make();
+struct N { int v; };
+N operator+(N, int);
+N mk();
+int (*factory())(int);
+void construct() { A a(1); }
+void construct_from_call() { A a(make()); }
+int through_returned() { return factory()(1); }
+N add_call_lhs(int x) { return mk() + x; }
+";
+
+    #[test]
+    fn constructors_resolve_and_returned_function_pointers_are_dynamic() {
+        let _guard = CLANG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = write_fixture("call_shapes", CALL_SHAPES_SRC);
+        let funcs = walk_free_functions(&path, &cxx_args()).expect("libclang walk");
+        let _ = std::fs::remove_file(&path);
+        let get = |n: &str| {
+            funcs
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("{n} missing; got {funcs:?}"))
+        };
+        assert_eq!(get("construct").calls, ["A::A"]);
+        assert_eq!(get("construct").dynamic_calls, 0);
+        assert_eq!(get("through_returned").calls, ["factory"]);
+        assert_eq!(get("through_returned").dynamic_calls, 1);
+        // Twins.
+        assert_eq!(get("construct_from_call").calls, ["A::A", "make"]);
+        assert_eq!(get("construct_from_call").dynamic_calls, 0);
+        assert_eq!(
+            get("add_call_lhs").dynamic_calls,
+            0,
+            "{:?}",
+            get("add_call_lhs")
+        );
+        assert!(get("add_call_lhs").calls.contains(&"mk".to_string()));
     }
 
     /// A PLAIN free function (no class involved) keeps its existing
