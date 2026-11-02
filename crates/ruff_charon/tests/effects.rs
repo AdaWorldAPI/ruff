@@ -21,11 +21,16 @@ fn data(name: &str) -> PathBuf {
 }
 
 fn import(name: &str) -> (PathBuf, String) {
+    import_crate(name, "cg_lib")
+}
+
+fn import_crate(name: &str, krate: &str) -> (PathBuf, String) {
     let dir = std::env::temp_dir().join(format!("ruff_charon_fx_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let llbc = load(&data("cg_lib.llbc")).expect("llbc");
-    Store::new(&dir).import(&llbc, "cg_lib").expect("import");
-    let text = std::fs::read_to_string(dir.join("cg_lib.effects.tsv")).expect("effects file");
+    let llbc = load(&data(&format!("{krate}.llbc"))).expect("llbc");
+    Store::new(&dir).import(&llbc, krate).expect("import");
+    let text =
+        std::fs::read_to_string(dir.join(format!("{krate}.effects.tsv"))).expect("effects file");
     (dir, text)
 }
 
@@ -67,6 +72,11 @@ fn a_witnessed_overflow_check_is_recorded_with_its_kind() {
         effects_of(&text, "cg_lib::util::triple"),
         [("ASSERT", "Overflow:Mul")]
     );
+    // `double(self.0) / 2 * self.0`: two different kinds, in body order.
+    assert_eq!(
+        effects_of(&text, "cg_lib::shapes::impl_Shape_for_Square::area"),
+        [("ASSERT", "DivisionByZero"), ("ASSERT", "Overflow:Mul")]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -80,18 +90,30 @@ fn a_function_without_a_witnessed_effect_has_no_row() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fails if repeated effects are collapsed: one row per occurrence, so a
-/// count survives.
+/// Fails if repeated effects of one kind are collapsed: one row per
+/// occurrence, so a count survives. `cg_app::run` has three additions, each
+/// with its own overflow check; a kind-level dedup would leave one.
 #[test]
 fn every_occurrence_is_its_own_row() {
-    let (dir, text) = import("multi");
+    let (dir, text) = import_crate("multi", "cg_app");
+    assert_eq!(
+        effects_of(&text, "cg_app::run"),
+        [("ASSERT", "Overflow:Add"); 3]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fails if the effect rows disagree with the independent reference output
+/// (`cg_lib.llbc_calls.txt`, written by another tool), which counts the
+/// asserts per function.
+#[test]
+fn the_assert_count_matches_the_reference() {
+    let (dir, text) = import("reference");
     let total_asserts = text
         .lines()
         .filter(|l| !l.starts_with('#'))
         .filter(|l| l.split('\t').nth(1) == Some("ASSERT"))
         .count();
-    // The reference output (`cg_lib.llbc_calls.txt`, written by an
-    // independent tool) counts the asserts per function; the sum must match.
     let reference: usize = std::fs::read_to_string(data("cg_lib.llbc_calls.txt"))
         .expect("reference")
         .lines()
