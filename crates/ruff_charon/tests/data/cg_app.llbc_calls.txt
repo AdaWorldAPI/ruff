@@ -1,0 +1,2 @@
+has_errors	False
+cg_app::run	id=0	calls=['static:cg_lib::area_of@1', 'static:cg_lib::area_dyn@2', 'static:cg_lib::shapes::Impl::area@3', 'static:cg_lib::util::double@4']	deref_write_arg=0	deref_write_local=0	assert=3

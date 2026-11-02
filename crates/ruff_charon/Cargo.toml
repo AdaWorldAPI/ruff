@@ -1,0 +1,20 @@
+[package]
+name = "ruff_charon"
+version = "0.1.0"
+publish = false
+# Excluded from the ruff workspace (root `exclude`), like ruff_r2il: it depends on a sibling
+# checkout and pins its own edition / rust-version.
+edition = "2024"
+rust-version = "1.99"
+description = "Rust intake arm (D-CODEGRAPH-0): reads Charon's LLBC through charon-lib and emits the facts Charon witnessed, as calls, relation rows with a witness grade, and Kythe entries. Nothing is inferred; what cannot be represented is counted as residual."
+
+[lib]
+name = "ruff_charon"
+
+[dependencies]
+# The AdaWorldAPI fork checkout, consumed by path (P0 fork rule). The library only:
+# `--no-default-features` drops the rustc driver and the minirust submodule, and builds on
+# stable. Producing LLBC needs the fork's `charon` binary on its pinned nightly.
+charon = { path = "../../../charon/charon", default-features = false }
+serde_json = "1"
+anyhow = "1"
