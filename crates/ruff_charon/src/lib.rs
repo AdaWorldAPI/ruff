@@ -29,6 +29,8 @@
 //! A `MAY_DISPATCH` row is never a confirmed caller (crai-rs RS-F07). Nothing
 //! is inferred from names.
 
+pub mod store;
+
 use std::fmt::Write as _;
 use std::path::Path;
 

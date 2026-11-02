@@ -7,5 +7,8 @@
       cd rev1/cg_lib && charon cargo --no-dedup-serialized-ast --dest-file cg_lib.llbc
       cd rev1/cg_app && charon cargo --no-dedup-serialized-ast --dest-file cg_app.llbc
 
+- `cg_lib_rev2.llbc`, `cg_app_rev2.llbc`: the same for `rev2`, which deletes `triple` and
+  `area_dyn` from `cg_lib` and drops the `area_dyn` call from `cg_app` (the store tests).
+
 - `*.llbc_calls.txt`: the reference output, written by lance-graph
   `crates/sag-ra-probe/tools/llbc_calls.py <file> <crate>`, never by this crate.
