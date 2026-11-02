@@ -7,7 +7,8 @@ members = ["crates/*"]
 # See .claude/plans/r2il-behavioral-ir-v1.md.
 # ruff_metta_spo is excluded for the same reason: it path-deps the
 # hyperon-experimental sibling checkout (the Hyperon MeTTa parser).
-exclude = ["crates/ruff_r2il", "crates/ruff_metta_spo"]
+# ruff_charon likewise: it path-deps the AdaWorldAPI charon checkout.
+exclude = ["crates/ruff_r2il", "crates/ruff_metta_spo", "crates/ruff_charon"]
 resolver = "2"
 
 [workspace.package]
