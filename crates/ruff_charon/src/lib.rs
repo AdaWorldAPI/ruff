@@ -100,15 +100,16 @@ pub fn path_name(name: &Name) -> String {
 }
 
 /// The object of a `MAY_DISPATCH` row (`Trait::method via kind`) and its
-/// Kythe target (the trait). Behaviour-preserving extraction: a missing
-/// name still renders as the `?` placeholder.
+/// Kythe target (the trait). `None` when the trait or the method has no
+/// name: a placeholder would be one symbol shared by every unresolved
+/// target, so the caller records the call as a `CALLEE_NOT_NAMED` residual
+/// instead of guessing an identity.
 fn may_dispatch_object(
     trait_name: Option<String>,
     method_name: Option<String>,
     kind: &str,
 ) -> Option<(String, String)> {
-    let tr = trait_name.unwrap_or_else(|| "?".to_owned());
-    let name = method_name.unwrap_or_else(|| "?".to_owned());
+    let (tr, name) = (trait_name?, method_name?);
     Some((format!("{tr}::{name} via {kind}"), tr))
 }
 
