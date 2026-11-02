@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::{GRADE, Llbc, relations};
 
 /// The version of the rows artifact this crate writes and reads.
-pub const ROWS_VERSION: u32 = 1;
+pub const ROWS_VERSION: u32 = 2;
 const ROWS_SCHEMA: &[&str] = &[
     "predicate",
     "subject",
@@ -238,6 +238,14 @@ impl Store {
                 r.predicate, r.subject, r.object
             )?;
         }
+        // Whether Charon translated the whole crate: a PARTIAL crate's absent
+        // rows are not evidence of absence.
+        let completeness = if llbc.has_errors {
+            "PARTIAL"
+        } else {
+            "COMPLETE"
+        };
+        writeln!(out, "CRATE\t{crate_name}\t{completeness}\t{GRADE}\t-\t-\t-")?;
         let mut res = Vec::new();
         header(&mut res, RESIDUALS_VERSION, RESIDUALS_SCHEMA)?;
         for r in &residual {

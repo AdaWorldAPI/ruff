@@ -197,7 +197,7 @@ fn readers_refuse_unknown_versions_and_missing_columns() {
         .join(format!("ruff_charon_reader_{}", std::process::id()))
         .join("cg_lib.rows.tsv");
     let text = std::fs::read_to_string(&path).expect("rows file");
-    std::fs::write(&path, text.replacen("#version 1", "#version 2", 1)).expect("write");
+    std::fs::write(&path, text.replacen("#version 2", "#version 3", 1)).expect("write");
     assert!(
         store.rows("cg_lib").is_err(),
         "a newer version must be refused"

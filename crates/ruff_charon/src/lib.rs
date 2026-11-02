@@ -102,6 +102,8 @@ pub enum Callee {
     Trait {
         kind: String,
         trait_id: Option<TraitDeclId>,
+        /// The trait method the call names.
+        method: TraitMethodId,
         impl_fun: Option<FunDeclId>,
     },
     /// `FnOperand::Dynamic`.
@@ -123,6 +125,14 @@ pub struct CallSite {
     pub site: Option<Site>,
 }
 
+/// A function item or pointer used as a value (not called), in a structured body.
+#[derive(Debug, Clone)]
+pub struct FnRef {
+    /// `None` when the reference is not a plain function id (a trait method).
+    pub target: Option<FunDeclId>,
+    pub site: Option<Site>,
+}
+
 /// What one function's body witnesses.
 #[derive(Debug, Clone)]
 pub struct FunFacts {
@@ -132,6 +142,8 @@ pub struct FunFacts {
     pub site: Option<Site>,
     /// `None`: the body is not structured LLBC (opaque, extern, unstructured).
     pub calls: Option<Vec<CallSite>>,
+    /// Function items and pointers named as values; empty without a structured body.
+    pub refs: Vec<FnRef>,
     /// Writes through a dereference rooted in an argument (caller memory; for
     /// a closure, its captured state is argument 1).
     pub deref_write_arg: usize,
@@ -178,6 +190,24 @@ fn has_deref(place: &Place) -> bool {
     }
 }
 
+fn operand_fn_ptr(op: &Operand) -> Option<&FnPtr> {
+    let Operand::Const(c) = op else { return None };
+    match c.kind() {
+        ConstantExprKind::FnDef(p) | ConstantExprKind::FnPtr(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// The operand positions of an rvalue that can hold a function value.
+fn rvalue_operands(rv: &Rvalue) -> Vec<&Operand> {
+    match rv {
+        Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) => vec![op],
+        Rvalue::BinaryOp(_, a, b) => vec![a, b],
+        Rvalue::Aggregate(_, ops) => ops.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn callee(krate: &TranslatedCrate, call: &Call) -> Callee {
     match &call.func {
         FnOperand::Regular(ptr) => match ptr.kind.as_ref() {
@@ -202,6 +232,7 @@ fn callee(krate: &TranslatedCrate, call: &Call) -> Callee {
                 Callee::Trait {
                     kind: variant(format!("{:?}", tr.kind)),
                     trait_id: Some(tr.trait_decl_ref.id),
+                    method: *method,
                     impl_fun,
                 }
             }
@@ -226,6 +257,7 @@ pub fn fun_facts(krate: &TranslatedCrate, crate_name: &str) -> Vec<FunFacts> {
             name,
             site: site(krate, f.item_meta.span),
             calls: None,
+            refs: Vec::new(),
             deref_write_arg: 0,
             deref_write_local: 0,
             asserts: 0,
@@ -233,17 +265,39 @@ pub fn fun_facts(krate: &TranslatedCrate, crate_name: &str) -> Vec<FunFacts> {
         if let Body::Structured(body) = &f.body {
             let args = body.locals.arg_count;
             let mut calls = Vec::new();
-            body.body.dyn_visit(|st: &Statement| match &st.kind {
-                StatementKind::Call { call, .. } => calls.push(CallSite {
-                    callee: callee(krate, call),
-                    site: site(krate, st.span),
-                }),
-                StatementKind::Assert { .. } => facts.asserts += 1,
-                StatementKind::Assign(place, _) if has_deref(place) => match root_local(place) {
-                    Some(l) if l.index() <= args => facts.deref_write_arg += 1,
-                    _ => facts.deref_write_local += 1,
-                },
-                _ => {}
+            body.body.dyn_visit(|st: &Statement| {
+                // Operands that are function values, never the callee itself
+                // (`FnOperand` is not an `Operand`).
+                let operands: Vec<&Operand> = match &st.kind {
+                    StatementKind::Assign(_, rv) => rvalue_operands(rv),
+                    StatementKind::Call { call, .. } => call.args.iter().collect(),
+                    _ => Vec::new(),
+                };
+                for op in operands {
+                    if let Some(ptr) = operand_fn_ptr(op) {
+                        facts.refs.push(FnRef {
+                            target: match ptr.kind.as_ref() {
+                                FnPtrKind::Fun(id) => Some(*id),
+                                FnPtrKind::Trait(..) => None,
+                            },
+                            site: site(krate, st.span),
+                        });
+                    }
+                }
+                match &st.kind {
+                    StatementKind::Call { call, .. } => calls.push(CallSite {
+                        callee: callee(krate, call),
+                        site: site(krate, st.span),
+                    }),
+                    StatementKind::Assert { .. } => facts.asserts += 1,
+                    StatementKind::Assign(place, _) if has_deref(place) => {
+                        match root_local(place) {
+                            Some(l) if l.index() <= args => facts.deref_write_arg += 1,
+                            _ => facts.deref_write_local += 1,
+                        }
+                    }
+                    _ => {}
+                }
             });
             facts.calls = Some(calls);
         }
@@ -302,6 +356,9 @@ pub struct Relation {
     pub subject: String,
     pub object: String,
     pub site: Option<Site>,
+    /// What a Kythe `ref/call` points at when it is not `object`: the plain
+    /// trait name for `MAY_DISPATCH`, which Kythe reads as the declaration.
+    pub kythe_target: Option<String>,
 }
 
 /// Something Charon gave that no relation represents, with the reason.
@@ -342,7 +399,63 @@ pub fn relations(
             subject: f.qualified.clone(),
             object: f.qualified.clone(),
             site: f.site.clone(),
+            kythe_target: None,
         });
+        let decl = krate.fun_decls.get(f.id);
+        let mut marker = |predicate: &'static str, object: String| {
+            receipt.harvested += 1;
+            rows.push(Relation {
+                predicate,
+                subject: f.qualified.clone(),
+                object,
+                site: f.site.clone(),
+                kythe_target: None,
+            });
+        };
+        if let Some(d) = decl {
+            if d.item_meta.attr_info.public {
+                marker("PUBLIC", f.qualified.clone());
+            }
+            if d.item_meta
+                .name
+                .name
+                .iter()
+                .any(|e| !matches!(e, PathElem::Ident(..) | PathElem::Impl(_)))
+            {
+                marker("SYNTHETIC", f.qualified.clone());
+            }
+        }
+        if let Some(d) = decl
+            && let FunSource::TraitImpl {
+                trait_ref, item_id, ..
+            }
+            | FunSource::TraitDefault {
+                trait_ref, item_id, ..
+            } = &d.src
+        {
+            let named = krate.trait_decls.get(trait_ref.id).and_then(|t| {
+                let m = t.methods.get(*item_id)?;
+                Some(format!(
+                    "{}::{}",
+                    qualified_name(krate, &t.item_meta.name),
+                    m.skip_binder.name
+                ))
+            });
+            receipt.harvested += 1;
+            match named {
+                Some(object) => rows.push(Relation {
+                    predicate: "IMPLEMENTS",
+                    subject: f.qualified.clone(),
+                    object,
+                    site: f.site.clone(),
+                    kythe_target: None,
+                }),
+                None => residual.push(Residual {
+                    reason: "TRAIT_METHOD_NOT_FOUND",
+                    subject: f.qualified.clone(),
+                }),
+            }
+        }
         let Some(calls) = f.calls else {
             // The body is an item of its own: harvested here, represented by
             // nothing, so it is the residual. The definition above stays
@@ -356,6 +469,7 @@ pub fn relations(
         };
         for c in calls {
             receipt.harvested += 1;
+            let mut kythe_target = None;
             let (predicate, object) = match &c.callee {
                 Callee::Fun(id) => match krate.fun_decls.get(*id) {
                     Some(t) => ("CALLS_RESOLVED", qualified_name(krate, &t.item_meta.name)),
@@ -373,6 +487,7 @@ pub fn relations(
                 Callee::Trait {
                     kind,
                     trait_id,
+                    method,
                     impl_fun,
                 } => {
                     if kind == "TraitImpl" {
@@ -398,7 +513,12 @@ pub fn relations(
                             .and_then(|t| krate.item_names.get(&ItemId::TraitDecl(t)))
                             .map(|n| qualified_name(krate, n))
                             .unwrap_or_else(|| "?".to_owned());
-                        ("MAY_DISPATCH", format!("{tr} via {kind}"))
+                        let name = trait_id
+                            .and_then(|t| krate.trait_decls.get(t))
+                            .and_then(|t| t.methods.get(*method))
+                            .map_or_else(|| "?".to_owned(), |m| m.skip_binder.name.to_string());
+                        kythe_target = Some(tr.clone());
+                        ("MAY_DISPATCH", format!("{tr}::{name} via {kind}"))
                     }
                 }
                 Callee::Dynamic => ("UNRESOLVED_CALL", "dynamic".to_owned()),
@@ -408,7 +528,31 @@ pub fn relations(
                 subject: f.qualified.clone(),
                 object,
                 site: c.site,
+                kythe_target,
             });
+        }
+        for r in f.refs {
+            receipt.harvested += 1;
+            let named = r.target.and_then(|id| match krate.fun_decls.get(id) {
+                Some(t) => Some(qualified_name(krate, &t.item_meta.name)),
+                None => krate
+                    .item_names
+                    .get(&ItemId::Fun(id))
+                    .map(|n| qualified_name(krate, n)),
+            });
+            match named {
+                Some(object) => rows.push(Relation {
+                    predicate: "REFERENCES",
+                    subject: f.qualified.clone(),
+                    object,
+                    site: r.site,
+                    kythe_target: None,
+                }),
+                None => residual.push(Residual {
+                    reason: "REFERENCE_NOT_NAMED",
+                    subject: f.qualified.clone(),
+                }),
+            }
         }
     }
     receipt.represented = rows.len();
@@ -475,6 +619,14 @@ pub fn kythe_entries(
     let mut files = std::collections::HashSet::new();
     let (rows, _, _) = relations(krate, crate_name);
     for r in rows {
+        // The v2 predicates are facts about items, not Kythe edges; emitting
+        // their anchors would change the entry stream.
+        if matches!(
+            r.predicate,
+            "PUBLIC" | "IMPLEMENTS" | "SYNTHETIC" | "REFERENCES"
+        ) {
+            continue;
+        }
         let Some(s) = &r.site else { continue };
         if files.insert(s.file.clone())
             && let Some(f) = krate.files.iter().find(|f| match &f.name {
@@ -508,7 +660,10 @@ pub fn kythe_entries(
                 );
             }
             "CALLS_RESOLVED" | "MAY_DISPATCH" => {
-                let target = r.object.split(" via ").next().unwrap_or(&r.object);
+                let target = r
+                    .kythe_target
+                    .as_deref()
+                    .unwrap_or_else(|| r.object.split(" via ").next().unwrap_or(&r.object));
                 let callee = vname(corpus, target, "", "rust");
                 emit(
                     serde_json::json!({"source": a.clone(), "edge_kind": "/kythe/edge/ref/call", "target": callee, "fact_name": "/"}),
