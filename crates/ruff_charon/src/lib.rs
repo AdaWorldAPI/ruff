@@ -99,6 +99,19 @@ pub fn path_name(name: &Name) -> String {
         .join("::")
 }
 
+/// The object of a `MAY_DISPATCH` row (`Trait::method via kind`) and its
+/// Kythe target (the trait). Behaviour-preserving extraction: a missing
+/// name still renders as the `?` placeholder.
+fn may_dispatch_object(
+    trait_name: Option<String>,
+    method_name: Option<String>,
+    kind: &str,
+) -> Option<(String, String)> {
+    let tr = trait_name.unwrap_or_else(|| "?".to_owned());
+    let name = method_name.unwrap_or_else(|| "?".to_owned());
+    Some((format!("{tr}::{name} via {kind}"), tr))
+}
+
 /// Charon's own rendering of a name, which spells impl blocks out
 /// (`{impl Shape for Square}`), so distinct items print distinctly.
 pub fn qualified_name(krate: &TranslatedCrate, name: &Name) -> String {
@@ -534,14 +547,20 @@ pub fn relations(
                     } else {
                         let tr = trait_id
                             .and_then(|t| krate.item_names.get(&ItemId::TraitDecl(t)))
-                            .map(|n| qualified_name(krate, n))
-                            .unwrap_or_else(|| "?".to_owned());
+                            .map(|n| qualified_name(krate, n));
                         let name = trait_id
                             .and_then(|t| krate.trait_decls.get(t))
                             .and_then(|t| t.methods.get(*method))
-                            .map_or_else(|| "?".to_owned(), |m| m.skip_binder.name.to_string());
-                        kythe_target = Some(tr.clone());
-                        ("MAY_DISPATCH", format!("{tr}::{name} via {kind}"))
+                            .map(|m| m.skip_binder.name.to_string());
+                        let Some((object, target)) = may_dispatch_object(tr, name, kind) else {
+                            residual.push(Residual {
+                                reason: "CALLEE_NOT_NAMED",
+                                subject: f.qualified.clone(),
+                            });
+                            continue;
+                        };
+                        kythe_target = Some(target);
+                        ("MAY_DISPATCH", object)
                     }
                 }
                 Callee::Dynamic => ("UNRESOLVED_CALL", "dynamic".to_owned()),
@@ -721,6 +740,27 @@ mod tests {
         assert_eq!(b64(b"ab"), "YWI=");
         assert_eq!(b64(b"abc"), "YWJj");
         assert_eq!(b64(b"function"), "ZnVuY3Rpb24=");
+    }
+
+    /// Fails if a dispatch whose trait or method has no name gets a target:
+    /// a `?` placeholder is shared by every unresolved target, so two
+    /// distinct calls would merge onto one symbol.
+    #[test]
+    fn an_unnamed_dispatch_target_is_not_emitted() {
+        let n = |s: &str| Some(s.to_owned());
+        assert_eq!(may_dispatch_object(None, n("m"), "Clause"), None);
+        assert_eq!(may_dispatch_object(n("a::T"), None, "Dyn"), None);
+        assert_eq!(may_dispatch_object(None, None, "Clause"), None);
+    }
+
+    /// The silence twin: a fully named dispatch keeps its object and target.
+    #[test]
+    fn a_named_dispatch_target_is_emitted() {
+        let n = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            may_dispatch_object(n("a::T"), n("m"), "Clause"),
+            Some(("a::T::m via Clause".to_owned(), "a::T".to_owned()))
+        );
     }
 
     #[test]
