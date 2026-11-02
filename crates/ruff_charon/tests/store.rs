@@ -280,3 +280,31 @@ fn concurrent_imports_of_one_crate_do_not_collide() {
         "temporary files left behind: {leftovers:?}"
     );
 }
+
+/// Temporary files left by an interrupted import (same process id, counter
+/// restarted at zero) do not block a later import.
+#[test]
+fn leftover_temporary_files_do_not_block_an_import() {
+    let dir = temp("leftover");
+    let pid = std::process::id();
+    // Every counter value this test binary can reach, for every artifact.
+    for artifact in ["rows.tsv", "residuals.tsv", "files.tsv"] {
+        for n in 0..4096 {
+            std::fs::write(
+                dir.join(format!(".cg_lib.{artifact}.{pid}.{n}.tmp")),
+                b"stale",
+            )
+            .expect("plant");
+        }
+    }
+    let store = Store::new(dir.clone());
+    store
+        .import(&llbc("cg_lib.llbc"), "cg_lib")
+        .expect("import");
+    assert_eq!(
+        store.rows("cg_lib").expect("rows"),
+        store_of("leftover_clean", &[("cg_lib.llbc", "cg_lib")])
+            .rows("cg_lib")
+            .expect("rows")
+    );
+}

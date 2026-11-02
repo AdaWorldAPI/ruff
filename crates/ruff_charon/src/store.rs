@@ -174,19 +174,37 @@ impl Store {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("artifact");
-        let tmp = path.with_file_name(format!(
-            ".{name}.{}.{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(body)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)
+        // A leftover from an interrupted import can hold the name this call
+        // picks (a restarted process may get the same id and its counter
+        // starts again at zero). Skip taken names; creation stays exclusive,
+        // so a concurrent writer is never written into.
+        let (tmp, mut file) = loop {
+            let tmp = path.with_file_name(format!(
+                ".{name}.{}.{}.tmp",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(file) => break (tmp, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        };
+        let written = file
+            .write_all(body)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| {
+                drop(file);
+                fs::rename(&tmp, path)
+            });
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// Import (or refresh) one crate from its LLBC: replaces its rows,
