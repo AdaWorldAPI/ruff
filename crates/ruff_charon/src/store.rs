@@ -363,6 +363,13 @@ impl Store {
         Self::replace(&self.path(crate_name, "rows.bin"), &bin)?;
         if self.tsv_export {
             Self::replace(&self.path(crate_name, "rows.tsv"), &out)?;
+        } else {
+            // A TSV left by an earlier import would describe the previous
+            // revision while `rows.bin` describes this one.
+            match fs::remove_file(self.path(crate_name, "rows.tsv")) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
         }
         Self::replace(&self.path(crate_name, "residuals.tsv"), &res)?;
         Self::replace(&self.path(crate_name, "files.tsv"), &files)?;

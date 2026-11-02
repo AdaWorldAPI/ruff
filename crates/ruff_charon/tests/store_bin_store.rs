@@ -83,6 +83,33 @@ fn tsv_export_off_writes_no_tsv() {
     assert!(!store.rows("cg_lib").expect("rows").is_empty());
 }
 
+/// Red if turning the export off leaves an older `rows.tsv` behind: it would
+/// describe the previous revision while `rows.bin` describes the new one.
+#[test]
+fn turning_the_export_off_removes_a_stale_tsv() {
+    let dir = temp("tsv_stale");
+    Store::new(&dir)
+        .import(&llbc("cg_lib.llbc"), "cg_lib")
+        .expect("import rev1");
+    assert!(dir.join("cg_lib.rows.tsv").exists(), "rev1 wrote a TSV");
+    let store = Store::new(&dir).with_tsv_export(false);
+    store
+        .import(&llbc("cg_lib_rev2.llbc"), "cg_lib")
+        .expect("import rev2");
+    assert!(
+        !dir.join("cg_lib.rows.tsv").exists(),
+        "the rev1 TSV survived a rev2 import with export off"
+    );
+    let rev2 = store.rows("cg_lib").expect("rows");
+    let rev1 = Store::new(temp("tsv_stale_ref"));
+    rev1.import(&llbc("cg_lib.llbc"), "cg_lib").expect("ref");
+    assert_ne!(
+        rev2,
+        rev1.rows("cg_lib").expect("ref rows"),
+        "the two revisions must differ, or this test proves nothing"
+    );
+}
+
 /// Red when a function row loses its `FunDeclId`, the CRATE row gains one, or
 /// a DEFINES row names a different function than the one it was harvested from.
 #[test]
