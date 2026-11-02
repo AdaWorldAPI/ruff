@@ -285,7 +285,7 @@ fn a_call_through_a_known_impl_names_the_resolved_function() {
     );
     assert_eq!(
         objects("trprobe::default_method"),
-        [twice_name],
+        std::slice::from_ref(&twice_name),
         "the trait's default method"
     );
     assert!(objects("trprobe::qualified_call").is_empty());
@@ -298,6 +298,29 @@ fn a_call_through_a_known_impl_names_the_resolved_function() {
         ["TRAIT_IMPL_METHOD_NOT_FOUND"]
     );
     assert!(receipt.conserved(), "{receipt:?}");
+
+    // Charon lists an inherited default method in the impl's own table, so
+    // the trait-default fallback is only reached when that entry is missing.
+    let table = &mut llbc
+        .krate
+        .trait_impls
+        .get_mut(impl_id)
+        .expect("impl")
+        .methods;
+    assert!(
+        table.remove(twice_m).is_some(),
+        "the impl lists the default method"
+    );
+    let (rows, _, _) = relations(&llbc.krate, "trprobe");
+    let objects: Vec<_> = find(&rows, "CALLS_RESOLVED", "trprobe::default_method")
+        .iter()
+        .map(|r| r.object.clone())
+        .collect();
+    assert_eq!(
+        objects,
+        std::slice::from_ref(&twice_name),
+        "falls back to the trait's default method"
+    );
 }
 
 /// A local function without a structured body is one definition (a DEFINES
