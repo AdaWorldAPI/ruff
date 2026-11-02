@@ -99,6 +99,20 @@ pub fn path_name(name: &Name) -> String {
         .join("::")
 }
 
+/// The object of a `MAY_DISPATCH` row (`Trait::method via kind`) and its
+/// Kythe target (the trait). `None` when the trait or the method has no
+/// name: a placeholder would be one symbol shared by every unresolved
+/// target, so the caller records the call as a `CALLEE_NOT_NAMED` residual
+/// instead of guessing an identity.
+fn may_dispatch_object(
+    trait_name: Option<String>,
+    method_name: Option<String>,
+    kind: &str,
+) -> Option<(String, String)> {
+    let (tr, name) = (trait_name?, method_name?);
+    Some((format!("{tr}::{name} via {kind}"), tr))
+}
+
 /// Charon's own rendering of a name, which spells impl blocks out
 /// (`{impl Shape for Square}`), so distinct items print distinctly.
 pub fn qualified_name(krate: &TranslatedCrate, name: &Name) -> String {
@@ -167,6 +181,57 @@ pub struct FunFacts {
     pub deref_write_local: usize,
     /// `Assert` statements: overflow, division and bounds checks that can panic.
     pub asserts: usize,
+    /// Every effect the body witnesses, one per occurrence, in body order.
+    /// An observation list: a function with none is NOT proven pure.
+    pub effects: Vec<Effect>,
+}
+
+/// One effect a function body witnesses, at its site.
+///
+/// Only what the LLBC shows is recorded. The absence of an effect is never a
+/// purity verdict: Charon's own passes may fold checks into fallible
+/// operations, callees' effects are not included, and an unstructured body
+/// records nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Effect {
+    pub kind: EffectKind,
+    pub site: Option<Site>,
+}
+
+/// The kind of a witnessed effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectKind {
+    /// An `Assert` that can panic. The text is Charon's `BuiltinAssertKind`
+    /// tag (`BoundsCheck`, `DivisionByZero`, ...), `Overflow:<BinOp>` for an
+    /// overflow check (`Overflow:Mul`), and `User` for a source `assert!`.
+    Assert(String),
+    /// A write through a dereference rooted in an argument.
+    DerefWriteArg,
+    /// A write through a dereference rooted in a local.
+    DerefWriteLocal,
+}
+
+impl EffectKind {
+    /// The `effect` and `kind` columns of `<crate>.effects.tsv`.
+    pub fn columns(&self) -> (&'static str, &str) {
+        match self {
+            EffectKind::Assert(k) => ("ASSERT", k),
+            EffectKind::DerefWriteArg => ("DEREF_WRITE", "Arg"),
+            EffectKind::DerefWriteLocal => ("DEREF_WRITE", "Local"),
+        }
+    }
+}
+
+/// The exact kind of an assert: Charon's tag, with the operator for an
+/// overflow check; `User` when Charon records no built-in kind.
+fn assert_kind(assert: &Assert) -> String {
+    match &assert.check_kind {
+        None => "User".to_owned(),
+        Some(BuiltinAssertKind::Overflow(op, ..)) => {
+            format!("Overflow:{}", variant(format!("{op:?}")))
+        }
+        Some(k) => variant(format!("{k:?}")),
+    }
 }
 
 fn file_name(krate: &TranslatedCrate, id: FileId) -> String {
@@ -277,6 +342,7 @@ pub fn fun_facts(krate: &TranslatedCrate, crate_name: &str) -> Vec<FunFacts> {
             deref_write_arg: 0,
             deref_write_local: 0,
             asserts: 0,
+            effects: Vec::new(),
         };
         if let Body::Structured(body) = &f.body {
             let args = body.locals.arg_count;
@@ -305,12 +371,28 @@ pub fn fun_facts(krate: &TranslatedCrate, crate_name: &str) -> Vec<FunFacts> {
                         callee: callee(krate, call),
                         site: site(krate, st.span),
                     }),
-                    StatementKind::Assert { .. } => facts.asserts += 1,
+                    StatementKind::Assert { assert, .. } => {
+                        facts.asserts += 1;
+                        facts.effects.push(Effect {
+                            kind: EffectKind::Assert(assert_kind(assert)),
+                            site: site(krate, st.span),
+                        });
+                    }
                     StatementKind::Assign(place, _) if has_deref(place) => {
-                        match root_local(place) {
-                            Some(l) if l.index() <= args => facts.deref_write_arg += 1,
-                            _ => facts.deref_write_local += 1,
-                        }
+                        let kind = match root_local(place) {
+                            Some(l) if l.index() <= args => {
+                                facts.deref_write_arg += 1;
+                                EffectKind::DerefWriteArg
+                            }
+                            _ => {
+                                facts.deref_write_local += 1;
+                                EffectKind::DerefWriteLocal
+                            }
+                        };
+                        facts.effects.push(Effect {
+                            kind,
+                            site: site(krate, st.span),
+                        });
                     }
                     _ => {}
                 }
@@ -534,14 +616,20 @@ pub fn relations(
                     } else {
                         let tr = trait_id
                             .and_then(|t| krate.item_names.get(&ItemId::TraitDecl(t)))
-                            .map(|n| qualified_name(krate, n))
-                            .unwrap_or_else(|| "?".to_owned());
+                            .map(|n| qualified_name(krate, n));
                         let name = trait_id
                             .and_then(|t| krate.trait_decls.get(t))
                             .and_then(|t| t.methods.get(*method))
-                            .map_or_else(|| "?".to_owned(), |m| m.skip_binder.name.to_string());
-                        kythe_target = Some(tr.clone());
-                        ("MAY_DISPATCH", format!("{tr}::{name} via {kind}"))
+                            .map(|m| m.skip_binder.name.to_string());
+                        let Some((object, target)) = may_dispatch_object(tr, name, kind) else {
+                            residual.push(Residual {
+                                reason: "CALLEE_NOT_NAMED",
+                                subject: f.qualified.clone(),
+                            });
+                            continue;
+                        };
+                        kythe_target = Some(target);
+                        ("MAY_DISPATCH", object)
                     }
                 }
                 Callee::Dynamic => ("UNRESOLVED_CALL", "dynamic".to_owned()),
@@ -721,6 +809,27 @@ mod tests {
         assert_eq!(b64(b"ab"), "YWI=");
         assert_eq!(b64(b"abc"), "YWJj");
         assert_eq!(b64(b"function"), "ZnVuY3Rpb24=");
+    }
+
+    /// Fails if a dispatch whose trait or method has no name gets a target:
+    /// a `?` placeholder is shared by every unresolved target, so two
+    /// distinct calls would merge onto one symbol.
+    #[test]
+    fn an_unnamed_dispatch_target_is_not_emitted() {
+        let n = |s: &str| Some(s.to_owned());
+        assert_eq!(may_dispatch_object(None, n("m"), "Clause"), None);
+        assert_eq!(may_dispatch_object(n("a::T"), None, "Dyn"), None);
+        assert_eq!(may_dispatch_object(None, None, "Clause"), None);
+    }
+
+    /// The silence twin: a fully named dispatch keeps its object and target.
+    #[test]
+    fn a_named_dispatch_target_is_emitted() {
+        let n = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            may_dispatch_object(n("a::T"), n("m"), "Clause"),
+            Some(("a::T::m via Clause".to_owned(), "a::T".to_owned()))
+        );
     }
 
     #[test]

@@ -42,6 +42,8 @@ const ROWS_SCHEMA: &[&str] = &[
 const FILES_VERSION: u32 = 1;
 const FILES_SCHEMA: &[&str] = &["path", "fnv64"];
 const RESIDUALS_VERSION: u32 = 1;
+const EFFECTS_VERSION: u32 = 1;
+const EFFECTS_SCHEMA: &[&str] = &["subject", "effect", "kind", "file", "start", "end"];
 const RESIDUALS_SCHEMA: &[&str] = &["reason", "subject"];
 
 /// One stored relation row.
@@ -354,6 +356,26 @@ impl Store {
         for r in &residual {
             writeln!(res, "{}\t{}", r.reason, r.subject)?;
         }
+        // Witnessed effects, one row per occurrence. An observation list only:
+        // a function with no row is not proven pure.
+        let mut effects = Vec::new();
+        header(&mut effects, EFFECTS_VERSION, EFFECTS_SCHEMA)?;
+        for f in crate::fun_facts(&llbc.krate, crate_name) {
+            for fx in &f.effects {
+                let (effect, kind) = fx.kind.columns();
+                let (file, start, end) = fx
+                    .site
+                    .as_ref()
+                    .map_or(("-".to_owned(), "-".to_owned(), "-".to_owned()), |s| {
+                        (s.file.clone(), s.start.to_string(), s.end.to_string())
+                    });
+                writeln!(
+                    effects,
+                    "{}\t{effect}\t{kind}\t{file}\t{start}\t{end}",
+                    f.qualified
+                )?;
+            }
+        }
         let mut files = Vec::new();
         header(&mut files, FILES_VERSION, FILES_SCHEMA)?;
         for (p, d) in crate_files(llbc, crate_name) {
@@ -372,6 +394,7 @@ impl Store {
             }
         }
         Self::replace(&self.path(crate_name, "residuals.tsv"), &res)?;
+        Self::replace(&self.path(crate_name, "effects.tsv"), &effects)?;
         Self::replace(&self.path(crate_name, "files.tsv"), &files)?;
         Ok(receipt)
     }
