@@ -1,14 +1,12 @@
 # ruff_charon test data
 
-- `cg_lib.llbc`, `cg_app.llbc`: Charon LLBC of the two crates of lance-graph
-  `crates/sag-ra-probe/fixtures/codegraph/rev1`, produced with the AdaWorldAPI Charon fork
-  (`c69e231`, toolchain `nightly-2026-09-17`, built `--no-default-features --features rustc`):
+- `cg_lib.llbc`, `cg_app.llbc`: Charon LLBC of the two crates of lance-graph `crates/sag-ra-probe/fixtures/codegraph/rev1`.
+- `cg_lib_rev2.llbc`, `cg_app_rev2.llbc`: the same for `rev2`, which deletes `triple` and `area_dyn` from `cg_lib` and drops the `area_dyn` call from `cg_app` (the store tests).
+- `*.llbc_calls.txt`: the reference output, written by lance-graph `crates/sag-ra-probe/tools/llbc_calls.py <file> <crate>`, never by this crate.
 
-      cd rev1/cg_lib && charon cargo --no-dedup-serialized-ast --dest-file cg_lib.llbc
-      cd rev1/cg_app && charon cargo --no-dedup-serialized-ast --dest-file cg_app.llbc
+The LLBC was produced with the AdaWorldAPI Charon fork (`c69e231`, toolchain `nightly-2026-09-17`, built `--no-default-features --features rustc`), from the fixture revision's directory:
 
-- `cg_lib_rev2.llbc`, `cg_app_rev2.llbc`: the same for `rev2`, which deletes `triple` and
-  `area_dyn` from `cg_lib` and drops the `area_dyn` call from `cg_app` (the store tests).
-
-- `*.llbc_calls.txt`: the reference output, written by lance-graph
-  `crates/sag-ra-probe/tools/llbc_calls.py <file> <crate>`, never by this crate.
+```sh
+cd cg_lib && charon cargo --no-dedup-serialized-ast --dest-file cg_lib.llbc
+cd cg_app && charon cargo --no-dedup-serialized-ast --dest-file cg_app.llbc
+```

@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{GRADE, Llbc, relations};
 
@@ -164,14 +165,27 @@ impl Store {
 
     /// Write `path` through a temporary file and a rename, so a reader never
     /// sees half an artifact.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "ruff/clippy.toml's list is directory-scoped and reaches this \
-            workspace-excluded crate; there is no ty System here, plain std::fs is correct"
-    )]
     fn replace(path: &Path, body: &[u8]) -> io::Result<()> {
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, body)?;
+        // A temporary file of its own per call: two imports of one crate must
+        // not write into each other's file, or one of them publishes the
+        // other's half-written bytes (or fails when it was renamed away).
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("artifact");
+        let tmp = path.with_file_name(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        drop(file);
         fs::rename(&tmp, path)
     }
 
@@ -326,7 +340,9 @@ impl Store {
     }
 
     /// Call rows whose callee is a function of a stored crate that no stored
-    /// crate defines: edges left behind by an incomplete refresh.
+    /// crate defines: edges left behind by an incomplete refresh. A call
+    /// resolved through a known trait impl names the trait (`<trait> via
+    /// TraitImpl`), not a function, so it is not checked here.
     ///
     /// # Errors
     /// I/O or format errors.
@@ -340,7 +356,7 @@ impl Store {
             .collect();
         Ok(all
             .iter()
-            .filter(|r| r.predicate == "CALLS_RESOLVED")
+            .filter(|r| r.predicate == "CALLS_RESOLVED" && !r.object.contains(" via "))
             .filter(|r| {
                 let owner = r.object.split("::").next().unwrap_or("");
                 crates.iter().any(|c| c == owner) && !defined.contains(r.object.as_str())

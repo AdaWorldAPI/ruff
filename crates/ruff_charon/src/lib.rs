@@ -490,9 +490,9 @@ mod tests {
     #[test]
     fn base64_matches_the_standard_alphabet() {
         assert_eq!(b64(b""), "");
-        assert_eq!(b64(b"f"), "Zg==");
-        assert_eq!(b64(b"fo"), "Zm8=");
-        assert_eq!(b64(b"foo"), "Zm9v");
+        assert_eq!(b64(b"a"), "YQ==");
+        assert_eq!(b64(b"ab"), "YWI=");
+        assert_eq!(b64(b"abc"), "YWJj");
         assert_eq!(b64(b"function"), "ZnVuY3Rpb24=");
     }
 
