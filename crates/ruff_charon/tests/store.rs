@@ -191,7 +191,7 @@ fn files_are_the_crates_own() {
 #[test]
 fn readers_refuse_unknown_versions_and_missing_columns() {
     let store = store_of("reader", &[("cg_lib.llbc", "cg_lib")]);
-    let rows = store.rows("cg_lib").expect("rows");
+    let rows = store.rows_tsv("cg_lib").expect("rows");
     assert!(!rows.is_empty());
     let path = std::env::temp_dir()
         .join(format!("ruff_charon_reader_{}", std::process::id()))
@@ -199,16 +199,16 @@ fn readers_refuse_unknown_versions_and_missing_columns() {
     let text = std::fs::read_to_string(&path).expect("rows file");
     std::fs::write(&path, text.replacen("#version 2", "#version 3", 1)).expect("write");
     assert!(
-        store.rows("cg_lib").is_err(),
+        store.rows_tsv("cg_lib").is_err(),
         "a newer version must be refused"
     );
     std::fs::write(&path, text.replacen("\tgrade\t", "\tlevel\t", 1)).expect("write");
     assert!(
-        store.rows("cg_lib").is_err(),
+        store.rows_tsv("cg_lib").is_err(),
         "a renamed column must be refused"
     );
     std::fs::write(&path, &text).expect("restore");
-    assert_eq!(store.rows("cg_lib").expect("rows"), rows);
+    assert_eq!(store.rows_tsv("cg_lib").expect("rows"), rows);
 }
 
 /// A call resolved through a known trait impl names the trait, not a

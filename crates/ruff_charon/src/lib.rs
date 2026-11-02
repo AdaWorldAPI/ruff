@@ -30,9 +30,12 @@
 //! is inferred from names.
 
 pub mod store;
+pub mod store_bin;
 
 use std::fmt::Write as _;
 use std::path::Path;
+
+use anyhow::Context as _;
 
 use charon_lib::ast::llbc_ast::{Statement, StatementKind};
 use charon_lib::ast::visitor::AstVisitable;
@@ -47,14 +50,27 @@ pub struct Llbc {
     /// Charon reported errors: the crate description is partial.
     pub has_errors: bool,
     pub krate: TranslatedCrate,
+    /// The version of Charon that wrote the file (`CrateData::charon_version`).
+    pub charon_version: String,
+    /// [`store_bin::digest`] over the bytes of the LLBC file.
+    pub llbc_digest: u64,
 }
 
 /// Read an LLBC file written by `charon ... --dest-file`.
 pub fn load(path: &Path) -> anyhow::Result<Llbc> {
+    // Charon offers no deserialize-from-bytes API (only `deserialize_from_file`,
+    // which also needs `serde_stacker` for deep ASTs), so the file is read twice:
+    // once for the digest, once by Charon.
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read llbc file {}", path.display()))?;
+    let llbc_digest = store_bin::digest(&bytes);
+    drop(bytes);
     let data = CrateData::deserialize_from_file(path, SerializationFormat::Json)?;
     Ok(Llbc {
         has_errors: data.has_errors,
         krate: data.translated,
+        charon_version: data.charon_version.0,
+        llbc_digest,
     })
 }
 
@@ -359,6 +375,10 @@ pub struct Relation {
     /// What a Kythe `ref/call` points at when it is not `object`: the plain
     /// trait name for `MAY_DISPATCH`, which Kythe reads as the declaration.
     pub kythe_target: Option<String>,
+    /// The Charon `FunDeclId` of the function the row was harvested from. It
+    /// indexes the `fun_decls` of ONE LLBC file, so it is never an identity on
+    /// its own: identity is `(artifact, FunDeclId)`.
+    pub fun: Option<FunDeclId>,
 }
 
 /// Something Charon gave that no relation represents, with the reason.
@@ -400,6 +420,7 @@ pub fn relations(
             object: f.qualified.clone(),
             site: f.site.clone(),
             kythe_target: None,
+            fun: Some(f.id),
         });
         let decl = krate.fun_decls.get(f.id);
         let mut marker = |predicate: &'static str, object: String| {
@@ -410,6 +431,7 @@ pub fn relations(
                 object,
                 site: f.site.clone(),
                 kythe_target: None,
+                fun: Some(f.id),
             });
         };
         if let Some(d) = decl {
@@ -449,6 +471,7 @@ pub fn relations(
                     object,
                     site: f.site.clone(),
                     kythe_target: None,
+                    fun: Some(f.id),
                 }),
                 None => residual.push(Residual {
                     reason: "TRAIT_METHOD_NOT_FOUND",
@@ -529,6 +552,7 @@ pub fn relations(
                 object,
                 site: c.site,
                 kythe_target,
+                fun: Some(f.id),
             });
         }
         for r in f.refs {
@@ -547,6 +571,7 @@ pub fn relations(
                     object,
                     site: r.site,
                     kythe_target: None,
+                    fun: Some(f.id),
                 }),
                 None => residual.push(Residual {
                     reason: "REFERENCE_NOT_NAMED",

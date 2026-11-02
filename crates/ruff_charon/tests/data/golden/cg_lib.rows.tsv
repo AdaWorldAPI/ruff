@@ -1,0 +1,31 @@
+#version 2
+#schema predicate	subject	object	grade	file	start	end
+DEFINES	cg_lib::area_of	cg_lib::area_of	COMPILER	cg_lib/src/lib.rs	81	144
+PUBLIC	cg_lib::area_of	cg_lib::area_of	COMPILER	cg_lib/src/lib.rs	81	144
+MAY_DISPATCH	cg_lib::area_of	cg_lib::shapes::Shape::area via Clause	COMPILER	cg_lib/src/lib.rs	134	142
+DEFINES	cg_lib::area_dyn	cg_lib::area_dyn	COMPILER	cg_lib/src/lib.rs	146	208
+PUBLIC	cg_lib::area_dyn	cg_lib::area_dyn	COMPILER	cg_lib/src/lib.rs	146	208
+UNRESOLVED_CALL	cg_lib::area_dyn	dynamic	COMPILER	cg_lib/src/lib.rs	198	206
+DEFINES	cg_lib::macro_use::checked	cg_lib::macro_use::checked	COMPILER	cg_lib/src/macro_use.rs	32	91
+PUBLIC	cg_lib::macro_use::checked	cg_lib::macro_use::checked	COMPILER	cg_lib/src/macro_use.rs	32	91
+CALLS_RESOLVED	cg_lib::macro_use::checked	cg_lib::util::triple	COMPILER	cg_lib/src/macro_use.rs	73	78
+CALLS_RESOLVED	cg_lib::macro_use::checked	core::panicking::assert_failed	COMPILER	cg_lib/src/macro_use.rs	62	82
+DEFINES	cg_lib::util::double	cg_lib::util::double	COMPILER	cg_lib/src/util.rs	28	70
+PUBLIC	cg_lib::util::double	cg_lib::util::double	COMPILER	cg_lib/src/util.rs	28	70
+DEFINES	cg_lib::util::triple	cg_lib::util::triple	COMPILER	cg_lib/src/util.rs	72	114
+PUBLIC	cg_lib::util::triple	cg_lib::util::triple	COMPILER	cg_lib/src/util.rs	72	114
+DEFINES	cg_lib::util::unit	cg_lib::util::unit	COMPILER	cg_lib/src/util.rs	116	157
+PUBLIC	cg_lib::util::unit	cg_lib::util::unit	COMPILER	cg_lib/src/util.rs	116	157
+DEFINES	cg_lib::util::private_unused	cg_lib::util::private_unused	COMPILER	cg_lib/src/util.rs	159	195
+DEFINES	cg_lib::shapes::impl_Shape_for_Square::area	cg_lib::shapes::impl_Shape_for_Square::area	COMPILER	cg_lib/src/shapes.rs	192	257
+PUBLIC	cg_lib::shapes::impl_Shape_for_Square::area	cg_lib::shapes::impl_Shape_for_Square::area	COMPILER	cg_lib/src/shapes.rs	192	257
+IMPLEMENTS	cg_lib::shapes::impl_Shape_for_Square::area	cg_lib::shapes::Shape::area	COMPILER	cg_lib/src/shapes.rs	192	257
+CALLS_RESOLVED	cg_lib::shapes::impl_Shape_for_Square::area	cg_lib::util::double	COMPILER	cg_lib/src/shapes.rs	224	238
+DEFINES	cg_lib::shapes::impl_Shape_for_Rect::area	cg_lib::shapes::impl_Shape_for_Rect::area	COMPILER	cg_lib/src/shapes.rs	287	340
+PUBLIC	cg_lib::shapes::impl_Shape_for_Rect::area	cg_lib::shapes::impl_Shape_for_Rect::area	COMPILER	cg_lib/src/shapes.rs	287	340
+IMPLEMENTS	cg_lib::shapes::impl_Shape_for_Rect::area	cg_lib::shapes::Shape::area	COMPILER	cg_lib/src/shapes.rs	287	340
+DEFINES	cg_lib::shapes::{Square}::side	cg_lib::shapes::{Square}::side	COMPILER	cg_lib/src/shapes.rs	362	410
+PUBLIC	cg_lib::shapes::{Square}::side	cg_lib::shapes::{Square}::side	COMPILER	cg_lib/src/shapes.rs	362	410
+DEFINES	cg_lib::macro_use::checked::{promoted_const}	cg_lib::macro_use::checked::{promoted_const}	COMPILER	cg_lib/src/macro_use.rs	62	82
+SYNTHETIC	cg_lib::macro_use::checked::{promoted_const}	cg_lib::macro_use::checked::{promoted_const}	COMPILER	cg_lib/src/macro_use.rs	62	82
+CRATE	cg_lib	COMPLETE	COMPILER	-	-	-
