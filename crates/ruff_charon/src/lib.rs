@@ -30,6 +30,7 @@
 //! is inferred from names.
 
 pub mod store;
+pub mod store_bin;
 
 use std::fmt::Write as _;
 use std::path::Path;
