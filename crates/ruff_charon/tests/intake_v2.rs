@@ -147,3 +147,29 @@ fn kythe_output_is_unchanged_by_v2() {
         assert_eq!(got, want, "{file}");
     }
 }
+
+/// Fails when a v2 predicate reaches Kythe. The goldens cannot catch this:
+/// a PUBLIC/IMPLEMENTS/SYNTHETIC row carries its function's DEFINES span, and
+/// the emitter drops duplicate entries. A REFERENCES row has a span of its
+/// own (`helper` in `take`, bytes 247..253), so only it shows the leak.
+#[test]
+fn a_reference_is_not_a_kythe_anchor() {
+    let llbc = load(&data("fnref.llbc")).expect("llbc");
+    let (rows, _, _) = relations(&llbc.krate, "fnref");
+    let site = rows
+        .iter()
+        .find(|r| r.predicate == "REFERENCES")
+        .and_then(|r| r.site.as_ref())
+        .expect("a reference site");
+    assert_eq!((site.start, site.end), (247, 253));
+    let at = format!("\"signature\":\"@{}:{}\"", site.start, site.end);
+    let entries = kythe_entries(&llbc.krate, "fnref", "lance-graph", "");
+    assert!(
+        !entries.is_empty(),
+        "the crate's own anchors must be emitted"
+    );
+    assert!(
+        entries.iter().all(|e| !e.contains(&at)),
+        "an anchor was emitted at the reference site"
+    );
+}
