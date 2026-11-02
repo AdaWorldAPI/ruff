@@ -210,3 +210,101 @@ fn readers_refuse_unknown_versions_and_missing_columns() {
     std::fs::write(&path, &text).expect("restore");
     assert_eq!(store.rows("cg_lib").expect("rows"), rows);
 }
+
+/// A call resolved through a known trait impl names the trait, not a
+/// function, so a consistent store must not report it as dangling, while a
+/// call to a function nobody defines still is.
+#[test]
+fn trait_impl_calls_are_not_dangling() {
+    let dir = temp("traitimpl");
+    let header = "#version 1\n#schema predicate\tsubject\tobject\tgrade\tfile\tstart\tend\n";
+    std::fs::write(
+        dir.join("x.rows.tsv"),
+        format!(
+            "{header}DEFINES\tx::f\tx::f\tCOMPILER\t-\t-\t-\n\
+             CALLS_RESOLVED\tx::f\tx::Shape via TraitImpl\tCOMPILER\t-\t-\t-\n"
+        ),
+    )
+    .expect("rows");
+    std::fs::write(dir.join("x.files.tsv"), "#version 1\n#schema path\tfnv64\n").expect("files");
+    let store = Store::new(&dir);
+    assert!(store.dangling().expect("dangling").is_empty());
+    // The check is still live for function targets.
+    std::fs::write(
+        dir.join("x.rows.tsv"),
+        format!(
+            "{header}DEFINES\tx::f\tx::f\tCOMPILER\t-\t-\t-\n\
+             CALLS_RESOLVED\tx::f\tx::Shape via TraitImpl\tCOMPILER\t-\t-\t-\n\
+             CALLS_RESOLVED\tx::f\tx::gone\tCOMPILER\t-\t-\t-\n"
+        ),
+    )
+    .expect("rows");
+    let objects: Vec<_> = store
+        .dangling()
+        .expect("dangling")
+        .into_iter()
+        .map(|r| r.object)
+        .collect();
+    assert_eq!(objects, ["x::gone"]);
+}
+
+/// Concurrent imports of one crate each write through their own temporary
+/// file: all succeed, and the store ends with a whole, correct artifact.
+#[test]
+fn concurrent_imports_of_one_crate_do_not_collide() {
+    let dir = temp("concurrent");
+    let lib = std::sync::Arc::new(llbc("cg_lib.llbc"));
+    let clean = store_of("concurrent_clean", &[("cg_lib.llbc", "cg_lib")]);
+    for _round in 0..10 {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (dir, lib) = (dir.clone(), lib.clone());
+                std::thread::spawn(move || Store::new(dir).import(&lib, "cg_lib").map(|_| ()))
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread").expect("import");
+        }
+    }
+    assert_eq!(
+        Store::new(&dir).all_rows().expect("rows"),
+        clean.all_rows().expect("rows")
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files left behind: {leftovers:?}"
+    );
+}
+
+/// Temporary files left by an interrupted import (same process id, counter
+/// restarted at zero) do not block a later import.
+#[test]
+fn leftover_temporary_files_do_not_block_an_import() {
+    let dir = temp("leftover");
+    let pid = std::process::id();
+    // Every counter value this test binary can reach, for every artifact.
+    for artifact in ["rows.tsv", "residuals.tsv", "files.tsv"] {
+        for n in 0..4096 {
+            std::fs::write(
+                dir.join(format!(".cg_lib.{artifact}.{pid}.{n}.tmp")),
+                b"stale",
+            )
+            .expect("plant");
+        }
+    }
+    let store = Store::new(dir.clone());
+    store
+        .import(&llbc("cg_lib.llbc"), "cg_lib")
+        .expect("import");
+    assert_eq!(
+        store.rows("cg_lib").expect("rows"),
+        store_of("leftover_clean", &[("cg_lib.llbc", "cg_lib")])
+            .rows("cg_lib")
+            .expect("rows")
+    );
+}

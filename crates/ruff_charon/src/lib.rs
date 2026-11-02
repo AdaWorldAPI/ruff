@@ -22,7 +22,7 @@
 //! | Charon | Meaning | Relation |
 //! |---|---|---|
 //! | `FnPtrKind::Fun(id)` | a resolved function | `CALLS_RESOLVED` |
-//! | `FnPtrKind::Trait` with `TraitRefKind::TraitImpl` | a known impl | `CALLS_RESOLVED` |
+//! | `FnPtrKind::Trait` with `TraitRefKind::TraitImpl` | a known impl; the row names the impl's method (or the trait's default) | `CALLS_RESOLVED` |
 //! | `FnPtrKind::Trait`, any other trait-ref kind (`Clause`, `Dyn`, ...) | the impl is chosen later | `MAY_DISPATCH` |
 //! | `FnOperand::Dynamic` | a function pointer or vtable slot | `UNRESOLVED_CALL` |
 //!
@@ -95,9 +95,14 @@ pub enum Callee {
     /// `FnPtrKind::Fun`: the function's id.
     Fun(FunDeclId),
     /// `FnPtrKind::Trait`: the trait reference's kind and the method's trait.
+    /// `impl_fun` is the function a `TraitImpl` reference resolves to: the
+    /// impl's own method, or the trait's default method when the impl does
+    /// not define it. `None` for every other kind, and when the impl or the
+    /// method is not in the LLBC.
     Trait {
         kind: String,
         trait_id: Option<TraitDeclId>,
+        impl_fun: Option<FunDeclId>,
     },
     /// `FnOperand::Dynamic`.
     Dynamic,
@@ -173,14 +178,33 @@ fn has_deref(place: &Place) -> bool {
     }
 }
 
-fn callee(call: &Call) -> Callee {
+fn callee(krate: &TranslatedCrate, call: &Call) -> Callee {
     match &call.func {
         FnOperand::Regular(ptr) => match ptr.kind.as_ref() {
             FnPtrKind::Fun(id) => Callee::Fun(*id),
-            FnPtrKind::Trait(tr, _) => Callee::Trait {
-                kind: variant(format!("{:?}", tr.kind)),
-                trait_id: Some(tr.trait_decl_ref.id),
-            },
+            FnPtrKind::Trait(tr, method) => {
+                let impl_fun = match &tr.kind {
+                    TraitRefKind::TraitImpl(r) => krate
+                        .trait_impls
+                        .get(r.id)
+                        .and_then(|i| i.methods.get(*method))
+                        .map(|b| b.skip_binder.id)
+                        .or_else(|| {
+                            krate
+                                .trait_decls
+                                .get(tr.trait_decl_ref.id)
+                                .and_then(|t| t.methods.get(*method))
+                                .and_then(|m| m.skip_binder.default.as_ref())
+                                .map(|d| d.id)
+                        }),
+                    _ => None,
+                };
+                Callee::Trait {
+                    kind: variant(format!("{:?}", tr.kind)),
+                    trait_id: Some(tr.trait_decl_ref.id),
+                    impl_fun,
+                }
+            }
         },
         FnOperand::Dynamic(..) => Callee::Dynamic,
     }
@@ -211,7 +235,7 @@ pub fn fun_facts(krate: &TranslatedCrate, crate_name: &str) -> Vec<FunFacts> {
             let mut calls = Vec::new();
             body.body.dyn_visit(|st: &Statement| match &st.kind {
                 StatementKind::Call { call, .. } => calls.push(CallSite {
-                    callee: callee(call),
+                    callee: callee(krate, call),
                     site: site(krate, st.span),
                 }),
                 StatementKind::Assert { .. } => facts.asserts += 1,
@@ -320,6 +344,10 @@ pub fn relations(
             site: f.site.clone(),
         });
         let Some(calls) = f.calls else {
+            // The body is an item of its own: harvested here, represented by
+            // nothing, so it is the residual. The definition above stays
+            // represented by its DEFINES row.
+            receipt.harvested += 1;
             residual.push(Residual {
                 reason: "BODY_NOT_STRUCTURED",
                 subject: f.qualified.clone(),
@@ -342,17 +370,36 @@ pub fn relations(
                         }
                     },
                 },
-                Callee::Trait { kind, trait_id } => {
-                    let tr = trait_id
-                        .and_then(|t| krate.item_names.get(&ItemId::TraitDecl(t)))
-                        .map(|n| qualified_name(krate, n))
-                        .unwrap_or_else(|| "?".to_owned());
-                    let p = if kind == "TraitImpl" {
-                        "CALLS_RESOLVED"
+                Callee::Trait {
+                    kind,
+                    trait_id,
+                    impl_fun,
+                } => {
+                    if kind == "TraitImpl" {
+                        // A known impl: the confirmed callee is the function
+                        // it resolves to, never the trait.
+                        let named = impl_fun.and_then(|id| match krate.fun_decls.get(id) {
+                            Some(t) => Some(qualified_name(krate, &t.item_meta.name)),
+                            None => krate
+                                .item_names
+                                .get(&ItemId::Fun(id))
+                                .map(|n| qualified_name(krate, n)),
+                        });
+                        let Some(name) = named else {
+                            residual.push(Residual {
+                                reason: "TRAIT_IMPL_METHOD_NOT_FOUND",
+                                subject: f.qualified.clone(),
+                            });
+                            continue;
+                        };
+                        ("CALLS_RESOLVED", name)
                     } else {
-                        "MAY_DISPATCH"
-                    };
-                    (p, format!("{tr} via {kind}"))
+                        let tr = trait_id
+                            .and_then(|t| krate.item_names.get(&ItemId::TraitDecl(t)))
+                            .map(|n| qualified_name(krate, n))
+                            .unwrap_or_else(|| "?".to_owned());
+                        ("MAY_DISPATCH", format!("{tr} via {kind}"))
+                    }
                 }
                 Callee::Dynamic => ("UNRESOLVED_CALL", "dynamic".to_owned()),
             };
@@ -490,9 +537,9 @@ mod tests {
     #[test]
     fn base64_matches_the_standard_alphabet() {
         assert_eq!(b64(b""), "");
-        assert_eq!(b64(b"f"), "Zg==");
-        assert_eq!(b64(b"fo"), "Zm8=");
-        assert_eq!(b64(b"foo"), "Zm9v");
+        assert_eq!(b64(b"a"), "YQ==");
+        assert_eq!(b64(b"ab"), "YWI=");
+        assert_eq!(b64(b"abc"), "YWJj");
         assert_eq!(b64(b"function"), "ZnVuY3Rpb24=");
     }
 
