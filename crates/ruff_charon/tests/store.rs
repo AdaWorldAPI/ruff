@@ -197,7 +197,7 @@ fn readers_refuse_unknown_versions_and_missing_columns() {
         .join(format!("ruff_charon_reader_{}", std::process::id()))
         .join("cg_lib.rows.tsv");
     let text = std::fs::read_to_string(&path).expect("rows file");
-    std::fs::write(&path, text.replacen("#version 1", "#version 2", 1)).expect("write");
+    std::fs::write(&path, text.replacen("#version 2", "#version 3", 1)).expect("write");
     assert!(
         store.rows("cg_lib").is_err(),
         "a newer version must be refused"
@@ -307,4 +307,28 @@ fn leftover_temporary_files_do_not_block_an_import() {
             .rows("cg_lib")
             .expect("rows")
     );
+}
+
+/// The crate row records whether Charon reported errors, so a reader can tell
+/// a crate whose absent rows are evidence of absence from one that is partial.
+#[test]
+fn the_crate_row_records_charon_errors() {
+    let status = |has_errors: bool| {
+        let store = Store::new(temp(&format!("crate_status_{has_errors}")));
+        let mut l = llbc("cg_lib.llbc");
+        l.has_errors = has_errors;
+        store.import(&l, "cg_lib").expect("import");
+        store
+            .rows("cg_lib")
+            .expect("rows")
+            .into_iter()
+            .filter(|r| r.predicate == "CRATE")
+            .map(|r| (r.subject, r.object))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        status(false),
+        [("cg_lib".to_owned(), "COMPLETE".to_owned())]
+    );
+    assert_eq!(status(true), [("cg_lib".to_owned(), "PARTIAL".to_owned())]);
 }

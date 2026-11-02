@@ -11,3 +11,7 @@ The LLBC was produced with the AdaWorldAPI Charon fork (`c69e231`, toolchain `ni
 cd cg_lib && charon cargo --no-dedup-serialized-ast --dest-file cg_lib.llbc
 cd cg_app && charon cargo --no-dedup-serialized-ast --dest-file cg_app.llbc
 ```
+
+- `fnref.llbc`: Charon LLBC of `fnref.rs` (a function used only as a function pointer, an unused private function, and a call through a pointer argument), produced with `charon rustc --no-dedup-serialized-ast --dest-file fnref.llbc -- --crate-type=lib fnref.rs`. rustc reports `dead_code` for `unused_private` only.
+- `cg_lib.kythe.golden`, `cg_app.kythe.golden`: `ruff_charon kythe <file> <crate>` on rows v1 (before the v2 predicates); the v2 Kythe output must equal them.
+- `cg_broken` (rev1) produces no LLBC: rustc stops on E0425 and E0432 before Charon translates, so a `CRATE … PARTIAL` row cannot come from a crate that does not compile.

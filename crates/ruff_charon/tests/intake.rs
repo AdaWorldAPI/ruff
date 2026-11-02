@@ -46,7 +46,7 @@ fn dispatch_is_never_a_confirmed_call() {
     let rows = rows("cg_lib.llbc", "cg_lib");
     let bound = find(&rows, "MAY_DISPATCH", "cg_lib::area_of");
     assert_eq!(bound.len(), 1, "{rows:#?}");
-    assert_eq!(bound[0].object, "cg_lib::shapes::Shape via Clause");
+    assert_eq!(bound[0].object, "cg_lib::shapes::Shape::area via Clause");
     assert!(find(&rows, "CALLS_RESOLVED", "cg_lib::area_of").is_empty());
     let dynamic = find(&rows, "UNRESOLVED_CALL", "cg_lib::area_dyn");
     assert_eq!(dynamic.len(), 1);
@@ -104,8 +104,9 @@ fn receipt_conserves() {
     assert!(receipt.conserved(), "{receipt:?}");
     assert_eq!(receipt.represented, rows.len());
     assert_eq!(receipt.residual, residual.len());
-    // 11 local functions, 5 call statements (llbc_calls.py's count).
-    assert_eq!(receipt.harvested, 16);
+    // 11 local functions, 5 call statements (llbc_calls.py's count), and
+    // the rows v2 facts: 9 PUBLIC, 2 IMPLEMENTS, 1 SYNTHETIC.
+    assert_eq!(receipt.harvested, 28);
 }
 
 /// The Kythe entries carry the macro call as a `ref/call` anchor and the
