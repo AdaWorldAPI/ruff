@@ -122,3 +122,22 @@ fn the_assert_count_matches_the_reference() {
     assert_eq!(total_asserts, reference);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Fails if writes through a dereferenced place are dropped or their root is
+/// misclassified: `through_arg` writes twice through argument-rooted derefs
+/// (`*p` and `s.f`, which is `(*s).f`), `through_local` once through a local
+/// reference, and `plain` only assigns locals, so it has no row (the twin).
+#[test]
+fn deref_writes_are_classified_by_their_root() {
+    let (dir, text) = import_crate("deref", "derefw");
+    assert_eq!(
+        effects_of(&text, "derefw::through_arg"),
+        vec![("DEREF_WRITE", "Arg"), ("DEREF_WRITE", "Arg")]
+    );
+    assert_eq!(
+        effects_of(&text, "derefw::through_local"),
+        vec![("DEREF_WRITE", "Local")]
+    );
+    assert!(effects_of(&text, "derefw::plain").is_empty(), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
