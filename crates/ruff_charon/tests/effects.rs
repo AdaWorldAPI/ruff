@@ -4,6 +4,10 @@
 //! only: a function with no row is NOT proven pure (asserts removed by
 //! Charon's own passes, callees' effects and unharvested bodies are not
 //! here), so nothing may read the absence of a row as purity.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "tests write and read their own temp files; there is no ty System here"
+)]
 
 use std::path::PathBuf;
 

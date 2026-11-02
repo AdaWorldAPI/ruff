@@ -181,6 +181,57 @@ pub struct FunFacts {
     pub deref_write_local: usize,
     /// `Assert` statements: overflow, division and bounds checks that can panic.
     pub asserts: usize,
+    /// Every effect the body witnesses, one per occurrence, in body order.
+    /// An observation list: a function with none is NOT proven pure.
+    pub effects: Vec<Effect>,
+}
+
+/// One effect a function body witnesses, at its site.
+///
+/// Only what the LLBC shows is recorded. The absence of an effect is never a
+/// purity verdict: Charon's own passes may fold checks into fallible
+/// operations, callees' effects are not included, and an unstructured body
+/// records nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Effect {
+    pub kind: EffectKind,
+    pub site: Option<Site>,
+}
+
+/// The kind of a witnessed effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectKind {
+    /// An `Assert` that can panic. The text is Charon's `BuiltinAssertKind`
+    /// tag (`BoundsCheck`, `DivisionByZero`, ...), `Overflow:<BinOp>` for an
+    /// overflow check (`Overflow:Mul`), and `User` for a source `assert!`.
+    Assert(String),
+    /// A write through a dereference rooted in an argument.
+    DerefWriteArg,
+    /// A write through a dereference rooted in a local.
+    DerefWriteLocal,
+}
+
+impl EffectKind {
+    /// The `effect` and `kind` columns of `<crate>.effects.tsv`.
+    pub fn columns(&self) -> (&'static str, &str) {
+        match self {
+            EffectKind::Assert(k) => ("ASSERT", k),
+            EffectKind::DerefWriteArg => ("DEREF_WRITE", "Arg"),
+            EffectKind::DerefWriteLocal => ("DEREF_WRITE", "Local"),
+        }
+    }
+}
+
+/// The exact kind of an assert: Charon's tag, with the operator for an
+/// overflow check; `User` when Charon records no built-in kind.
+fn assert_kind(assert: &Assert) -> String {
+    match &assert.check_kind {
+        None => "User".to_owned(),
+        Some(BuiltinAssertKind::Overflow(op, ..)) => {
+            format!("Overflow:{}", variant(format!("{op:?}")))
+        }
+        Some(k) => variant(format!("{k:?}")),
+    }
 }
 
 fn file_name(krate: &TranslatedCrate, id: FileId) -> String {
@@ -291,6 +342,7 @@ pub fn fun_facts(krate: &TranslatedCrate, crate_name: &str) -> Vec<FunFacts> {
             deref_write_arg: 0,
             deref_write_local: 0,
             asserts: 0,
+            effects: Vec::new(),
         };
         if let Body::Structured(body) = &f.body {
             let args = body.locals.arg_count;
@@ -319,12 +371,28 @@ pub fn fun_facts(krate: &TranslatedCrate, crate_name: &str) -> Vec<FunFacts> {
                         callee: callee(krate, call),
                         site: site(krate, st.span),
                     }),
-                    StatementKind::Assert { .. } => facts.asserts += 1,
+                    StatementKind::Assert { assert, .. } => {
+                        facts.asserts += 1;
+                        facts.effects.push(Effect {
+                            kind: EffectKind::Assert(assert_kind(assert)),
+                            site: site(krate, st.span),
+                        });
+                    }
                     StatementKind::Assign(place, _) if has_deref(place) => {
-                        match root_local(place) {
-                            Some(l) if l.index() <= args => facts.deref_write_arg += 1,
-                            _ => facts.deref_write_local += 1,
-                        }
+                        let kind = match root_local(place) {
+                            Some(l) if l.index() <= args => {
+                                facts.deref_write_arg += 1;
+                                EffectKind::DerefWriteArg
+                            }
+                            _ => {
+                                facts.deref_write_local += 1;
+                                EffectKind::DerefWriteLocal
+                            }
+                        };
+                        facts.effects.push(Effect {
+                            kind,
+                            site: site(krate, st.span),
+                        });
                     }
                     _ => {}
                 }
