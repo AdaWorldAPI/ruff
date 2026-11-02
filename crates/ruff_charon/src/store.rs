@@ -25,6 +25,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::store_bin::{self, BinRow, Prov};
 use crate::{GRADE, Llbc, relations};
 
 /// The version of the rows artifact this crate writes and reads.
@@ -147,16 +148,53 @@ fn read_table(
     Ok(rows)
 }
 
+/// Provenance the store cannot know. The caller supplies it, or it is recorded
+/// as UNKNOWN (`None`); it is never guessed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceProv {
+    /// The commit of the rustc that Charon ran on.
+    pub rustc_commit: Option<String>,
+    /// The revision of the analysed source tree.
+    pub source_revision: Option<String>,
+}
+
 /// A directory of per-crate artifacts.
 #[derive(Debug, Clone)]
 pub struct Store {
     dir: PathBuf,
+    tsv_export: bool,
+}
+
+fn invalid(m: impl ToString) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, m.to_string())
+}
+
+/// The Charon commit this crate was built against (`build.rs`); empty or
+/// absent is UNKNOWN.
+fn built_charon_commit() -> Option<String> {
+    option_env!("RUFF_CHARON_CHARON_COMMIT")
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
 }
 
 impl Store {
+    /// A store that writes `rows.bin` and, for now, `rows.tsv` as well.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            tsv_export: true,
+        }
+    }
+
+    /// Whether `import` also writes `<crate>.rows.tsv`. On by default in this
+    /// release (transitional): the lance-graph codegraph reader still reads
+    /// `rows.tsv` until its binary reader lands, at which point the default
+    /// flips to off. `rows.bin` is always written.
+    #[must_use]
+    pub fn with_tsv_export(mut self, on: bool) -> Self {
+        self.tsv_export = on;
+        self
     }
 
     fn path(&self, crate_name: &str, suffix: &str) -> PathBuf {
@@ -213,8 +251,43 @@ impl Store {
     ///
     /// # Errors
     /// I/O errors, or `InvalidData` when the receipt does not conserve.
-    #[expect(clippy::disallowed_methods, reason = "see `replace`")]
     pub fn import(&self, llbc: &Llbc, crate_name: &str) -> io::Result<crate::Receipt> {
+        self.import_with(llbc, crate_name, &SourceProv::default())
+    }
+
+    /// [`Store::import`] with the provenance only the caller knows.
+    ///
+    /// # Errors
+    /// I/O errors, or `InvalidData` when the receipt does not conserve or the
+    /// rows cannot be encoded.
+    pub fn import_with(
+        &self,
+        llbc: &Llbc,
+        crate_name: &str,
+        src: &SourceProv,
+    ) -> io::Result<crate::Receipt> {
+        self.import_inner(llbc, crate_name, src, built_charon_commit())
+    }
+
+    /// [`Store::import`] with a fixed provenance (no Charon commit, no rustc
+    /// commit, no source revision), so the bytes written do not depend on the
+    /// machine that built this crate. Only for the golden-file test.
+    ///
+    /// # Errors
+    /// As [`Store::import`].
+    #[doc(hidden)]
+    pub fn import_for_golden(&self, llbc: &Llbc, crate_name: &str) -> io::Result<crate::Receipt> {
+        self.import_inner(llbc, crate_name, &SourceProv::default(), None)
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "see `replace`")]
+    fn import_inner(
+        &self,
+        llbc: &Llbc,
+        crate_name: &str,
+        src: &SourceProv,
+        charon_commit: Option<String>,
+    ) -> io::Result<crate::Receipt> {
         let (rows, residual, receipt) = relations(&llbc.krate, crate_name);
         if !receipt.conserved() {
             return Err(io::Error::new(
@@ -246,6 +319,36 @@ impl Store {
             "COMPLETE"
         };
         writeln!(out, "CRATE\t{crate_name}\t{completeness}\t{GRADE}\t-\t-\t-")?;
+        // The same rows, in the same order, for the binary file.
+        let mut bin_rows = Vec::with_capacity(rows.len() + 1);
+        for r in &rows {
+            let fun = r
+                .fun
+                .map(|id| u32::try_from(id.index()).map_err(invalid))
+                .transpose()?;
+            bin_rows.push(BinRow {
+                predicate: r.predicate.to_owned(),
+                subject: r.subject.clone(),
+                object: r.object.clone(),
+                grade: GRADE.to_owned(),
+                site: r.site.as_ref().map(|s| (s.file.clone(), s.start, s.end)),
+                fun,
+            });
+        }
+        bin_rows.push(BinRow {
+            predicate: "CRATE".to_owned(),
+            subject: crate_name.to_owned(),
+            object: completeness.to_owned(),
+            grade: GRADE.to_owned(),
+            site: None,
+            fun: None,
+        });
+        let bin = store_bin::write(
+            &bin_rows,
+            llbc.has_errors,
+            &[Self::prov(llbc, src, charon_commit)],
+        )
+        .map_err(invalid)?;
         let mut res = Vec::new();
         header(&mut res, RESIDUALS_VERSION, RESIDUALS_SCHEMA)?;
         for r in &residual {
@@ -257,10 +360,53 @@ impl Store {
             writeln!(files, "{p}\t{d:016x}")?;
         }
         // Files last: a crate whose digests are present has its rows.
-        Self::replace(&self.path(crate_name, "rows.tsv"), &out)?;
+        Self::replace(&self.path(crate_name, "rows.bin"), &bin)?;
+        if self.tsv_export {
+            Self::replace(&self.path(crate_name, "rows.tsv"), &out)?;
+        }
         Self::replace(&self.path(crate_name, "residuals.tsv"), &res)?;
         Self::replace(&self.path(crate_name, "files.tsv"), &files)?;
         Ok(receipt)
+    }
+
+    /// The provenance record of one import. `llbc_schema_version` repeats the
+    /// Charon version: no separate schema version exists today. `target_config`
+    /// is the sorted target triples, then `;`, then the Charon options as JSON
+    /// (serde's fixed field order).
+    fn prov(llbc: &Llbc, src: &SourceProv, charon_commit: Option<String>) -> Prov {
+        let mut triples: Vec<&str> = llbc
+            .krate
+            .target_information
+            .keys()
+            .map(String::as_str)
+            .collect();
+        triples.sort_unstable();
+        let target_config = serde_json::to_string(&llbc.krate.options)
+            .ok()
+            .map(|opts| format!("{};{opts}", triples.join(",")));
+        Prov {
+            charon_version: Some(llbc.charon_version.clone()),
+            charon_commit,
+            llbc_schema_version: Some(llbc.charon_version.clone()),
+            llbc_digest: Some(format!("{:016x}", llbc.llbc_digest)),
+            rustc_commit: src.rustc_commit.clone(),
+            target_config,
+            source_revision: src.source_revision.clone(),
+        }
+    }
+
+    fn decode_bin(&self, crate_name: &str) -> io::Result<store_bin::Decoded> {
+        let path = self.path(crate_name, "rows.bin");
+        let bytes = fs::read(&path)?;
+        store_bin::read(&bytes).map_err(|e| invalid(format!("{}: {e}", path.display())))
+    }
+
+    /// The provenance records of one crate's `rows.bin`.
+    ///
+    /// # Errors
+    /// I/O or format errors.
+    pub fn provenance(&self, crate_name: &str) -> io::Result<Vec<Prov>> {
+        Ok(self.decode_bin(crate_name)?.prov)
     }
 
     /// The crates in the store, sorted.
@@ -282,11 +428,38 @@ impl Store {
         Ok(out)
     }
 
-    /// One crate's rows, read by schema names.
+    /// One crate's rows, read from `rows.bin`, or from `rows.tsv` when the
+    /// crate was stored before the binary format existed.
     ///
     /// # Errors
     /// I/O or format errors.
+    #[expect(clippy::disallowed_methods, reason = "see `replace`")]
     pub fn rows(&self, crate_name: &str) -> io::Result<Vec<Row>> {
+        // A store written before the binary format has only `rows.tsv`; it
+        // stays readable until its crate is imported again.
+        if !self.path(crate_name, "rows.bin").exists() {
+            return self.rows_tsv(crate_name);
+        }
+        Ok(self
+            .decode_bin(crate_name)?
+            .rows
+            .into_iter()
+            .map(|r| Row {
+                predicate: r.predicate,
+                subject: r.subject,
+                object: r.object,
+                grade: r.grade,
+                site: r.site,
+            })
+            .collect())
+    }
+
+    /// One crate's rows, read from `rows.tsv` by schema names (debug and test
+    /// path; the file exists only while the TSV export is on).
+    ///
+    /// # Errors
+    /// I/O or format errors.
+    pub fn rows_tsv(&self, crate_name: &str) -> io::Result<Vec<Row>> {
         let table = read_table(
             &self.path(crate_name, "rows.tsv"),
             ROWS_VERSION,
