@@ -1,0 +1,12 @@
+has_errors	False
+cg_lib::area_of	id=0	calls=['trait:Clause']	deref_write_arg=0	deref_write_local=0	assert=0
+cg_lib::area_dyn	id=1	calls=['dynamic']	deref_write_arg=0	deref_write_local=0	assert=0
+cg_lib::macro_use::checked	id=2	calls=['static:cg_lib::util::triple@4', 'static:core::panicking::assert_failed@7']	deref_write_arg=0	deref_write_local=0	assert=0
+cg_lib::util::double	id=3	calls=[]	deref_write_arg=0	deref_write_local=0	assert=1
+cg_lib::util::triple	id=4	calls=[]	deref_write_arg=0	deref_write_local=0	assert=1
+cg_lib::util::unit	id=5	calls=[]	deref_write_arg=0	deref_write_local=0	assert=0
+cg_lib::util::private_unused	id=6	calls=[]	deref_write_arg=0	deref_write_local=0	assert=0
+cg_lib::shapes::Impl::area	id=8	calls=['static:cg_lib::util::double@3']	deref_write_arg=0	deref_write_local=0	assert=2
+cg_lib::shapes::Impl::area	id=9	calls=[]	deref_write_arg=0	deref_write_local=0	assert=1
+cg_lib::shapes::Impl::side	id=10	calls=[]	deref_write_arg=0	deref_write_local=0	assert=0
+cg_lib::macro_use::checked::Builtin	id=11	calls=[]	deref_write_arg=0	deref_write_local=0	assert=0

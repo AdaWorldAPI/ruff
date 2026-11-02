@@ -5,7 +5,7 @@ members = ["crates/*"]
 # the main workspace and its Cargo.lock sibling-free. Build it via
 # `cargo <cmd> --manifest-path crates/ruff_r2il/Cargo.toml`.
 # See .claude/plans/r2il-behavioral-ir-v1.md.
-exclude = ["crates/ruff_r2il"]
+exclude = ["crates/ruff_r2il", "crates/ruff_charon"]
 resolver = "2"
 
 [workspace.package]
