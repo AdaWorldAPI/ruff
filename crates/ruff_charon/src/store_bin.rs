@@ -248,6 +248,12 @@ pub enum WriteError {
         /// The offending index.
         value: u32,
     },
+    /// The laid-out file is too large for its u32 section offsets and
+    /// lengths (a section ends past 4 GiB).
+    FileTooLarge {
+        /// The byte position that does not fit.
+        value: usize,
+    },
 }
 
 /// Why [`read`] refused a file; one variant per refusal.
@@ -328,6 +334,9 @@ impl fmt::Display for WriteError {
                 write!(f, "{section} is too large to address ({len})")
             }
             Self::NoProv => write!(f, "no provenance record"),
+            Self::FileTooLarge { value } => {
+                write!(f, "section position {value} does not fit a u32")
+            }
             Self::FunDeclTooLarge { value } => {
                 write!(
                     f,
@@ -699,24 +708,34 @@ pub fn write(rows: &[BinRow], partial: bool, prov: &[Prov]) -> Result<Vec<u8>, W
         data: prov_section(prov)?,
     });
 
-    Ok(assemble(
+    assemble(
         [n_rows, n_symbols, n_files],
         u32::from(partial) * FLAG_PARTIAL,
         sections,
-    ))
+    )
 }
 
 /// Lay out header, directory and sections (each starting on a multiple of 8).
-fn assemble(counts: [u32; 3], flags: u32, mut sections: Vec<Section>) -> Vec<u8> {
+/// Every offset, length and the section count must fit their u32 directory
+/// fields; a value that does not is an error, never a saturated `u32::MAX`
+/// that would publish a file the reader then refuses.
+fn assemble(
+    counts: [u32; 3],
+    flags: u32,
+    mut sections: Vec<Section>,
+) -> Result<Vec<u8>, WriteError> {
     sections.sort_by_key(|s| s.tag);
-    let n_sections = u32::try_from(sections.len()).unwrap_or(u32::MAX);
+    let n_sections = dir_field(sections.len())?;
     let mut dir = Vec::with_capacity(sections.len() * DIR_ENTRY_LEN);
     let mut body: Vec<u8> = Vec::new();
     let base = HEADER_LEN + sections.len() * DIR_ENTRY_LEN;
     for s in &sections {
         pad8(&mut body);
-        let offset = u32::try_from(base + body.len()).unwrap_or(u32::MAX);
-        let len = u32::try_from(s.data.len()).unwrap_or(u32::MAX);
+        let offset = dir_field(base + body.len())?;
+        let len = dir_field(s.data.len())?;
+        // The section's end must be addressable too: a reader checks
+        // `offset + len` against the file length.
+        dir_field(base + body.len() + s.data.len())?;
         dir.extend_from_slice(&s.tag.to_le_bytes());
         dir.extend_from_slice(&s.width.to_le_bytes());
         dir.extend_from_slice(&s.enc.to_le_bytes());
@@ -740,7 +759,12 @@ fn assemble(counts: [u32; 3], flags: u32, mut sections: Vec<Section>) -> Vec<u8>
     file.extend_from_slice(&body);
     let d = digest(&file[32..]);
     file[16..24].copy_from_slice(&d.to_le_bytes());
-    file
+    Ok(file)
+}
+
+/// A directory field: a section count, offset or length as a u32.
+fn dir_field(value: usize) -> Result<u32, WriteError> {
+    u32::try_from(value).map_err(|_| WriteError::FileTooLarge { value })
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,4 +1246,21 @@ pub fn read(bytes: &[u8]) -> Result<Decoded, ReadError> {
         prov,
         digest: dig,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WriteError, dir_field};
+
+    /// Red if a directory field saturates instead of failing: the last
+    /// addressable byte converts, the first one past 4 GiB is refused.
+    #[test]
+    fn a_directory_field_past_u32_is_an_error() {
+        let max = usize::try_from(u32::MAX).expect("u32 fits usize on supported targets");
+        assert_eq!(dir_field(max), Ok(u32::MAX));
+        assert_eq!(
+            dir_field(max + 1),
+            Err(WriteError::FileTooLarge { value: max + 1 })
+        );
+    }
 }
