@@ -49,7 +49,7 @@ use ruff_spo_triplet::{
     CppTemplateKind,
 };
 
-use crate::{CppClass, CppEnum, CppFunction, Declaration};
+use crate::{CppClass, CppEnum, CppFunction, Declaration, LookupSet};
 
 /// A failure walking a translation unit.
 #[derive(Debug)]
@@ -297,10 +297,17 @@ fn collect_functions(entity: &Entity, out: &mut Vec<CppFunction>) {
                     } else {
                         name
                     };
-                    let mut calls = Vec::new();
-                    collect_calls(&child, &mut calls);
+                    let mut found = FoundCalls::default();
+                    collect_calls(&child, &mut found);
+                    let FoundCalls {
+                        mut calls,
+                        mut unresolved_calls,
+                        dynamic_calls,
+                    } = found;
                     calls.sort();
                     calls.dedup();
+                    unresolved_calls.sort();
+                    unresolved_calls.dedup();
                     // AST-DLL signature shape, captured exactly as the class
                     // walker captures it for a member (`void` filtered out, types
                     // verbatim from the cursor) so the two planes agree and one
@@ -328,6 +335,8 @@ fn collect_functions(entity: &Entity, out: &mut Vec<CppFunction>) {
                         namespace: enclosing_scopes(&child),
                         name,
                         calls,
+                        unresolved_calls,
+                        dynamic_calls,
                         return_type,
                         param_types,
                         is_static,
@@ -341,60 +350,112 @@ fn collect_functions(entity: &Entity, out: &mut Vec<CppFunction>) {
     }
 }
 
-/// Recurse a function body collecting EVERY resolvable callee name (the general
-/// call graph). Distinct from [`walk_body`]'s `calls` (persistence mutators
-/// only): here every `CallExpr` callee is the dispatch structure a C-library
-/// transcode follows.
+/// The calls of one function body, by how far libclang resolved them.
 #[cfg(feature = "libclang")]
-fn collect_calls(node: &Entity, out: &mut Vec<String>) {
+#[derive(Default)]
+struct FoundCalls {
+    calls: Vec<String>,
+    unresolved_calls: Vec<LookupSet>,
+    dynamic_calls: u32,
+}
+
+/// Where a `CallExpr` goes, as far as libclang resolved it.
+#[cfg(feature = "libclang")]
+enum CallTarget {
+    /// A function or method declaration: its scope-qualified name.
+    Resolved(String),
+    /// An unresolved lookup set (`OverloadedDeclRef`).
+    Lookup(LookupSet),
+    /// Anything else: a pointer, a parameter, a field. Not named.
+    Dynamic,
+}
+
+/// Recurse a function body collecting EVERY call (the general call graph).
+/// Distinct from [`walk_body`]'s `calls` (persistence mutators only): here
+/// every `CallExpr` is the dispatch structure a C-library transcode follows,
+/// split by resolution status so an unresolved call is never reported as a
+/// resolved one.
+#[cfg(feature = "libclang")]
+fn collect_calls(node: &Entity, out: &mut FoundCalls) {
     for child in node.get_children() {
-        if child.get_kind() == EntityKind::CallExpr
-            && let Some(name) = call_callee_name(&child)
-        {
-            out.push(name);
+        if child.get_kind() == EntityKind::CallExpr {
+            match call_target(&child) {
+                CallTarget::Resolved(name) => out.calls.push(name),
+                CallTarget::Lookup(set) => out.unresolved_calls.push(set),
+                CallTarget::Dynamic => out.dynamic_calls += 1,
+            }
         }
         collect_calls(&child, out);
     }
 }
 
-/// The callee name of a `CallExpr` cursor, with a fallback for the case
-/// `child.get_name()` alone misses.
+/// The target of a `CallExpr` cursor.
 ///
-/// Ordinarily `CallExpr::get_name()` (`clang_getCursorSpelling`) already
-/// resolves the callee — but when ANYTHING in the surrounding expression has
-/// an error/dependent type (a genuinely unresolved template-dependent call,
-/// OR — the concrete case found harvesting real Tesseract, makerow.cpp's
-/// `make_baseline_spline`, `tesseract-rs/.claude/harvest/makerow-callgraph.txt`
-/// — a call downstream of an UNRELATED parse error elsewhere in the same
-/// statement: an `auto`-typed variable whose initializer references an
-/// undeclared symbol becomes `<dependent type>`, and passing THAT variable as
-/// an argument to an otherwise perfectly ordinary, non-overloaded function
-/// forces Clang to represent the call's callee as an `UnresolvedLookupExpr`
-/// instead of a resolved `DeclRefExpr`), `clang_getCursorSpelling` on the
-/// `CallExpr` itself returns empty (`get_name()` → `None`) even though the
-/// callee's own name is perfectly well-formed one level down: nested inside
-/// an `OverloadedDeclRef` cursor (libclang's cursor-kind for the unresolved
-/// lookup set), reachable via the `CallExpr`'s callee sub-expression
-/// (`DeclRefExpr`/`UnexposedExpr` wrapping). Falls back to the first
-/// `OverloadedDeclRef` found among the `CallExpr`'s descendants, stopping at
-/// any nested `CallExpr` (an argument that is itself a call) so a broken
-/// INNER call's callee is never mistaken for the OUTER one.
+/// A resolved call references the callee's declaration. A METHOD is emitted
+/// class-qualified (`A::reset`) so it joins against the class-qualified
+/// definition and same-named methods of different classes never collapse
+/// (codex P2 on ruff #57). A free function carries its enclosing scopes
+/// (`a::f`), the key [`CppFunction::qualified_name`] gives its definition, so
+/// `a::f` and `b::f` never collapse; at global scope (the C norm) it is bare.
+///
+/// When anything in the surrounding expression has an error or dependent
+/// type, Clang represents the callee as an unresolved lookup set
+/// (`OverloadedDeclRef`), even for an ordinary, non-overloaded function. The
+/// concrete case is Tesseract's makerow.cpp `make_baseline_spline`
+/// (`tesseract-rs/.claude/harvest/makerow-callgraph.txt`): an `auto` variable
+/// whose initializer names an undeclared symbol becomes `<dependent type>`,
+/// and passing it as an argument turns the callee into a lookup set. Overload
+/// resolution did not happen, so that call is a [`CallTarget::Lookup`] with
+/// its candidates, never a resolved call. The set is searched among the
+/// `CallExpr`'s descendants, stopping at any nested `CallExpr` (an argument
+/// that is itself a call) so a broken INNER call's set is never mistaken for
+/// the OUTER one.
+///
+/// A call that references anything else (a function pointer variable, a
+/// parameter, a field) is [`CallTarget::Dynamic`]: the program text does not
+/// name the target, and the variable's name is not a callee.
 #[cfg(feature = "libclang")]
-fn call_callee_name(call: &Entity) -> Option<String> {
-    // A resolved call to a METHOD is emitted class-qualified (`A::reset`) so
-    // it joins against the class-qualified definition entry and same-named
-    // methods of different classes never collapse (codex P2 on ruff #57).
-    // Free-function callees stay bare (zero-loss vs the banked manifests);
-    // the OverloadedDeclRef fallback stays bare too — an unresolved lookup
-    // set has no single owning class to name.
+fn call_target(call: &Entity) -> CallTarget {
     if let Some(referenced) = call.get_reference() {
-        if referenced.get_kind() == EntityKind::Method
-            && let Some(name) = referenced.get_name()
-        {
-            return Some(qualify_with_class(&referenced, name));
-        }
+        return match referenced.get_kind() {
+            EntityKind::Method => referenced.get_name().map_or(CallTarget::Dynamic, |name| {
+                CallTarget::Resolved(qualify_with_class(&referenced, name))
+            }),
+            EntityKind::FunctionDecl
+            | EntityKind::FunctionTemplate
+            | EntityKind::ConversionFunction => CallTarget::Resolved(qualified_name(&referenced)),
+            EntityKind::OverloadedDeclRef => CallTarget::Lookup(lookup_set(&referenced)),
+            _ => CallTarget::Dynamic,
+        };
     }
-    call.get_name().or_else(|| find_overloaded_decl_ref(call))
+    find_overloaded_decl_ref(call)
+        .map_or(CallTarget::Dynamic, |o| CallTarget::Lookup(lookup_set(&o)))
+}
+
+/// The lookup set of an `OverloadedDeclRef` cursor: its spelled name and its
+/// candidates, each scope-qualified with its signature.
+#[cfg(feature = "libclang")]
+fn lookup_set(set: &Entity) -> LookupSet {
+    let mut candidates: Vec<String> = set
+        .get_overloaded_declarations()
+        .unwrap_or_default()
+        .iter()
+        .map(|d| {
+            let mut parts = enclosing_scopes(d);
+            parts.push(
+                d.get_display_name()
+                    .or_else(|| d.get_name())
+                    .unwrap_or_default(),
+            );
+            parts.join("::")
+        })
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    LookupSet {
+        name: set.get_name().unwrap_or_default(),
+        candidates,
+    }
 }
 
 /// `Class::name` for a method entity, from its SEMANTIC parent (the class),
@@ -408,18 +469,18 @@ fn qualify_with_class(method: &Entity, name: String) -> String {
     }
 }
 
+/// The first `OverloadedDeclRef` among `node`'s descendants, not entering a
+/// nested `CallExpr`.
 #[cfg(feature = "libclang")]
-fn find_overloaded_decl_ref(node: &Entity) -> Option<String> {
+fn find_overloaded_decl_ref<'tu>(node: &Entity<'tu>) -> Option<Entity<'tu>> {
     for child in node.get_children() {
-        if child.get_kind() == EntityKind::OverloadedDeclRef
-            && let Some(name) = child.get_name()
-        {
-            return Some(name);
+        if child.get_kind() == EntityKind::OverloadedDeclRef {
+            return Some(child);
         }
         if child.get_kind() != EntityKind::CallExpr
-            && let Some(name) = find_overloaded_decl_ref(&child)
+            && let Some(found) = find_overloaded_decl_ref(&child)
         {
-            return Some(name);
+            return Some(found);
         }
     }
     None
@@ -2400,13 +2461,21 @@ void Widget::dispatch() {
             dispatch.calls
         );
 
-        // Fix 2: the unresolved (`OverloadedDeclRef`-shaped) callee reference
-        // to `free_helper` is still recovered, despite `get_name()` on the
-        // `CallExpr` itself returning empty.
+        // Fix 2, re-pinned (S2): the unresolved (`OverloadedDeclRef`-shaped)
+        // callee reference to `free_helper` is still recovered, but as an
+        // unresolved lookup set with its candidate, never as a resolved call
+        // (overload resolution did not happen).
         assert!(
-            compute.calls.contains(&"free_helper".to_string()),
-            "compute must call free_helper despite the unresolved-lookup shape: {:?}",
+            !compute.calls.contains(&"free_helper".to_string()),
+            "an unresolved lookup set must not be a resolved call: {:?}",
             compute.calls
+        );
+        assert_eq!(
+            compute.unresolved_calls,
+            [LookupSet {
+                name: "free_helper".to_string(),
+                candidates: vec!["free_helper(int)".to_string()],
+            }]
         );
 
         // Regression: an IN-CLASS (inline) method definition must NOT be
@@ -2506,6 +2575,21 @@ int via_ptr(int (*fp)(int), int x) { return fp(x); }
             "a call through a pointer is not a call to the pointer: {:?}",
             get("via_ptr").calls
         );
+        // Where the unresolved calls go instead: the lookup set keeps both
+        // overloads as distinct candidates; the pointer call is counted only.
+        assert_eq!(
+            get("use_broken").unresolved_calls,
+            [LookupSet {
+                name: "g".to_string(),
+                candidates: vec!["g(double)".to_string(), "g(int)".to_string()],
+            }]
+        );
+        assert_eq!(get("via_ptr").dynamic_calls, 1);
+        assert!(get("via_ptr").unresolved_calls.is_empty());
+        // The silence twin: resolved calls carry no unresolved or dynamic
+        // count.
+        assert!(get("use_ns").unresolved_calls.is_empty());
+        assert_eq!(get("use_ns").dynamic_calls, 0);
     }
 
     /// A PLAIN free function (no class involved) keeps its existing

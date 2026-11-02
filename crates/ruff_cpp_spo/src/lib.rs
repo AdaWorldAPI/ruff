@@ -145,10 +145,21 @@ pub struct CppFunction {
     pub namespace: Vec<String>,
     /// The function name as written (`pixScaleGrayLI`).
     pub name: String,
-    /// Every resolvable callee name in the body, deduped + sorted — the call
-    /// graph. Distinct from the AR/OO `BodyArm.calls` (persistence mutators
-    /// only); this is EVERY `CallExpr` callee.
+    /// Every RESOLVED callee in the body, deduped + sorted — the call graph.
+    /// Distinct from the AR/OO `BodyArm.calls` (persistence mutators only).
+    /// A method is class-qualified (`A::reset`); a free function carries its
+    /// enclosing scopes (`a::f`, the same key as [`Self::qualified_name`];
+    /// bare at global scope). Calls libclang did not resolve are NOT here:
+    /// see [`Self::unresolved_calls`] and [`Self::dynamic_calls`].
     pub calls: Vec<String>,
+    /// Calls libclang left as an unresolved lookup set (`OverloadedDeclRef`),
+    /// deduped + sorted. Never a resolved call: overload resolution did not
+    /// happen, so which candidate is called is unknown.
+    pub unresolved_calls: Vec<LookupSet>,
+    /// Calls through something that is not a function declaration (a
+    /// function pointer, a parameter, a field): the target is not named by
+    /// the program text, so only the count is kept.
+    pub dynamic_calls: u32,
     /// Return type, verbatim (e.g. `bool`, `const char *`). `None` (and not
     /// emitted) for `void` — the AST-DLL shape reads an absent `returns_type`
     /// as "no value returned".
@@ -192,6 +203,18 @@ pub struct CppFunction {
     /// its name finds declarations and call sites first. `None` only when
     /// libclang reports no file for the cursor.
     pub file: Option<std::path::PathBuf>,
+}
+
+/// An unresolved call: the name as spelled at the call site and the
+/// declarations the lookup found, each scope-qualified with its signature
+/// (`g(int)`, `g(double)`), so two overloads stay distinct.
+#[cfg(feature = "libclang")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LookupSet {
+    /// The name as spelled at the call site.
+    pub name: String,
+    /// The candidates of the lookup set, sorted and deduped.
+    pub candidates: Vec<String>,
 }
 
 #[cfg(feature = "libclang")]
