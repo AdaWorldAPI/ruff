@@ -523,29 +523,46 @@ fn attr_arg_window(kind: AttrKind) -> (usize, usize) {
     }
 }
 
-/// Rails `enum` options. The legacy kwarg form spells them with a leading
-/// underscore (`_prefix`); the modern positional form without.
-const ENUM_OPTION_KEYS: &[&str] = &[
-    "prefix", "suffix", "scopes", "default", "validate", "_prefix", "_suffix", "_scopes",
+/// The options of the legacy keyword form (`enum status: [..], _prefix:
+/// true`). Rails' `enum` slices exactly these keys off as options; every
+/// other key is a column.
+const LEGACY_ENUM_OPTION_KEYS: &[&str] = &[
+    "_prefix",
+    "_suffix",
+    "_scopes",
     "_default",
+    "_instance_methods",
 ];
 
-/// Push the typed [`EnumForm`] for every enum column a `enum` call declares.
+/// Push the typed [`EnumForm`] for every enum column a `enum` call declares,
+/// following Rails' `enum(name = nil, values = nil, **options)`:
 ///
-/// Modern form: `enum :status, { open: 0 }, prefix: true` — a Sym column,
-/// then the variant argument, then trailing options. Legacy kwarg form:
-/// `enum status: { open: 0 }, _prefix: true` — each non-option pair is one
-/// column; the option pairs apply to every column of the call.
+/// - With a column name (`enum :status, ..` or `enum "status", ..`), a
+///   positional values argument is the variants and the keyword arguments
+///   are options. Without one, every keyword argument is a variant
+///   (`enum :status, open: 0, default: 1` declares a variant `default`).
+/// - Without a name (`enum status: [..], _prefix: true`), the keys in
+///   [`LEGACY_ENUM_OPTION_KEYS`] are options and every other key is a
+///   column.
 fn emit_enum_forms(args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
     match args.split_first() {
         Some((Node::Kwargs(k), _)) => emit_enum_forms_legacy(&k.pairs, src, out),
         Some((Node::Hash(h), _)) => emit_enum_forms_legacy(&h.pairs, src, out),
         Some((first, rest)) => {
-            if let Some(column) = sym_string(first) {
+            if let Some(column) = enum_column_name(first) {
                 emit_enum_form_modern(column, rest, src, out);
             }
         }
         None => {}
+    }
+}
+
+/// An enum column name: Rails takes it as `name.to_s`, so a symbol and a
+/// string literal name the same column.
+fn enum_column_name(node: &Node) -> Option<String> {
+    match node {
+        Node::Str(s) => Some(s.value.to_string_lossy()),
+        other => sym_string(other),
     }
 }
 
@@ -555,32 +572,24 @@ fn emit_enum_form_modern(
     src: Option<&str>,
     out: &mut Vec<Declaration>,
 ) {
-    let mut variants = EnumVariants::Missing;
-    let mut options = Vec::new();
-    let mut tail = rest;
-    if let Some((first, after)) = rest.split_first() {
-        tail = after;
-        match first {
-            // Without a positional variant argument Rails reads the keyword
-            // arguments as the variants (`enum :status, open: 0`), except for
-            // the Rails option keys, which stay options.
-            Node::Kwargs(k) => {
-                let (opts, pairs) = split_enum_options(&k.pairs);
-                options = opts;
-                if has_splat(&k.pairs) {
-                    variants = EnumVariants::Unresolved(source_text(first, src));
-                } else if !pairs.is_empty() {
-                    variants = EnumVariants::Hash(pairs);
-                }
-            }
-            other => variants = classify_enum_variants(other, src),
+    let (variants, options) = match rest.split_first() {
+        None => (EnumVariants::Missing, Vec::new()),
+        // No positional values: Rails reads every keyword argument as a
+        // variant, and there are no options.
+        Some((first @ Node::Kwargs(_), _)) => (classify_enum_variants(first, src), Vec::new()),
+        Some((first, tail)) => {
+            let options = tail
+                .iter()
+                .filter_map(|arg| match arg {
+                    Node::Kwargs(k) => Some(enum_pairs(&k.pairs, src)),
+                    Node::Hash(h) => Some(enum_pairs(&h.pairs, src)),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            (classify_enum_variants(first, src), options)
         }
-    }
-    for arg in tail {
-        if let Some(opts) = as_hash_options(arg) {
-            options.extend(opts);
-        }
-    }
+    };
     out.push(Declaration::EnumForm(EnumForm::new(
         column, variants, options,
     )));
@@ -592,8 +601,8 @@ fn emit_enum_forms_legacy(pairs: &[Node], src: Option<&str>, out: &mut Vec<Decla
     for pair_node in pairs {
         let Node::Pair(p) = pair_node else { continue };
         let key = pair_key(&p.key);
-        if ENUM_OPTION_KEYS.contains(&key.as_str()) {
-            options.push((key, render_node(&p.value)));
+        if LEGACY_ENUM_OPTION_KEYS.contains(&key.as_str()) {
+            options.push((key, source_text(&p.value, src)));
         } else {
             columns.push((key, classify_enum_variants(&p.value, src)));
         }
@@ -607,21 +616,20 @@ fn emit_enum_forms_legacy(pairs: &[Node], src: Option<&str>, out: &mut Vec<Decla
     }
 }
 
-/// `(key, value)` pairs rendered verbatim, in source order.
-type Pairs = Vec<(String, String)>;
-
-/// Split hash pairs into (Rails enum options, variant pairs), source order.
-fn split_enum_options(pairs: &[Node]) -> (Pairs, Pairs) {
-    let mut options = Vec::new();
-    let mut variants = Vec::new();
-    for (key, value) in hash_pairs(pairs) {
-        if ENUM_OPTION_KEYS.contains(&key.as_str()) {
-            options.push((key, value));
-        } else {
-            variants.push((key, value));
-        }
-    }
-    (options, variants)
+/// The `(key, value)` pairs of an enum hash: keys unwrapped as by
+/// [`pair_key`], values as their exact source text when the source is
+/// available. A `**splat` contributes no pair; callers that must not drop
+/// it check [`has_splat`] first.
+fn enum_pairs(pairs: &[Node], src: Option<&str>) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter_map(|pair_node| {
+            let Node::Pair(p) = pair_node else {
+                return None;
+            };
+            Some((pair_key(&p.key), source_text(&p.value, src)))
+        })
+        .collect()
 }
 
 /// Classify the variant argument of an `enum` call by the form the source
@@ -633,7 +641,8 @@ fn split_enum_options(pairs: &[Node]) -> (Pairs, Pairs) {
 /// complete.
 fn classify_enum_variants(node: &Node, src: Option<&str>) -> EnumVariants {
     match node {
-        Node::Hash(h) if !has_splat(&h.pairs) => EnumVariants::Hash(hash_pairs(&h.pairs)),
+        Node::Hash(h) if !has_splat(&h.pairs) => EnumVariants::Hash(enum_pairs(&h.pairs, src)),
+        Node::Kwargs(k) if !has_splat(&k.pairs) => EnumVariants::Hash(enum_pairs(&k.pairs, src)),
         Node::Array(a) if !a.elements.iter().any(|e| matches!(e, Node::Splat(_))) => {
             EnumVariants::Array(a.elements.iter().map(array_key).collect())
         }

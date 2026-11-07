@@ -1547,25 +1547,70 @@ end
         assert!(!variants.iter().any(|v| v == "prefix"));
     }
 
+    /// Without a positional values argument Rails reads every keyword as a
+    /// variant, so `default:` and `suffix:` here are variants, not options.
     #[test]
-    fn enum_keyword_variants_without_positional_argument_split_off_options() {
-        let forms =
-            enum_forms_of("class M\n  enum :status, open: 0, closed: 1, suffix: true\nend\n");
+    fn enum_keyword_variants_without_positional_argument_are_all_variants() {
+        let forms = enum_forms_of("class M\n  enum :status, open: 0, default: 1, suffix: 2\nend\n");
         assert_eq!(
             forms,
             [EnumForm::new(
                 "status",
-                EnumVariants::Hash(pairs(&[("open", "0"), ("closed", "1")])),
-                pairs(&[("suffix", "true")]),
+                EnumVariants::Hash(pairs(&[("open", "0"), ("default", "1"), ("suffix", "2")])),
+                Vec::new(),
             )]
         );
-        let only_options = enum_forms_of("class M\n  enum :status, prefix: true\nend\n");
+    }
+
+    /// The legacy form slices off exactly the underscored Rails options;
+    /// every other key, including one spelled like a modern option, is a
+    /// column.
+    #[test]
+    fn enum_legacy_form_options_are_the_underscored_rails_keys() {
+        let default_column = enum_forms_of("class M\n  enum default: [:open]\nend\n");
         assert_eq!(
-            only_options,
+            default_column,
+            [EnumForm::new(
+                "default",
+                EnumVariants::Array(names(&["open"])),
+                Vec::new(),
+            )]
+        );
+        let instance_methods =
+            enum_forms_of("class M\n  enum status: [:open], _instance_methods: false\nend\n");
+        assert_eq!(
+            instance_methods,
             [EnumForm::new(
                 "status",
-                EnumVariants::Missing,
-                pairs(&[("prefix", "true")]),
+                EnumVariants::Array(names(&["open"])),
+                pairs(&[("_instance_methods", "false")]),
+            )]
+        );
+    }
+
+    /// Rails takes the column name as `name.to_s`.
+    #[test]
+    fn enum_string_column_name_matches_symbol_column_name() {
+        let string = enum_forms_of("class M\n  enum \"status\", [:open, :closed]\nend\n");
+        let symbol = enum_forms_of("class M\n  enum :status, [:open, :closed]\nend\n");
+        assert_eq!(string, symbol);
+        assert_eq!(string.len(), 1);
+    }
+
+    #[test]
+    fn enum_hash_values_keep_their_source_text() {
+        let forms = enum_forms_of(
+            "class M\n  enum :status, { open: Status::OPEN.to_i, closed: Status::CLOSED.to_i }\nend\n",
+        );
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[
+                    ("open", "Status::OPEN.to_i"),
+                    ("closed", "Status::CLOSED.to_i"),
+                ])),
+                Vec::new(),
             )]
         );
     }
