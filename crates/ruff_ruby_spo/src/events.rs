@@ -1314,7 +1314,7 @@ fn rails_kind(decl: &Declaration) -> RailsKind {
         Declaration::Validation(_) => RailsKind::Validation,
         Declaration::Callback(_) => RailsKind::Callback,
         Declaration::Concern(_) => RailsKind::Concern,
-        Declaration::Attribute(_) => RailsKind::Attribute,
+        Declaration::Attribute(_) | Declaration::EnumForm(_) => RailsKind::Attribute,
         Declaration::Delegation(_) => RailsKind::Delegation,
         Declaration::Scope(_) => RailsKind::Scope,
         Declaration::ActsAs(_) => RailsKind::ActsAs,

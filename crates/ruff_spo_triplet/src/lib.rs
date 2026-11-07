@@ -97,8 +97,8 @@ pub use ir::{
     ActsAs, AssocDecl, AssocKind, AttrDecl, AttrKind, Callback, ConcernKind, ConcernRef,
     ConstexprKind, CppAccess, CppBase, CppField, CppFriend, CppMacroUse, CppMethod,
     CppRefQualifier, CppStaticAssert, CppTemplate, CppTemplateKind, Delegation, DslCall, DynMethod,
-    Field, Function, GemDsl, GemKind, Model, ModelGraph, ScopeDecl, ScopeKind, StiInfo, UsingRef,
-    Validation, ValidationKind,
+    EnumForm, EnumVariants, Field, Function, GemDsl, GemKind, Model, ModelGraph, ScopeDecl,
+    ScopeKind, StiInfo, UsingRef, Validation, ValidationKind,
 };
 pub use nav_digest::build_nav_digest;
 pub use ndjson::{ParseError, from_ndjson, to_ndjson};

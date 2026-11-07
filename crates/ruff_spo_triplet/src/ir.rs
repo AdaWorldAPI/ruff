@@ -137,6 +137,15 @@ pub struct Model {
     /// `column_override` per kind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attributes: Vec<AttrDecl>,
+    /// Typed Rails `enum` declarations, one per enum column, in source
+    /// order. The legacy [`AttrDecl`] of kind [`AttrKind::Enum`] stays in
+    /// [`Self::attributes`]; this is the lossless form that keeps the
+    /// variant list's shape (hash, array, unresolved, missing) and the
+    /// Rails enum options apart. Additive + serde-defaulted: existing
+    /// dumps deserialize with an empty vec. No triples are expanded from
+    /// it; consumers read the struct field directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_forms: Vec<EnumForm>,
     /// `delegate :foo, :bar, to: :baz`. Expanded as `delegates_to` —
     /// one triple per (method, to) pair.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -477,6 +486,59 @@ pub struct AttrDecl {
     /// Type / serializer / enum-mapping / store-key options, verbatim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<(String, String)>,
+}
+
+/// The variant list of a Rails `enum`, in the form the source wrote it.
+///
+/// Physical values stay source-owned: this IR is where they are read, they
+/// are never carried as labels downstream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum EnumVariants {
+    /// `{ open: 0, closed: 1 }` — (key, physical value verbatim), source
+    /// order. Duplicate keys are kept as written.
+    Hash(Vec<(String, String)>),
+    /// `[:open, :closed]` — keys in source order; the 0-based position is
+    /// the physical value.
+    Array(Vec<String>),
+    /// A constant or other expression the walker cannot evaluate, rendered
+    /// verbatim (e.g. `STATUSES`).
+    Unresolved(String),
+    /// No variant argument at all.
+    Missing,
+}
+
+/// One Rails `enum` declaration, typed. Lives beside the legacy
+/// [`AttrDecl`], which is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct EnumForm {
+    /// The enum column name.
+    pub column: String,
+    /// The variant list as written.
+    pub variants: EnumVariants,
+    /// Rails enum options (`prefix`, `suffix`, `scopes`, `default`,
+    /// `validate`, and the legacy `_prefix` / `_suffix` / `_scopes` /
+    /// `_default`), key and value verbatim, source order. Never variants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<(String, String)>,
+}
+
+impl EnumForm {
+    /// Build an [`EnumForm`] (the struct is `#[non_exhaustive]`, so other
+    /// crates cannot use a struct literal).
+    #[must_use]
+    pub fn new(
+        column: impl Into<String>,
+        variants: EnumVariants,
+        options: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            column: column.into(),
+            variants,
+            options,
+        }
+    }
 }
 
 /// The 13 Rails attribute-declaration macros covered by the AR-shape.
@@ -1009,6 +1071,7 @@ mod dto_surface_tests {
         "delegations",
         "dsl_calls",
         "dynamic_methods",
+        "enum_forms",
         "fields",
         "friends",
         "functions",
@@ -1110,6 +1173,7 @@ mod dto_surface_tests {
                 name: "a".into(),
                 options: opts(),
             }],
+            enum_forms: vec![EnumForm::new("status", EnumVariants::Missing, opts())],
             delegations: vec![Delegation {
                 methods: vec!["m".into()],
                 to: "t".into(),
@@ -1182,6 +1246,35 @@ mod dto_surface_tests {
     #[test]
     fn model_dto_surface_locked() {
         assert_eq!(keys(&full_model()), MODEL_DTO);
+    }
+
+    #[test]
+    fn model_with_enum_forms_round_trips_through_json() {
+        let model = Model {
+            enum_forms: vec![
+                EnumForm::new(
+                    "status",
+                    EnumVariants::Hash(vec![("open".into(), "0".into())]),
+                    vec![("_prefix".into(), "true".into())],
+                ),
+                EnumForm::new("kind", EnumVariants::Array(vec!["a".into()]), Vec::new()),
+                EnumForm::new("tier", EnumVariants::Unresolved("TIERS".into()), Vec::new()),
+                EnumForm::new("mode", EnumVariants::Missing, Vec::new()),
+            ],
+            ..Model::new("M")
+        };
+        let json = serde_json::to_string(&model).expect("serializes");
+        let back: Model = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, model);
+    }
+
+    #[test]
+    fn model_json_without_enum_forms_deserializes_with_an_empty_vec() {
+        let model: Model = serde_json::from_str(r#"{"name":"M","fields":[],"functions":[]}"#)
+            .expect("old dump deserializes");
+        assert_eq!(model.enum_forms, Vec::<EnumForm>::new());
+        let json = serde_json::to_string(&model).expect("serializes");
+        assert!(!json.contains("enum_forms"), "empty vec is skipped: {json}");
     }
 
     #[test]
