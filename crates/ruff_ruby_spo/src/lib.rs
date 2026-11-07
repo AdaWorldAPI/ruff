@@ -1588,6 +1588,50 @@ end
         );
     }
 
+    /// A key that needs evaluation (a method call, a constant, an
+    /// interpolated string) makes the whole literal unresolved; no
+    /// placeholder key is published.
+    #[test]
+    fn enum_literal_with_a_computed_key_is_unresolved() {
+        for (src, text) in [
+            (
+                "class M\n  enum :status, [\"open\".freeze, :closed]\nend\n",
+                "[\"open\".freeze, :closed]",
+            ),
+            (
+                "class M\n  enum :status, { \"open\".freeze => 0 }\nend\n",
+                "{ \"open\".freeze => 0 }",
+            ),
+            (
+                "class M\n  enum :status, [OPEN, :closed]\nend\n",
+                "[OPEN, :closed]",
+            ),
+            (
+                "class M\n  enum :status, [\"#{prefix}_open\"]\nend\n",
+                "[\"#{prefix}_open\"]",
+            ),
+        ] {
+            assert_eq!(
+                enum_forms_of(src),
+                [EnumForm::new(
+                    "status",
+                    EnumVariants::Unresolved(text.to_string()),
+                    Vec::new(),
+                )],
+                "{src}"
+            );
+        }
+        // Silence twin: literal symbol and string keys still resolve.
+        assert_eq!(
+            enum_forms_of("class M\n  enum :status, { \"open\" => 0, closed: 1 }\nend\n"),
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("open", "0"), ("closed", "1")])),
+                Vec::new(),
+            )]
+        );
+    }
+
     /// Rails takes the column name as `name.to_s`.
     #[test]
     fn enum_string_column_name_matches_symbol_column_name() {

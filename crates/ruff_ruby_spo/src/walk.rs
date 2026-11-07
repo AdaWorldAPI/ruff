@@ -616,10 +616,9 @@ fn emit_enum_forms_legacy(pairs: &[Node], src: Option<&str>, out: &mut Vec<Decla
     }
 }
 
-/// The `(key, value)` pairs of an enum hash: keys unwrapped as by
+/// The `(key, value)` pairs of an enum options hash: keys unwrapped as by
 /// [`pair_key`], values as their exact source text when the source is
-/// available. A `**splat` contributes no pair; callers that must not drop
-/// it check [`has_splat`] first.
+/// available. Variants never go through here; they use [`literal_pairs`].
 fn enum_pairs(pairs: &[Node], src: Option<&str>) -> Vec<(String, String)> {
     pairs
         .iter()
@@ -640,28 +639,42 @@ fn enum_pairs(pairs: &[Node], src: Option<&str>) -> Vec<(String, String)> {
 /// list: a list that silently lacks the spliced values would read as
 /// complete.
 fn classify_enum_variants(node: &Node, src: Option<&str>) -> EnumVariants {
+    let resolved = match node {
+        Node::Hash(h) => literal_pairs(&h.pairs, src).map(EnumVariants::Hash),
+        Node::Kwargs(k) => literal_pairs(&k.pairs, src).map(EnumVariants::Hash),
+        Node::Array(a) => a
+            .elements
+            .iter()
+            .map(literal_key)
+            .collect::<Option<Vec<_>>>()
+            .map(EnumVariants::Array),
+        _ => None,
+    };
+    resolved.unwrap_or_else(|| EnumVariants::Unresolved(source_text(node, src)))
+}
+
+/// A variant key the walker can read without evaluating anything: a symbol
+/// or a plain string literal. A constant, a method call (`"open".freeze`),
+/// an interpolated string or a splat has no key until Ruby runs, so it
+/// yields `None`.
+fn literal_key(node: &Node) -> Option<String> {
     match node {
-        Node::Hash(h) if !has_splat(&h.pairs) => EnumVariants::Hash(enum_pairs(&h.pairs, src)),
-        Node::Kwargs(k) if !has_splat(&k.pairs) => EnumVariants::Hash(enum_pairs(&k.pairs, src)),
-        Node::Array(a) if !a.elements.iter().any(|e| matches!(e, Node::Splat(_))) => {
-            EnumVariants::Array(a.elements.iter().map(array_key).collect())
-        }
-        other => EnumVariants::Unresolved(source_text(other, src)),
+        Node::Str(s) => Some(s.value.to_string_lossy()),
+        other => sym_string(other),
     }
 }
 
-/// An array element as a key: `:sym` and `"str"` unwrapped, the same way
-/// [`pair_key`] reads hash keys.
-fn array_key(element: &Node) -> String {
-    match element {
-        Node::Str(s) => s.value.to_string_lossy(),
-        other => sym_string(other).unwrap_or_else(|| render_node(other)),
-    }
-}
-
-/// Whether hash pairs include a `**splat`, whose keys the walker cannot see.
-fn has_splat(pairs: &[Node]) -> bool {
-    pairs.iter().any(|p| matches!(p, Node::Kwsplat(_)))
+/// The variant pairs of a hash literal whose every element is a pair with
+/// a [`literal_key`]; `None` when any key needs evaluation or a `**splat`
+/// splices in pairs the walker cannot see.
+fn literal_pairs(pairs: &[Node], src: Option<&str>) -> Option<Vec<(String, String)>> {
+    pairs
+        .iter()
+        .map(|pair_node| match pair_node {
+            Node::Pair(p) => Some((literal_key(&p.key)?, source_text(&p.value, src))),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The exact source text of `node` when the source is available, else the
