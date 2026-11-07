@@ -45,7 +45,7 @@ pub(crate) fn parse_tree(dir: &Path) -> Vec<RubyClass> {
         let Some(ast) = parse_file(&src, &path) else {
             continue;
         };
-        collect_classes_from_node(&ast, &mut classes);
+        collect_classes_from_node(&ast, &src, &mut classes);
     }
     classes
 }
@@ -73,7 +73,7 @@ pub(crate) fn parse_models_with_engines(source_tree: &Path) -> Vec<RubyClass> {
         let Some(ast) = parse_file(&src, &path) else {
             continue;
         };
-        collect_classes_from_node(&ast, &mut classes);
+        collect_classes_from_node(&ast, &src, &mut classes);
     }
     classes
 }
@@ -134,7 +134,7 @@ pub(crate) fn parse_models_from_source_for_test(src: &str) -> Vec<RubyClass> {
         return Vec::new();
     };
     let mut classes = Vec::new();
-    collect_classes_from_node(&ast, &mut classes);
+    collect_classes_from_node(&ast, src, &mut classes);
     classes
 }
 
@@ -152,19 +152,19 @@ fn parse_file(src: &str, path: &Path) -> Option<Node> {
 /// Walk an AST node and emit a [`RubyClass`] for every `class X < Y`
 /// discovered, recursing into `module ... end` wrappers and `Begin`
 /// statement blocks.
-fn collect_classes_from_node(node: &Node, out: &mut Vec<RubyClass>) {
-    collect_classes_with_namespace(node, &[], out);
+fn collect_classes_from_node(node: &Node, src: &str, out: &mut Vec<RubyClass>) {
+    collect_classes_with_namespace(node, &[], src, out);
 }
 
 /// Recursive class-discovery walk that threads the enclosing module
 /// namespace through so `module Foo; class Bar < ApplicationRecord;`
 /// yields `name = "Foo::Bar"` (codex P2 r3418* — module namespaces
 /// were being dropped on the floor).
-fn collect_classes_with_namespace(node: &Node, ns: &[String], out: &mut Vec<RubyClass>) {
+fn collect_classes_with_namespace(node: &Node, ns: &[String], src: &str, out: &mut Vec<RubyClass>) {
     match node {
         Node::Begin(b) => {
             for stmt in &b.statements {
-                collect_classes_with_namespace(stmt, ns, out);
+                collect_classes_with_namespace(stmt, ns, src, out);
             }
         }
         Node::Module(m) => {
@@ -172,7 +172,7 @@ fn collect_classes_with_namespace(node: &Node, ns: &[String], out: &mut Vec<Ruby
             let mut nested = ns.to_vec();
             nested.push(mod_name);
             if let Some(body) = &m.body {
-                collect_classes_with_namespace(body, &nested, out);
+                collect_classes_with_namespace(body, &nested, src, out);
             }
         }
         Node::Class(c) => {
@@ -206,7 +206,7 @@ fn collect_classes_with_namespace(node: &Node, ns: &[String], out: &mut Vec<Ruby
                 }
             }
             if let Some(body) = &c.body {
-                walk_class_body(body, &mut class.declarations);
+                walk_class_body(body, Some(src), &mut class.declarations);
             }
             // D-AR-3.5: method-name + raise/reads/traverses extraction
             // runs over the same class body. We pass the declarations
@@ -220,7 +220,7 @@ fn collect_classes_with_namespace(node: &Node, ns: &[String], out: &mut Vec<Ruby
             // walked as part of body — collect_classes_with_namespace
             // handles it via the body's Class node arm.
             if let Some(body) = &c.body {
-                collect_nested_classes(body, ns, out);
+                collect_nested_classes(body, ns, src, out);
             }
         }
         _ => {}
@@ -231,17 +231,17 @@ fn collect_classes_with_namespace(node: &Node, ns: &[String], out: &mut Vec<Ruby
 /// `class A; class B; end; end`). The walker treats these as siblings
 /// at IR level (flat `ModelGraph::models`), matching what the SPO store
 /// expects.
-fn collect_nested_classes(body: &Node, ns: &[String], out: &mut Vec<RubyClass>) {
+fn collect_nested_classes(body: &Node, ns: &[String], src: &str, out: &mut Vec<RubyClass>) {
     match body {
         Node::Begin(b) => {
             for stmt in &b.statements {
                 if matches!(stmt, Node::Class(_) | Node::Module(_)) {
-                    collect_classes_with_namespace(stmt, ns, out);
+                    collect_classes_with_namespace(stmt, ns, src, out);
                 }
             }
         }
         Node::Class(_) | Node::Module(_) => {
-            collect_classes_with_namespace(body, ns, out);
+            collect_classes_with_namespace(body, ns, src, out);
         }
         _ => {}
     }

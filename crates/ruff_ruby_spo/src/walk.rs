@@ -24,22 +24,26 @@ use crate::Declaration;
 
 /// Walk a `Class.body` node and append every recognised DSL call as a
 /// [`Declaration`].
-pub(crate) fn walk_class_body(body: &Node, out: &mut Vec<Declaration>) {
+///
+/// `src` is the file the body was parsed from, when the caller has it. It
+/// is used only to keep an unresolved enum argument as the exact source
+/// text; without it that argument falls back to the walker's renderer.
+pub(crate) fn walk_class_body(body: &Node, src: Option<&str>, out: &mut Vec<Declaration>) {
     match body {
         Node::Begin(b) => {
             for stmt in &b.statements {
-                walk_statement(stmt, out);
+                walk_statement(stmt, src, out);
             }
         }
-        single => walk_statement(single, out),
+        single => walk_statement(single, src, out),
     }
 }
 
 /// Process one class-body statement.
-fn walk_statement(node: &Node, out: &mut Vec<Declaration>) {
+fn walk_statement(node: &Node, src: Option<&str>, out: &mut Vec<Declaration>) {
     match node {
-        Node::Send(s) if s.recv.is_none() => route_send(&s.method_name, &s.args, out),
-        Node::Block(blk) => walk_block(blk, out),
+        Node::Send(s) if s.recv.is_none() => route_send(&s.method_name, &s.args, src, out),
+        Node::Block(blk) => walk_block(blk, src, out),
         // Ruby keyword `alias new orig` parses as Node::Alias, NOT as a
         // Send; pick up method-alias facts that would otherwise be lost
         // (codex P2 PR #6 r3418*).
@@ -71,7 +75,7 @@ fn alias_target_name(node: &Node) -> String {
 /// DSL declaration (e.g. `scope :foo, -> { … }` parses as a Send whose
 /// last arg is a Block; `class_methods do ... end` parses as a Block
 /// whose call is `class_methods`).
-fn walk_block(blk: &lib_ruby_parser::nodes::Block, out: &mut Vec<Declaration>) {
+fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut Vec<Declaration>) {
     let Node::Send(s) = &*blk.call else {
         return;
     };
@@ -120,18 +124,18 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, out: &mut Vec<Declaration>) {
         // because that's runtime-only).
         "with_options" => {
             if let Some(body) = blk.body.as_ref() {
-                walk_class_body(body, out);
+                walk_class_body(body, src, out);
             }
             // Also record the wrapper call itself so the catch-all
             // coverage assertion still sees `with_options` somewhere.
-            route_send(s.method_name.as_str(), &s.args, out);
+            route_send(s.method_name.as_str(), &s.args, src, out);
         }
         other => {
             // Generic block: route the call as if it were a bare Send,
             // then drop the body. Conservative — keeps the call counted
             // for coverage without inventing a Declaration shape for
             // arbitrary block DSLs.
-            route_send(other, &s.args, out);
+            route_send(other, &s.args, src, out);
         }
     }
 }
@@ -184,7 +188,7 @@ fn lambda_loc(node: &Node) -> Option<String> {
 /// explicit arm or the `has_dsl_call` catch-all. The D-AR-4 coverage
 /// test fails loudly if a real corpus call slips through unmatched.
 #[allow(clippy::too_many_lines)] // exhaustive 78-name routing — splitting hurts readability
-fn route_send(name: &str, args: &[Node], out: &mut Vec<Declaration>) {
+fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
     match name {
         // ───── Associations (5) ─────
         "belongs_to" => emit_assoc(AssocKind::BelongsTo, args, out),
@@ -224,7 +228,7 @@ fn route_send(name: &str, args: &[Node], out: &mut Vec<Declaration>) {
         "serialize" => emit_attr(AttrKind::Serialize, args, out),
         "enum" => {
             emit_attr(AttrKind::Enum, args, out);
-            emit_enum_forms(args, out);
+            emit_enum_forms(args, src, out);
         }
         "store_attribute" => emit_attr(AttrKind::StoreAttribute, args, out),
         "store_accessor" => emit_attr(AttrKind::StoreAccessor, args, out),
@@ -532,20 +536,25 @@ const ENUM_OPTION_KEYS: &[&str] = &[
 /// then the variant argument, then trailing options. Legacy kwarg form:
 /// `enum status: { open: 0 }, _prefix: true` — each non-option pair is one
 /// column; the option pairs apply to every column of the call.
-fn emit_enum_forms(args: &[Node], out: &mut Vec<Declaration>) {
+fn emit_enum_forms(args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
     match args.split_first() {
-        Some((Node::Kwargs(k), _)) => emit_enum_forms_legacy(&k.pairs, out),
-        Some((Node::Hash(h), _)) => emit_enum_forms_legacy(&h.pairs, out),
+        Some((Node::Kwargs(k), _)) => emit_enum_forms_legacy(&k.pairs, src, out),
+        Some((Node::Hash(h), _)) => emit_enum_forms_legacy(&h.pairs, src, out),
         Some((first, rest)) => {
             if let Some(column) = sym_string(first) {
-                emit_enum_form_modern(column, rest, out);
+                emit_enum_form_modern(column, rest, src, out);
             }
         }
         None => {}
     }
 }
 
-fn emit_enum_form_modern(column: String, rest: &[Node], out: &mut Vec<Declaration>) {
+fn emit_enum_form_modern(
+    column: String,
+    rest: &[Node],
+    src: Option<&str>,
+    out: &mut Vec<Declaration>,
+) {
     let mut variants = EnumVariants::Missing;
     let mut options = Vec::new();
     let mut tail = rest;
@@ -558,11 +567,13 @@ fn emit_enum_form_modern(column: String, rest: &[Node], out: &mut Vec<Declaratio
             Node::Kwargs(k) => {
                 let (opts, pairs) = split_enum_options(&k.pairs);
                 options = opts;
-                if !pairs.is_empty() {
+                if has_splat(&k.pairs) {
+                    variants = EnumVariants::Unresolved(source_text(first, src));
+                } else if !pairs.is_empty() {
                     variants = EnumVariants::Hash(pairs);
                 }
             }
-            other => variants = classify_enum_variants(other),
+            other => variants = classify_enum_variants(other, src),
         }
     }
     for arg in tail {
@@ -575,7 +586,7 @@ fn emit_enum_form_modern(column: String, rest: &[Node], out: &mut Vec<Declaratio
     )));
 }
 
-fn emit_enum_forms_legacy(pairs: &[Node], out: &mut Vec<Declaration>) {
+fn emit_enum_forms_legacy(pairs: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
     let mut options = Vec::new();
     let mut columns = Vec::new();
     for pair_node in pairs {
@@ -584,7 +595,7 @@ fn emit_enum_forms_legacy(pairs: &[Node], out: &mut Vec<Declaration>) {
         if ENUM_OPTION_KEYS.contains(&key.as_str()) {
             options.push((key, render_node(&p.value)));
         } else {
-            columns.push((key, classify_enum_variants(&p.value)));
+            columns.push((key, classify_enum_variants(&p.value, src)));
         }
     }
     for (column, variants) in columns {
@@ -615,17 +626,41 @@ fn split_enum_options(pairs: &[Node]) -> (Pairs, Pairs) {
 
 /// Classify the variant argument of an `enum` call by the form the source
 /// wrote it.
-fn classify_enum_variants(node: &Node) -> EnumVariants {
+///
+/// A literal that splices in values the walker cannot see (`{ **BASE,
+/// archived: 2 }`, `[*BASE, :archived]`) is `Unresolved`, never a partial
+/// list: a list that silently lacks the spliced values would read as
+/// complete.
+fn classify_enum_variants(node: &Node, src: Option<&str>) -> EnumVariants {
     match node {
-        Node::Hash(h) => EnumVariants::Hash(hash_pairs(&h.pairs)),
-        Node::Array(a) => EnumVariants::Array(
-            a.elements
-                .iter()
-                .map(|e| sym_string(e).unwrap_or_else(|| render_node(e)))
-                .collect(),
-        ),
-        other => EnumVariants::Unresolved(render_node(other)),
+        Node::Hash(h) if !has_splat(&h.pairs) => EnumVariants::Hash(hash_pairs(&h.pairs)),
+        Node::Array(a) if !a.elements.iter().any(|e| matches!(e, Node::Splat(_))) => {
+            EnumVariants::Array(a.elements.iter().map(array_key).collect())
+        }
+        other => EnumVariants::Unresolved(source_text(other, src)),
     }
+}
+
+/// An array element as a key: `:sym` and `"str"` unwrapped, the same way
+/// [`pair_key`] reads hash keys.
+fn array_key(element: &Node) -> String {
+    match element {
+        Node::Str(s) => s.value.to_string_lossy(),
+        other => sym_string(other).unwrap_or_else(|| render_node(other)),
+    }
+}
+
+/// Whether hash pairs include a `**splat`, whose keys the walker cannot see.
+fn has_splat(pairs: &[Node]) -> bool {
+    pairs.iter().any(|p| matches!(p, Node::Kwsplat(_)))
+}
+
+/// The exact source text of `node` when the source is available, else the
+/// walker's rendering of it.
+fn source_text(node: &Node, src: Option<&str>) -> String {
+    let loc = node.expression();
+    src.and_then(|s| s.get(loc.begin..loc.end))
+        .map_or_else(|| render_node(node), str::to_owned)
 }
 
 fn emit_delegation(args: &[Node], out: &mut Vec<Declaration>) {

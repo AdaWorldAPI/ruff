@@ -1429,6 +1429,74 @@ end
     }
 
     #[test]
+    fn enum_string_array_keys_match_symbol_array_keys() {
+        let strings = enum_forms_of("class M\n  enum :status, [\"open\", \"closed\"]\nend\n");
+        let symbols = enum_forms_of("class M\n  enum :status, [:open, :closed]\nend\n");
+        assert_eq!(
+            strings,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(names(&["open", "closed"])),
+                Vec::new(),
+            )]
+        );
+        assert_eq!(strings, symbols);
+    }
+
+    #[test]
+    fn enum_unresolved_expression_keeps_its_source_text() {
+        let merged =
+            enum_forms_of("class M\n  enum :status, STATUSES.merge(extra_statuses)\nend\n");
+        let other = enum_forms_of("class M\n  enum :status, STATUSES.merge(more)\nend\n");
+        assert_eq!(
+            merged,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Unresolved("STATUSES.merge(extra_statuses)".to_string()),
+                Vec::new(),
+            )]
+        );
+        assert_ne!(merged, other);
+    }
+
+    #[test]
+    fn enum_literal_with_a_splat_is_unresolved_never_a_partial_list() {
+        let hash = enum_forms_of("class M\n  enum :status, { **BASE, archived: 2 }\nend\n");
+        let array = enum_forms_of("class M\n  enum :status, [*BASE, :archived]\nend\n");
+        let kwargs = enum_forms_of("class M\n  enum :status, **BASE, archived: 2\nend\n");
+        assert_eq!(
+            hash,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Unresolved("{ **BASE, archived: 2 }".to_string()),
+                Vec::new(),
+            )]
+        );
+        assert_eq!(
+            array,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Unresolved("[*BASE, :archived]".to_string()),
+                Vec::new(),
+            )]
+        );
+        assert!(
+            matches!(&kwargs[..], [f] if matches!(f.variants, EnumVariants::Unresolved(_))),
+            "keyword variants with a splat must be unresolved, got {kwargs:?}"
+        );
+        // Silence twin: the same literals without a splat stay resolved.
+        let plain = enum_forms_of("class M\n  enum :status, { archived: 2 }\nend\n");
+        assert_eq!(
+            plain,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("archived", "2")])),
+                Vec::new(),
+            )]
+        );
+    }
+
+    #[test]
     fn enum_without_variant_argument_is_missing() {
         let forms = enum_forms_of("class M\n  enum :status\nend\n");
         assert_eq!(
