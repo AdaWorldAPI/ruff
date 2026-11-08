@@ -522,6 +522,11 @@ pub struct EnumForm {
     /// `_default`), key and value verbatim, source order. Never variants.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<(String, String)>,
+    /// Option expressions that could not be read as `key: value` pairs, such
+    /// as `**ENUM_OPTIONS`, as source text in source order. When non-empty,
+    /// [`Self::options`] is incomplete: the expansion may set any option.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_options: Vec<String>,
 }
 
 impl EnumForm {
@@ -537,7 +542,15 @@ impl EnumForm {
             column: column.into(),
             variants,
             options,
+            unresolved_options: Vec::new(),
         }
+    }
+
+    /// Record option expressions that are not literal pairs.
+    #[must_use]
+    pub fn with_unresolved_options(mut self, unresolved: Vec<String>) -> Self {
+        self.unresolved_options = unresolved;
+        self
     }
 }
 

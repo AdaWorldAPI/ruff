@@ -1673,6 +1673,44 @@ end
     }
 
     #[test]
+    fn enum_option_splats_are_recorded_not_dropped() {
+        let only = enum_forms_of("class M\n  enum :status, [:open], **ENUM_OPTIONS\nend\n");
+        assert_eq!(
+            only,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(vec!["open".into()]),
+                Vec::new()
+            )
+            .with_unresolved_options(vec!["**ENUM_OPTIONS".into()])]
+        );
+        let mixed =
+            enum_forms_of("class M\n  enum :status, [:open], prefix: true, **OTHER_OPTIONS\nend\n");
+        assert_eq!(
+            mixed,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(vec!["open".into()]),
+                pairs(&[("prefix", "true")]),
+            )
+            .with_unresolved_options(vec!["**OTHER_OPTIONS".into()])]
+        );
+        let legacy =
+            enum_forms_of("class M\n  enum status: [:open], _prefix: true, **LEGACY\nend\n");
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].unresolved_options, vec!["**LEGACY".to_string()]);
+    }
+
+    #[test]
+    fn enum_literal_options_leave_no_unresolved_options() {
+        let forms =
+            enum_forms_of("class M\n  enum :status, [:open], prefix: true, scopes: false\nend\n");
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0].options.len(), 2);
+        assert!(forms[0].unresolved_options.is_empty());
+    }
+
+    #[test]
     fn enum_duplicate_keys_are_preserved_as_written() {
         let forms = enum_forms_of("class M\n  enum :status, { a: 0, a: 1 }\nend\n");
         assert_eq!(

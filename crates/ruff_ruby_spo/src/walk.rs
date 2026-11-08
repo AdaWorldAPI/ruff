@@ -572,34 +572,43 @@ fn emit_enum_form_modern(
     src: Option<&str>,
     out: &mut Vec<Declaration>,
 ) {
-    let (variants, options) = match rest.split_first() {
-        None => (EnumVariants::Missing, Vec::new()),
+    let mut options = Vec::new();
+    let mut unresolved = Vec::new();
+    let variants = match rest.split_first() {
+        None => EnumVariants::Missing,
         // No positional values: Rails reads every keyword argument as a
         // variant, and there are no options.
-        Some((first @ Node::Kwargs(_), _)) => (classify_enum_variants(first, src), Vec::new()),
+        Some((first @ Node::Kwargs(_), _)) => classify_enum_variants(first, src),
         Some((first, tail)) => {
-            let options = tail
-                .iter()
-                .filter_map(|arg| match arg {
-                    Node::Kwargs(k) => Some(enum_pairs(&k.pairs, src)),
-                    Node::Hash(h) => Some(enum_pairs(&h.pairs, src)),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            (classify_enum_variants(first, src), options)
+            for arg in tail {
+                let pairs = match arg {
+                    Node::Kwargs(k) => &k.pairs,
+                    Node::Hash(h) => &h.pairs,
+                    _ => continue,
+                };
+                let (resolved, rest) = enum_pairs(pairs, src);
+                options.extend(resolved);
+                unresolved.extend(rest);
+            }
+            classify_enum_variants(first, src)
         }
     };
-    out.push(Declaration::EnumForm(EnumForm::new(
-        column, variants, options,
-    )));
+    out.push(Declaration::EnumForm(
+        EnumForm::new(column, variants, options).with_unresolved_options(unresolved),
+    ));
 }
 
 fn emit_enum_forms_legacy(pairs: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
     let mut options = Vec::new();
     let mut columns = Vec::new();
+    let mut unresolved = Vec::new();
     for pair_node in pairs {
-        let Node::Pair(p) = pair_node else { continue };
+        // A splat such as `**ENUM_CONFIG` may carry columns or options; it
+        // cannot be read, so every form records it as an unresolved option.
+        let Node::Pair(p) = pair_node else {
+            unresolved.push(source_text(pair_node, src));
+            continue;
+        };
         let key = pair_key(&p.key);
         if LEGACY_ENUM_OPTION_KEYS.contains(&key.as_str()) {
             options.push((key, source_text(&p.value, src)));
@@ -608,27 +617,26 @@ fn emit_enum_forms_legacy(pairs: &[Node], src: Option<&str>, out: &mut Vec<Decla
         }
     }
     for (column, variants) in columns {
-        out.push(Declaration::EnumForm(EnumForm::new(
-            column,
-            variants,
-            options.clone(),
-        )));
+        out.push(Declaration::EnumForm(
+            EnumForm::new(column, variants, options.clone())
+                .with_unresolved_options(unresolved.clone()),
+        ));
     }
 }
 
 /// The `(key, value)` pairs of an enum options hash: keys unwrapped as by
 /// [`pair_key`], values as their exact source text when the source is
 /// available. Variants never go through here; they use [`literal_pairs`].
-fn enum_pairs(pairs: &[Node], src: Option<&str>) -> Vec<(String, String)> {
-    pairs
-        .iter()
-        .filter_map(|pair_node| {
-            let Node::Pair(p) = pair_node else {
-                return None;
-            };
-            Some((pair_key(&p.key), source_text(&p.value, src)))
-        })
-        .collect()
+fn enum_pairs(pairs: &[Node], src: Option<&str>) -> (Vec<(String, String)>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    for pair_node in pairs {
+        match pair_node {
+            Node::Pair(p) => resolved.push((pair_key(&p.key), source_text(&p.value, src))),
+            other => unresolved.push(source_text(other, src)),
+        }
+    }
+    (resolved, unresolved)
 }
 
 /// Classify the variant argument of an `enum` call by the form the source
