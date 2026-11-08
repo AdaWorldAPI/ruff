@@ -1314,7 +1314,7 @@ fn rails_kind(decl: &Declaration) -> RailsKind {
         Declaration::Validation(_) => RailsKind::Validation,
         Declaration::Callback(_) => RailsKind::Callback,
         Declaration::Concern(_) => RailsKind::Concern,
-        Declaration::Attribute(_) => RailsKind::Attribute,
+        Declaration::Attribute(_) | Declaration::EnumForm(_) => RailsKind::Attribute,
         Declaration::Delegation(_) => RailsKind::Delegation,
         Declaration::Scope(_) => RailsKind::Scope,
         Declaration::ActsAs(_) => RailsKind::ActsAs,
@@ -1343,7 +1343,7 @@ fn rails_arm(body: &Node) -> Vec<RailsEvent> {
     for stmt in stmts {
         let at = anchor(stmt);
         let mut decls = Vec::new();
-        crate::walk::walk_class_body(stmt, &mut decls);
+        crate::walk::walk_class_body(stmt, None, &mut decls);
         for decl in decls {
             let seq = u32::try_from(out.len()).unwrap_or(u32::MAX);
             out.push(RailsEvent {

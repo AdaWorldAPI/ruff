@@ -30,8 +30,8 @@
 use std::path::Path;
 
 use ruff_spo_triplet::{
-    ActsAs, AssocDecl, AttrDecl, Callback, ConcernRef, Delegation, DslCall, DynMethod, Field,
-    Function, GemDsl, Model, ModelGraph, ScopeDecl, StiInfo, UsingRef, Validation,
+    ActsAs, AssocDecl, AttrDecl, Callback, ConcernRef, Delegation, DslCall, DynMethod, EnumForm,
+    Field, Function, GemDsl, Model, ModelGraph, ScopeDecl, StiInfo, UsingRef, Validation,
 };
 
 mod actions;
@@ -136,6 +136,9 @@ pub enum Declaration {
     /// `store_attribute` / `store_accessor` / `define_attribute_method` /
     /// `undef_method`.
     Attribute(AttrDecl),
+    /// The typed form of a Rails `enum` call — one per enum column. Emitted
+    /// beside the legacy [`Declaration::Attribute`] of kind `Enum`.
+    EnumForm(EnumForm),
     /// `delegate :foo, :bar, to: :baz`.
     Delegation(Delegation),
     /// `scope` / `default_scope` / `scopes` (OP plural).
@@ -279,6 +282,7 @@ fn merge_model(dst: &mut Model, src: Model) {
     dst.callbacks.extend(src.callbacks);
     dst.concerns.extend(src.concerns);
     dst.attributes.extend(src.attributes);
+    dst.enum_forms.extend(src.enum_forms);
     dst.delegations.extend(src.delegations);
     dst.scopes.extend(src.scopes);
     dst.acts_as.extend(src.acts_as);
@@ -319,6 +323,7 @@ fn unpack_declaration(model: &mut Model, decl: &Declaration) {
         Declaration::Callback(cb) => model.callbacks.push(cb.clone()),
         Declaration::Concern(cr) => model.concerns.push(cr.clone()),
         Declaration::Attribute(a) => model.attributes.push(a.clone()),
+        Declaration::EnumForm(e) => model.enum_forms.push(e.clone()),
         Declaration::Delegation(d) => model.delegations.push(d.clone()),
         Declaration::Scope(s) => model.scopes.push(s.clone()),
         Declaration::ActsAs(aa) => model.acts_as.push(aa.clone()),
@@ -348,7 +353,8 @@ fn extract_fields(_class: &RubyClass) -> Vec<Field> {
 mod tests {
     use super::*;
     use ruff_spo_triplet::{
-        AssocDecl, AssocKind, AttrDecl, AttrKind, Callback, ConcernKind, ConcernRef, expand,
+        AssocDecl, AssocKind, AttrDecl, AttrKind, Callback, ConcernKind, ConcernRef, EnumVariants,
+        expand,
     };
 
     /// Locked target shape: a hand-built `ModelGraph` matching what a
@@ -601,6 +607,7 @@ end
                 Declaration::Callback(_) => cbk += 1,
                 Declaration::Concern(_) => concern += 1,
                 Declaration::Attribute(_) => attr += 1,
+                Declaration::EnumForm(_) => {}
                 Declaration::Delegation(_) => deleg += 1,
                 Declaration::Scope(_) => scope += 1,
                 Declaration::ActsAs(_) => acts_as += 1,
@@ -1345,6 +1352,419 @@ end
         assert_eq!(
             targets,
             ["close_duplicates", "update_done_ratio", "force_updated"]
+        );
+    }
+
+    /// Every typed enum form the first class of `src` declares.
+    fn enum_forms_of(src: &str) -> Vec<EnumForm> {
+        let classes = extract_from_source(src);
+        classes[0]
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::EnumForm(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn enum_hash_form_keeps_keys_and_values_in_source_order() {
+        let forms = enum_forms_of("class M\n  enum :status, { open: 0, closed: 1 }\nend\n");
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("open", "0"), ("closed", "1")])),
+                Vec::new(),
+            )]
+        );
+    }
+
+    #[test]
+    fn enum_array_form_keeps_order_and_reordering_changes_it() {
+        let ab = enum_forms_of("class M\n  enum :status, [:open, :closed]\nend\n");
+        let ba = enum_forms_of("class M\n  enum :status, [:closed, :open]\nend\n");
+        assert_eq!(
+            ab,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(names(&["open", "closed"])),
+                Vec::new(),
+            )]
+        );
+        assert_eq!(
+            ba,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(names(&["closed", "open"])),
+                Vec::new(),
+            )]
+        );
+        assert_ne!(ab, ba);
+    }
+
+    #[test]
+    fn enum_constant_form_is_unresolved_never_hash_or_array() {
+        let forms = enum_forms_of("class M\n  enum :status, STATUSES\nend\n");
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Unresolved("STATUSES".to_string()),
+                Vec::new(),
+            )]
+        );
+    }
+
+    #[test]
+    fn enum_string_array_keys_match_symbol_array_keys() {
+        let strings = enum_forms_of("class M\n  enum :status, [\"open\", \"closed\"]\nend\n");
+        let symbols = enum_forms_of("class M\n  enum :status, [:open, :closed]\nend\n");
+        assert_eq!(
+            strings,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(names(&["open", "closed"])),
+                Vec::new(),
+            )]
+        );
+        assert_eq!(strings, symbols);
+    }
+
+    #[test]
+    fn enum_unresolved_expression_keeps_its_source_text() {
+        let merged =
+            enum_forms_of("class M\n  enum :status, STATUSES.merge(extra_statuses)\nend\n");
+        let other = enum_forms_of("class M\n  enum :status, STATUSES.merge(more)\nend\n");
+        assert_eq!(
+            merged,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Unresolved("STATUSES.merge(extra_statuses)".to_string()),
+                Vec::new(),
+            )]
+        );
+        assert_ne!(merged, other);
+    }
+
+    #[test]
+    fn enum_literal_with_a_splat_is_unresolved_never_a_partial_list() {
+        let hash = enum_forms_of("class M\n  enum :status, { **BASE, archived: 2 }\nend\n");
+        let array = enum_forms_of("class M\n  enum :status, [*BASE, :archived]\nend\n");
+        let kwargs = enum_forms_of("class M\n  enum :status, **BASE, archived: 2\nend\n");
+        assert_eq!(
+            hash,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Unresolved("{ **BASE, archived: 2 }".to_string()),
+                Vec::new(),
+            )]
+        );
+        assert_eq!(
+            array,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Unresolved("[*BASE, :archived]".to_string()),
+                Vec::new(),
+            )]
+        );
+        assert!(
+            matches!(&kwargs[..], [f] if matches!(f.variants, EnumVariants::Unresolved(_))),
+            "keyword variants with a splat must be unresolved, got {kwargs:?}"
+        );
+        // Silence twin: the same literals without a splat stay resolved.
+        let plain = enum_forms_of("class M\n  enum :status, { archived: 2 }\nend\n");
+        assert_eq!(
+            plain,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("archived", "2")])),
+                Vec::new(),
+            )]
+        );
+    }
+
+    #[test]
+    fn enum_without_variant_argument_is_missing() {
+        let forms = enum_forms_of("class M\n  enum :status\nend\n");
+        assert_eq!(
+            forms,
+            [EnumForm::new("status", EnumVariants::Missing, Vec::new())]
+        );
+    }
+
+    #[test]
+    fn enum_legacy_kwarg_form_is_one_column_with_its_options() {
+        let forms = enum_forms_of("class M\n  enum status: { open: 0 }, _prefix: true\nend\n");
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("open", "0")])),
+                pairs(&[("_prefix", "true")]),
+            )]
+        );
+    }
+
+    #[test]
+    fn enum_legacy_multi_column_form_yields_one_form_per_column_in_order() {
+        let forms = enum_forms_of("class M\n  enum status: [:a], kind: { x: 1 }\nend\n");
+        assert_eq!(
+            forms,
+            [
+                EnumForm::new("status", EnumVariants::Array(names(&["a"])), Vec::new()),
+                EnumForm::new("kind", EnumVariants::Hash(pairs(&[("x", "1")])), Vec::new(),),
+            ]
+        );
+    }
+
+    #[test]
+    fn enum_options_are_never_captured_as_variants() {
+        let forms = enum_forms_of("class M\n  enum :status, [:a, :b], prefix: true\nend\n");
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(names(&["a", "b"])),
+                pairs(&[("prefix", "true")]),
+            )]
+        );
+        let EnumVariants::Array(variants) = &forms[0].variants else {
+            panic!("expected the array form");
+        };
+        assert!(!variants.iter().any(|v| v == "prefix"));
+    }
+
+    /// Without a positional values argument Rails reads every keyword as a
+    /// variant, so `default:` and `suffix:` here are variants, not options.
+    #[test]
+    fn enum_keyword_variants_without_positional_argument_are_all_variants() {
+        let forms = enum_forms_of("class M\n  enum :status, open: 0, default: 1, suffix: 2\nend\n");
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("open", "0"), ("default", "1"), ("suffix", "2")])),
+                Vec::new(),
+            )]
+        );
+    }
+
+    /// The legacy form slices off exactly the underscored Rails options;
+    /// every other key, including one spelled like a modern option, is a
+    /// column.
+    #[test]
+    fn enum_legacy_form_options_are_the_underscored_rails_keys() {
+        let default_column = enum_forms_of("class M\n  enum default: [:open]\nend\n");
+        assert_eq!(
+            default_column,
+            [EnumForm::new(
+                "default",
+                EnumVariants::Array(names(&["open"])),
+                Vec::new(),
+            )]
+        );
+        let instance_methods =
+            enum_forms_of("class M\n  enum status: [:open], _instance_methods: false\nend\n");
+        assert_eq!(
+            instance_methods,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(names(&["open"])),
+                pairs(&[("_instance_methods", "false")]),
+            )]
+        );
+    }
+
+    /// A key that needs evaluation (a method call, a constant, an
+    /// interpolated string) makes the whole literal unresolved; no
+    /// placeholder key is published.
+    #[test]
+    fn enum_literal_with_a_computed_key_is_unresolved() {
+        for (src, text) in [
+            (
+                "class M\n  enum :status, [\"open\".freeze, :closed]\nend\n",
+                "[\"open\".freeze, :closed]",
+            ),
+            (
+                "class M\n  enum :status, { \"open\".freeze => 0 }\nend\n",
+                "{ \"open\".freeze => 0 }",
+            ),
+            (
+                "class M\n  enum :status, [OPEN, :closed]\nend\n",
+                "[OPEN, :closed]",
+            ),
+            (
+                "class M\n  enum :status, [\"#{prefix}_open\"]\nend\n",
+                "[\"#{prefix}_open\"]",
+            ),
+        ] {
+            assert_eq!(
+                enum_forms_of(src),
+                [EnumForm::new(
+                    "status",
+                    EnumVariants::Unresolved(text.to_string()),
+                    Vec::new(),
+                )],
+                "{src}"
+            );
+        }
+        // Silence twin: literal symbol and string keys still resolve.
+        assert_eq!(
+            enum_forms_of("class M\n  enum :status, { \"open\" => 0, closed: 1 }\nend\n"),
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("open", "0"), ("closed", "1")])),
+                Vec::new(),
+            )]
+        );
+    }
+
+    /// Rails takes the column name as `name.to_s`.
+    #[test]
+    fn enum_string_column_name_matches_symbol_column_name() {
+        let string = enum_forms_of("class M\n  enum \"status\", [:open, :closed]\nend\n");
+        let symbol = enum_forms_of("class M\n  enum :status, [:open, :closed]\nend\n");
+        assert_eq!(string, symbol);
+        assert_eq!(string.len(), 1);
+    }
+
+    #[test]
+    fn enum_hash_values_keep_their_source_text() {
+        let forms = enum_forms_of(
+            "class M\n  enum :status, { open: Status::OPEN.to_i, closed: Status::CLOSED.to_i }\nend\n",
+        );
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[
+                    ("open", "Status::OPEN.to_i"),
+                    ("closed", "Status::CLOSED.to_i"),
+                ])),
+                Vec::new(),
+            )]
+        );
+    }
+
+    #[test]
+    fn enum_hash_form_with_trailing_options_keeps_them_apart() {
+        let forms = enum_forms_of("class M\n  enum :status, { open: 0 }, prefix: true\nend\n");
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("open", "0")])),
+                pairs(&[("prefix", "true")]),
+            )]
+        );
+    }
+
+    #[test]
+    fn enum_option_splats_are_recorded_not_dropped() {
+        let only = enum_forms_of("class M\n  enum :status, [:open], **ENUM_OPTIONS\nend\n");
+        assert_eq!(
+            only,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(vec!["open".into()]),
+                Vec::new()
+            )
+            .with_unresolved_options(vec!["**ENUM_OPTIONS".into()])]
+        );
+        let mixed =
+            enum_forms_of("class M\n  enum :status, [:open], prefix: true, **OTHER_OPTIONS\nend\n");
+        assert_eq!(
+            mixed,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Array(vec!["open".into()]),
+                pairs(&[("prefix", "true")]),
+            )
+            .with_unresolved_options(vec!["**OTHER_OPTIONS".into()])]
+        );
+        let legacy =
+            enum_forms_of("class M\n  enum status: [:open], _prefix: true, **LEGACY\nend\n");
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].unresolved_options, vec!["**LEGACY".to_string()]);
+    }
+
+    #[test]
+    fn enum_literal_options_leave_no_unresolved_options() {
+        let forms =
+            enum_forms_of("class M\n  enum :status, [:open], prefix: true, scopes: false\nend\n");
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0].options.len(), 2);
+        assert!(forms[0].unresolved_options.is_empty());
+    }
+
+    #[test]
+    fn enum_duplicate_keys_are_preserved_as_written() {
+        let forms = enum_forms_of("class M\n  enum :status, { a: 0, a: 1 }\nend\n");
+        assert_eq!(
+            forms,
+            [EnumForm::new(
+                "status",
+                EnumVariants::Hash(pairs(&[("a", "0"), ("a", "1")])),
+                Vec::new(),
+            )]
+        );
+    }
+
+    #[test]
+    fn model_without_enums_has_no_enum_forms() {
+        let classes = extract_from_source("class M\n  attribute :age, :integer\nend\n");
+        let models = build_models(&classes);
+        assert_eq!(models[0].enum_forms, Vec::<EnumForm>::new());
+    }
+
+    #[test]
+    fn enum_forms_flow_into_the_model_and_survive_a_reopen() {
+        let classes = extract_from_source(
+            "class M\n  enum :a, [:x]\nend\nclass M\n  enum :b, { y: 1 }\nend\n",
+        );
+        let models = build_models(&classes);
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].enum_forms,
+            [
+                EnumForm::new("a", EnumVariants::Array(names(&["x"])), Vec::new()),
+                EnumForm::new("b", EnumVariants::Hash(pairs(&[("y", "1")])), Vec::new(),),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_enum_attr_decl_is_unchanged_by_the_typed_form() {
+        let classes =
+            extract_from_source("class M\n  enum :status, { active: 0, archived: 1 }\nend\n");
+        let attrs: Vec<&AttrDecl> = classes[0]
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::Attribute(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attrs,
+            [&AttrDecl {
+                kind: AttrKind::Enum,
+                name: "status".to_string(),
+                options: pairs(&[("active", "0"), ("archived", "1")]),
+            }]
         );
     }
 }

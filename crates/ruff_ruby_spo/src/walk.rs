@@ -16,30 +16,34 @@
 use lib_ruby_parser::Node;
 use ruff_spo_triplet::{
     ActsAs, AssocDecl, AssocKind, AttrDecl, AttrKind, Callback, ConcernKind, ConcernRef,
-    Delegation, DslCall, DynMethod, GemDsl, GemKind, ScopeDecl, ScopeKind, UsingRef, Validation,
-    ValidationKind,
+    Delegation, DslCall, DynMethod, EnumForm, EnumVariants, GemDsl, GemKind, ScopeDecl, ScopeKind,
+    UsingRef, Validation, ValidationKind,
 };
 
 use crate::Declaration;
 
 /// Walk a `Class.body` node and append every recognised DSL call as a
 /// [`Declaration`].
-pub(crate) fn walk_class_body(body: &Node, out: &mut Vec<Declaration>) {
+///
+/// `src` is the file the body was parsed from, when the caller has it. It
+/// is used only to keep an unresolved enum argument as the exact source
+/// text; without it that argument falls back to the walker's renderer.
+pub(crate) fn walk_class_body(body: &Node, src: Option<&str>, out: &mut Vec<Declaration>) {
     match body {
         Node::Begin(b) => {
             for stmt in &b.statements {
-                walk_statement(stmt, out);
+                walk_statement(stmt, src, out);
             }
         }
-        single => walk_statement(single, out),
+        single => walk_statement(single, src, out),
     }
 }
 
 /// Process one class-body statement.
-fn walk_statement(node: &Node, out: &mut Vec<Declaration>) {
+fn walk_statement(node: &Node, src: Option<&str>, out: &mut Vec<Declaration>) {
     match node {
-        Node::Send(s) if s.recv.is_none() => route_send(&s.method_name, &s.args, out),
-        Node::Block(blk) => walk_block(blk, out),
+        Node::Send(s) if s.recv.is_none() => route_send(&s.method_name, &s.args, src, out),
+        Node::Block(blk) => walk_block(blk, src, out),
         // Ruby keyword `alias new orig` parses as Node::Alias, NOT as a
         // Send; pick up method-alias facts that would otherwise be lost
         // (codex P2 PR #6 r3418*).
@@ -71,7 +75,7 @@ fn alias_target_name(node: &Node) -> String {
 /// DSL declaration (e.g. `scope :foo, -> { … }` parses as a Send whose
 /// last arg is a Block; `class_methods do ... end` parses as a Block
 /// whose call is `class_methods`).
-fn walk_block(blk: &lib_ruby_parser::nodes::Block, out: &mut Vec<Declaration>) {
+fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut Vec<Declaration>) {
     let Node::Send(s) = &*blk.call else {
         return;
     };
@@ -120,18 +124,18 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, out: &mut Vec<Declaration>) {
         // because that's runtime-only).
         "with_options" => {
             if let Some(body) = blk.body.as_ref() {
-                walk_class_body(body, out);
+                walk_class_body(body, src, out);
             }
             // Also record the wrapper call itself so the catch-all
             // coverage assertion still sees `with_options` somewhere.
-            route_send(s.method_name.as_str(), &s.args, out);
+            route_send(s.method_name.as_str(), &s.args, src, out);
         }
         other => {
             // Generic block: route the call as if it were a bare Send,
             // then drop the body. Conservative — keeps the call counted
             // for coverage without inventing a Declaration shape for
             // arbitrary block DSLs.
-            route_send(other, &s.args, out);
+            route_send(other, &s.args, src, out);
         }
     }
 }
@@ -184,7 +188,7 @@ fn lambda_loc(node: &Node) -> Option<String> {
 /// explicit arm or the `has_dsl_call` catch-all. The D-AR-4 coverage
 /// test fails loudly if a real corpus call slips through unmatched.
 #[allow(clippy::too_many_lines)] // exhaustive 78-name routing — splitting hurts readability
-fn route_send(name: &str, args: &[Node], out: &mut Vec<Declaration>) {
+fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
     match name {
         // ───── Associations (5) ─────
         "belongs_to" => emit_assoc(AssocKind::BelongsTo, args, out),
@@ -222,7 +226,10 @@ fn route_send(name: &str, args: &[Node], out: &mut Vec<Declaration>) {
         // so it lands in `walk_statement`'s catch-all. Handled below.
         "undef_method" => emit_attr(AttrKind::UndefMethod, args, out),
         "serialize" => emit_attr(AttrKind::Serialize, args, out),
-        "enum" => emit_attr(AttrKind::Enum, args, out),
+        "enum" => {
+            emit_attr(AttrKind::Enum, args, out);
+            emit_enum_forms(args, src, out);
+        }
         "store_attribute" => emit_attr(AttrKind::StoreAttribute, args, out),
         "store_accessor" => emit_attr(AttrKind::StoreAccessor, args, out),
         "define_attribute_method" => emit_attr(AttrKind::DefineAttributeMethod, args, out),
@@ -516,6 +523,176 @@ fn attr_arg_window(kind: AttrKind) -> (usize, usize) {
     }
 }
 
+/// The options of the legacy keyword form (`enum status: [..], _prefix:
+/// true`). Rails' `enum` slices exactly these keys off as options; every
+/// other key is a column.
+const LEGACY_ENUM_OPTION_KEYS: &[&str] = &[
+    "_prefix",
+    "_suffix",
+    "_scopes",
+    "_default",
+    "_instance_methods",
+];
+
+/// Push the typed [`EnumForm`] for every enum column a `enum` call declares,
+/// following Rails' `enum(name = nil, values = nil, **options)`:
+///
+/// - With a column name (`enum :status, ..` or `enum "status", ..`), a
+///   positional values argument is the variants and the keyword arguments
+///   are options. Without one, every keyword argument is a variant
+///   (`enum :status, open: 0, default: 1` declares a variant `default`).
+/// - Without a name (`enum status: [..], _prefix: true`), the keys in
+///   [`LEGACY_ENUM_OPTION_KEYS`] are options and every other key is a
+///   column.
+fn emit_enum_forms(args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
+    match args.split_first() {
+        Some((Node::Kwargs(k), _)) => emit_enum_forms_legacy(&k.pairs, src, out),
+        Some((Node::Hash(h), _)) => emit_enum_forms_legacy(&h.pairs, src, out),
+        Some((first, rest)) => {
+            if let Some(column) = enum_column_name(first) {
+                emit_enum_form_modern(column, rest, src, out);
+            }
+        }
+        None => {}
+    }
+}
+
+/// An enum column name: Rails takes it as `name.to_s`, so a symbol and a
+/// string literal name the same column.
+fn enum_column_name(node: &Node) -> Option<String> {
+    match node {
+        Node::Str(s) => Some(s.value.to_string_lossy()),
+        other => sym_string(other),
+    }
+}
+
+fn emit_enum_form_modern(
+    column: String,
+    rest: &[Node],
+    src: Option<&str>,
+    out: &mut Vec<Declaration>,
+) {
+    let mut options = Vec::new();
+    let mut unresolved = Vec::new();
+    let variants = match rest.split_first() {
+        None => EnumVariants::Missing,
+        // No positional values: Rails reads every keyword argument as a
+        // variant, and there are no options.
+        Some((first @ Node::Kwargs(_), _)) => classify_enum_variants(first, src),
+        Some((first, tail)) => {
+            for arg in tail {
+                let pairs = match arg {
+                    Node::Kwargs(k) => &k.pairs,
+                    Node::Hash(h) => &h.pairs,
+                    _ => continue,
+                };
+                let (resolved, rest) = enum_pairs(pairs, src);
+                options.extend(resolved);
+                unresolved.extend(rest);
+            }
+            classify_enum_variants(first, src)
+        }
+    };
+    out.push(Declaration::EnumForm(
+        EnumForm::new(column, variants, options).with_unresolved_options(unresolved),
+    ));
+}
+
+fn emit_enum_forms_legacy(pairs: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
+    let mut options = Vec::new();
+    let mut columns = Vec::new();
+    let mut unresolved = Vec::new();
+    for pair_node in pairs {
+        // A splat such as `**ENUM_CONFIG` may carry columns or options; it
+        // cannot be read, so every form records it as an unresolved option.
+        let Node::Pair(p) = pair_node else {
+            unresolved.push(source_text(pair_node, src));
+            continue;
+        };
+        let key = pair_key(&p.key);
+        if LEGACY_ENUM_OPTION_KEYS.contains(&key.as_str()) {
+            options.push((key, source_text(&p.value, src)));
+        } else {
+            columns.push((key, classify_enum_variants(&p.value, src)));
+        }
+    }
+    for (column, variants) in columns {
+        out.push(Declaration::EnumForm(
+            EnumForm::new(column, variants, options.clone())
+                .with_unresolved_options(unresolved.clone()),
+        ));
+    }
+}
+
+/// The `(key, value)` pairs of an enum options hash: keys unwrapped as by
+/// [`pair_key`], values as their exact source text when the source is
+/// available. Variants never go through here; they use [`literal_pairs`].
+fn enum_pairs(pairs: &[Node], src: Option<&str>) -> (Vec<(String, String)>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    for pair_node in pairs {
+        match pair_node {
+            Node::Pair(p) => resolved.push((pair_key(&p.key), source_text(&p.value, src))),
+            other => unresolved.push(source_text(other, src)),
+        }
+    }
+    (resolved, unresolved)
+}
+
+/// Classify the variant argument of an `enum` call by the form the source
+/// wrote it.
+///
+/// A literal that splices in values the walker cannot see (`{ **BASE,
+/// archived: 2 }`, `[*BASE, :archived]`) is `Unresolved`, never a partial
+/// list: a list that silently lacks the spliced values would read as
+/// complete.
+fn classify_enum_variants(node: &Node, src: Option<&str>) -> EnumVariants {
+    let resolved = match node {
+        Node::Hash(h) => literal_pairs(&h.pairs, src).map(EnumVariants::Hash),
+        Node::Kwargs(k) => literal_pairs(&k.pairs, src).map(EnumVariants::Hash),
+        Node::Array(a) => a
+            .elements
+            .iter()
+            .map(literal_key)
+            .collect::<Option<Vec<_>>>()
+            .map(EnumVariants::Array),
+        _ => None,
+    };
+    resolved.unwrap_or_else(|| EnumVariants::Unresolved(source_text(node, src)))
+}
+
+/// A variant key the walker can read without evaluating anything: a symbol
+/// or a plain string literal. A constant, a method call (`"open".freeze`),
+/// an interpolated string or a splat has no key until Ruby runs, so it
+/// yields `None`.
+fn literal_key(node: &Node) -> Option<String> {
+    match node {
+        Node::Str(s) => Some(s.value.to_string_lossy()),
+        other => sym_string(other),
+    }
+}
+
+/// The variant pairs of a hash literal whose every element is a pair with
+/// a [`literal_key`]; `None` when any key needs evaluation or a `**splat`
+/// splices in pairs the walker cannot see.
+fn literal_pairs(pairs: &[Node], src: Option<&str>) -> Option<Vec<(String, String)>> {
+    pairs
+        .iter()
+        .map(|pair_node| match pair_node {
+            Node::Pair(p) => Some((literal_key(&p.key)?, source_text(&p.value, src))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The exact source text of `node` when the source is available, else the
+/// walker's rendering of it.
+fn source_text(node: &Node, src: Option<&str>) -> String {
+    let loc = node.expression();
+    src.and_then(|s| s.get(loc.begin..loc.end))
+        .map_or_else(|| render_node(node), str::to_owned)
+}
+
 fn emit_delegation(args: &[Node], out: &mut Vec<Declaration>) {
     let mut methods = Vec::new();
     let mut to = String::new();
@@ -632,18 +809,31 @@ fn as_hash_options(node: &Node) -> Option<Vec<(String, String)>> {
         Node::Kwargs(k) => &k.pairs,
         _ => return None,
     };
-    let mut out = Vec::new();
-    for pair_node in pairs {
-        let Node::Pair(p) = pair_node else { continue };
-        let key = match p.key.as_ref() {
-            Node::Sym(s) => s.name.to_string_lossy(),
-            Node::Str(s) => s.value.to_string_lossy(),
-            other => render_node(other),
-        };
-        let value = render_node(&p.value);
-        out.push((key, value));
+    Some(hash_pairs(pairs))
+}
+
+/// Render the `Pair` nodes of a hash as `(key, value)` strings, source
+/// order, duplicates kept.
+fn hash_pairs(pairs: &[Node]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter_map(|pair_node| {
+            let Node::Pair(p) = pair_node else {
+                return None;
+            };
+            Some((pair_key(&p.key), render_node(&p.value)))
+        })
+        .collect()
+}
+
+/// A hash key as a plain string: `:sym` and `"str"` keys unwrapped,
+/// anything else rendered.
+fn pair_key(key: &Node) -> String {
+    match key {
+        Node::Sym(s) => s.name.to_string_lossy(),
+        Node::Str(s) => s.value.to_string_lossy(),
+        other => render_node(other),
     }
-    Some(out)
 }
 
 /// Render a Hash node inline as `{k: v, k2: v2}` for the args blob.
