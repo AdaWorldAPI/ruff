@@ -3234,6 +3234,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruff_codegraph"
+version = "0.1.0"
+dependencies = [
+ "ruff_ruby_spo",
+ "ruff_spo_triplet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
 name = "ruff_command_line"
 version = "0.0.17"
 dependencies = [

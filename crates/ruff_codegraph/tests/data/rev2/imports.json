@@ -1,0 +1,12 @@
+{
+  "app/models/attachment.rb": [
+    "app/models/comment.rb"
+  ],
+  "app/models/comment.rb": [
+    "app/models/ticket.rb"
+  ],
+  "app/models/ticket.rb": [
+    "app/models/contact.rb",
+    "app/models/trackable.rb"
+  ]
+}
