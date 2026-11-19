@@ -29,11 +29,11 @@ ASSOCIATION	shop::Ticket	shop::Ticket.comments	SOURCE_STRUCTURE	-	-	-
 ASSOCIATION	shop::Ticket	shop::Ticket.customer	SOURCE_STRUCTURE	-	-	-
 DEFINES	shop::Ticket	shop::Ticket	SOURCE_STRUCTURE	-	-	-
 DELEGATES	shop::Ticket	name:customer	SOURCE_STRUCTURE	-	-	-
-DSL_CALL	shop::Ticket	validates_with(StateValidator)	SOURCE_STRUCTURE	-	-	-
 INCLUDES	shop::Ticket	shop::Trackable	SOURCE_STRUCTURE	-	-	-
 SCOPE	shop::Ticket	scope:open_tickets	SOURCE_STRUCTURE	-	-	-
 VALIDATES	shop::Ticket	validate:check_state	SOURCE_STRUCTURE	-	-	-
 VALIDATES	shop::Ticket	validates:title	SOURCE_STRUCTURE	-	-	-
+VALIDATES	shop::Ticket	validates_with:StateValidator	SOURCE_STRUCTURE	-	-	-
 VALIDATES_OPTION	shop::Ticket	validates:title:length={:maximum: 120}	SOURCE_STRUCTURE	-	-	-
 VALIDATES_OPTION	shop::Ticket	validates:title:presence=true	SOURCE_STRUCTURE	-	-	-
 ASSOCIATION_KIND	shop::Ticket.comments	has_many	SOURCE_STRUCTURE	-	-	-
@@ -45,7 +45,7 @@ CALLBACK	shop::Ticket::<after_commit>	announce	SOURCE_STRUCTURE	-	-	-
 CALLBACK_OPTION	shop::Ticket::<after_commit>	announce:if=:open?	SOURCE_STRUCTURE	-	-	-
 DEFINES	shop::Ticket::<after_commit>	shop::Ticket::<after_commit>	SOURCE_STRUCTURE	-	-	-
 SYNTHETIC	shop::Ticket::<after_commit>	shop::Ticket::<after_commit>	SOURCE_STRUCTURE	-	-	-
-CALLBACK	shop::Ticket::<after_create>	<block>	SOURCE_STRUCTURE	-	-	-
+CALLBACK	shop::Ticket::<after_create>	AuditCallback	SOURCE_STRUCTURE	-	-	-
 DEFINES	shop::Ticket::<after_create>	shop::Ticket::<after_create>	SOURCE_STRUCTURE	-	-	-
 SYNTHETIC	shop::Ticket::<after_create>	shop::Ticket::<after_create>	SOURCE_STRUCTURE	-	-	-
 CALLBACK	shop::Ticket::<before_save>	normalize_title	SOURCE_STRUCTURE	-	-	-

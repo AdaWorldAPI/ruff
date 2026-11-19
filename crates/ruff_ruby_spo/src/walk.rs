@@ -205,6 +205,7 @@ fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declar
         "normalizes" => emit_validation(ValidationKind::Normalizes, args, out),
         "validates_associated" => emit_validation(ValidationKind::ValidatesAssociated, args, out),
         "validates_each" => emit_validation(ValidationKind::ValidatesEach, args, out),
+        "validates_with" => emit_validates_with(args, out),
 
         // ───── Callbacks (13 phases) ─────
         n if is_callback_phase(n) => emit_callback(n, args, out),
@@ -398,9 +399,15 @@ fn emit_callback(phase: &str, args: &[Node], out: &mut Vec<Declaration>) {
     let options = args.iter().find_map(as_hash_options).unwrap_or_default();
     let targets: Vec<String> = args.iter().filter_map(sym_string).collect();
     if targets.is_empty() {
+        // `after_create AuditCallback.new` and `after_create AuditCallback`
+        // hand Rails an object; the class it names is the callback's identity.
+        let target = args
+            .iter()
+            .find_map(callback_class)
+            .unwrap_or_else(|| "<block>".to_string());
         out.push(Declaration::Callback(Callback {
             phase: phase.to_string(),
-            target: "<block>".to_string(),
+            target,
             options,
         }));
     } else {
@@ -411,6 +418,36 @@ fn emit_callback(phase: &str, args: &[Node], out: &mut Vec<Declaration>) {
                 options: options.clone(),
             }));
         }
+    }
+}
+
+/// The class a callback object names: `Foo`, `Foo::Bar`, or `Foo.new(...)`.
+fn callback_class(node: &Node) -> Option<String> {
+    match node {
+        Node::Const(_) => const_string(node),
+        Node::Send(s) if s.method_name == "new" => s.recv.as_deref().and_then(const_string),
+        _ => None,
+    }
+}
+
+/// `validates_with A, B, on: :create` registers one validator per class.
+fn emit_validates_with(args: &[Node], out: &mut Vec<Declaration>) {
+    let options = args.iter().find_map(as_hash_options).unwrap_or_default();
+    let classes: Vec<String> = args.iter().filter_map(const_string).collect();
+    if classes.is_empty() {
+        out.push(Declaration::Validation(Validation {
+            kind: ValidationKind::ValidatesWith,
+            target: "<expr>".to_string(),
+            options,
+        }));
+        return;
+    }
+    for target in classes {
+        out.push(Declaration::Validation(Validation {
+            kind: ValidationKind::ValidatesWith,
+            target,
+            options: options.clone(),
+        }));
     }
 }
 

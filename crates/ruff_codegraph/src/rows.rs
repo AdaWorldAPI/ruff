@@ -467,6 +467,7 @@ pub(crate) fn validation_macro(kind: ValidationKind) -> &'static str {
         ValidationKind::Normalizes => "normalizes",
         ValidationKind::ValidatesAssociated => "validates_associated",
         ValidationKind::ValidatesEach => "validates_each",
+        ValidationKind::ValidatesWith => "validates_with",
     }
 }
 

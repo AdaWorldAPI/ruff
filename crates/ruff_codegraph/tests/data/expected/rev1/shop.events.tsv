@@ -21,10 +21,10 @@ shop::Ticket	2	DECL	Association	has_many	comments	118
 shop::Ticket	3	DECL	Validation	validates	title	161
 shop::Ticket	4	DECL	Validation	validates	title	196
 shop::Ticket	5	DECL	Validation	validate	check_state	241
-shop::Ticket	6	DECL	DslCall	validates_with	StateValidator	265
+shop::Ticket	6	DECL	Validation	validates_with	StateValidator	265
 shop::Ticket	7	DECL	Callback	before_save	normalize_title	298
 shop::Ticket	8	DECL	Callback	before_save	stamp_owner	329
-shop::Ticket	9	DECL	Callback	after_create	<block>	356
+shop::Ticket	9	DECL	Callback	after_create	AuditCallback	356
 shop::Ticket	10	DECL	Callback	after_commit	announce	389
 shop::Ticket	11	DECL	Scope	scope	open_tickets	427
 shop::Ticket	12	DECL	Delegation	delegate	name:customer	478

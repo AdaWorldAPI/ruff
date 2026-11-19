@@ -449,12 +449,11 @@ fn class_form_callback_and_both_validation_forms_are_rows() {
     // `after_create`, `after_commit`) and one on Comment.
     assert_eq!(count_prefix(&rows, "CALLBACK\t"), 5);
     assert_eq!(count_prefix(&rows, "CALLBACK\tshop::Ticket::"), 4);
-    // The Ruby frontend hands the class form (`AuditCallback.new`) over as
-    // the `<block>` placeholder, so that is what the row says.
+    // The class form (`AuditCallback.new`) names its class.
     assert_eq!(
         count_lines(
             &rows,
-            &format!("CALLBACK\tshop::Ticket::<after_create>\t<block>\t{G}\t-\t-\t-")
+            &format!("CALLBACK\tshop::Ticket::<after_create>\tAuditCallback\t{G}\t-\t-\t-")
         ),
         1
     );
@@ -470,7 +469,7 @@ fn class_form_callback_and_both_validation_forms_are_rows() {
 
     // Validations: `validate :check_state` and the two `validates :title`
     // declarations (one row, two option rows) are VALIDATES rows; Comment has one.
-    assert_eq!(count_prefix(&rows, "VALIDATES\t"), 3);
+    assert_eq!(count_prefix(&rows, "VALIDATES\t"), 4);
     assert_eq!(
         count_lines(
             &rows,
@@ -486,17 +485,16 @@ fn class_form_callback_and_both_validation_forms_are_rows() {
         1
     );
     assert_eq!(count_prefix(&rows, "VALIDATES_OPTION\tshop::Ticket\t"), 2);
-    // `validates_with StateValidator` reaches the IR as a generic DSL call.
-    assert_eq!(count_prefix(&rows, "DSL_CALL\t"), 1);
+    assert_eq!(count_prefix(&rows, "DSL_CALL\t"), 0);
     assert_eq!(
         count_lines(
             &rows,
-            &format!("DSL_CALL\tshop::Ticket\tvalidates_with(StateValidator)\t{G}\t-\t-\t-")
+            &format!("VALIDATES\tshop::Ticket\tvalidates_with:StateValidator\t{G}\t-\t-\t-")
         ),
         1
     );
 
-    // Residuals: the `<block>` target and the undefined `announce` target.
+    // Residuals: the callback class and the undefined `announce` target.
     let residuals = read(out.path(), "shop.residuals.tsv");
     assert_eq!(
         count_lines(

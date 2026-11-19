@@ -78,8 +78,8 @@ store reserves for calls a compiler confirmed. A call on another receiver
 
 A callback whose target names no function of its model still gets its
 `CALLBACK` row, and a `REFERENCE_NOT_NAMED` residual on the phase node. That
-covers a block or lambda, the class form (`after_create Audit.new`, which the
-frontend reports as `<block>`), and a target defined in a concern.
+covers a block or lambda (target `<block>`), the class form
+(`after_create Audit.new`, target `Audit`), and a target defined in a concern.
 
 ## What the receipt accounts for
 
