@@ -1,0 +1,7 @@
+#version 1
+#schema path	fnv64
+app/models/attachment.rb	7bfcd4bd10fc8d26
+app/models/comment.rb	cea2fd67a4a522c4
+app/models/contact.rb	8817eb12dd771cd3
+app/models/ticket.rb	f57f05bfbb914501
+app/models/trackable.rb	0786b7ac7af46631

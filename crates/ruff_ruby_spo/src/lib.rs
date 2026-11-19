@@ -354,7 +354,7 @@ mod tests {
     use super::*;
     use ruff_spo_triplet::{
         AssocDecl, AssocKind, AttrDecl, AttrKind, Callback, ConcernKind, ConcernRef, EnumVariants,
-        expand,
+        ValidationKind, expand,
     };
 
     /// Locked target shape: a hand-built `ModelGraph` matching what a
@@ -1352,6 +1352,54 @@ end
         assert_eq!(
             targets,
             ["close_duplicates", "update_done_ratio", "force_updated"]
+        );
+    }
+
+    #[test]
+    fn callback_object_and_validator_class_keep_their_names() {
+        let classes = extract_from_source(
+            r"
+class Ticket < ApplicationRecord
+  after_create AuditCallback.new
+  after_update Audit::Trail
+  before_save { stamp }
+  validates_with StateValidator, on: :create
+end
+",
+        );
+        let callbacks: Vec<(&str, &str)> = classes[0]
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::Callback(cb) => Some((cb.phase.as_str(), cb.target.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            callbacks,
+            [
+                ("after_create", "AuditCallback"),
+                ("after_update", "Audit::Trail"),
+                ("before_save", "<block>"),
+            ]
+        );
+        let validators: Vec<(ValidationKind, &str)> = classes[0]
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::Validation(v) => Some((v.kind, v.target.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            validators,
+            [(ValidationKind::ValidatesWith, "StateValidator")]
+        );
+        assert!(
+            !classes[0]
+                .declarations
+                .iter()
+                .any(|d| matches!(d, Declaration::DslCall(c) if c.name == "validates_with"))
         );
     }
 

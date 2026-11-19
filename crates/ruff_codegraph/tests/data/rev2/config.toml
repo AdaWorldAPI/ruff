@@ -1,0 +1,8 @@
+namespace = "shop"
+frontend = "ruby-rails"
+root = "app/models"
+
+[lanes]
+structural = true
+order = true
+imports = "imports.json"

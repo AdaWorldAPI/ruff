@@ -1,0 +1,29 @@
+[package]
+name = "ruff_codegraph"
+version = "0.1.0"
+publish = false
+edition = "2024"
+rust-version = { workspace = true }
+description = "One-way projection of ruff's source harvest into the Codegraph store: graded relation rows, an ordered event lane and a receipt that accounts for every row. The store files are the only interface to lance-graph; nothing is read back."
+license = "MIT"
+
+[lib]
+name = "ruff_codegraph"
+
+[[bin]]
+name = "ruff_codegraph"
+path = "src/main.rs"
+
+[dependencies]
+ruff_ruby_spo = { path = "../ruff_ruby_spo" }
+ruff_spo_triplet = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

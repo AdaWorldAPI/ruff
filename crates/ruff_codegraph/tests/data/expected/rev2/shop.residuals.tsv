@@ -1,0 +1,5 @@
+#version 1
+#schema reason	subject
+CALLEE_NOT_NAMED	shop::Comment::notify
+REFERENCE_NOT_NAMED	shop::Ticket::<after_commit>
+REFERENCE_NOT_NAMED	shop::Ticket::<after_create>

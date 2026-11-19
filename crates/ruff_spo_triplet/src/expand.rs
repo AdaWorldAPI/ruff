@@ -447,7 +447,8 @@ impl Expander {
             ValidationKind::Validates
             | ValidationKind::Validate
             | ValidationKind::ValidatesAssociated
-            | ValidationKind::ValidatesEach => Predicate::ValidatesConstraint,
+            | ValidationKind::ValidatesEach
+            | ValidationKind::ValidatesWith => Predicate::ValidatesConstraint,
         };
         self.push(
             model_iri.to_string(),

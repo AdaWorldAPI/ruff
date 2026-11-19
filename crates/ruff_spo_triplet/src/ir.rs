@@ -428,6 +428,8 @@ pub enum ValidationKind {
     ValidatesAssociated,
     /// `validates_each :attr, :attr2 { |record, attr, value| … }`
     ValidatesEach,
+    /// `validates_with StateValidator`; the target is the validator class.
+    ValidatesWith,
 }
 
 /// One callback declaration.

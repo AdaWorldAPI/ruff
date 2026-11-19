@@ -1,0 +1,96 @@
+{
+  "cardinality": {
+    "events": {
+      "BODY": 41,
+      "DECL": 19
+    },
+    "residuals": {
+      "CALLEE_NOT_NAMED": 1,
+      "REFERENCE_NOT_NAMED": 2
+    },
+    "rows": {
+      "ASSOCIATION": 4,
+      "ASSOCIATION_KIND": 4,
+      "ASSOCIATION_OPTION": 3,
+      "CALLBACK": 5,
+      "CALLBACK_OPTION": 1,
+      "CALLS_NAMED": 1,
+      "CRATE": 1,
+      "DEFINES": 18,
+      "DELEGATES": 1,
+      "FIELD_TYPE": 1,
+      "GUARDED_WRITE": 1,
+      "IMPORTS": 4,
+      "INCLUDES": 1,
+      "INHERITS": 1,
+      "PUBLIC": 6,
+      "RAISES": 1,
+      "READS": 1,
+      "SCOPE": 1,
+      "SYNTHETIC": 4,
+      "TRAVERSES": 1,
+      "UNRESOLVED_CALL": 1,
+      "VALIDATES": 4,
+      "VALIDATES_OPTION": 3,
+      "WRITES": 4
+    }
+  },
+  "conservation": {
+    "associations": {
+      "rows": 4,
+      "seen": 4
+    },
+    "callback_targets_not_named": {
+      "rows": 2,
+      "seen": 2
+    },
+    "callbacks": {
+      "rows": 5,
+      "seen": 5
+    },
+    "calls": {
+      "rows": 2,
+      "seen": 2
+    },
+    "calls_not_named": {
+      "rows": 1,
+      "seen": 1
+    },
+    "fields": {
+      "rows": 1,
+      "seen": 1
+    },
+    "functions": {
+      "rows": 9,
+      "seen": 9
+    },
+    "imports": {
+      "rows": 4,
+      "seen": 4
+    },
+    "validations": {
+      "rows": 4,
+      "seen": 4
+    }
+  },
+  "direction": "ruff->store",
+  "formats": {
+    "events": 1,
+    "files": 1,
+    "receipt": 1,
+    "residuals": 1,
+    "rows": 2
+  },
+  "imports_fnv64": "50f4fbb974da993c",
+  "lanes": {
+    "imports": "present",
+    "order": "present",
+    "structural": "present"
+  },
+  "namespace": "shop",
+  "not_projected": {},
+  "snapshot": {
+    "digest": "35284aaf5ad50d5b",
+    "files": 5
+  }
+}
