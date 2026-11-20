@@ -49,6 +49,11 @@
 //! or method parameter of the same name shadows it. A class, module, `def` or
 //! `class << self` body starts with no bindings and does not leak its own.
 //!
+//! A hash key that is such a local read becomes a [`SeedKey`] when the bound
+//! value is a string, symbol, integer, boolean or `nil`. A value too large to
+//! bind (more than 4096 nodes, counting hash keys) leaves the name unbound.
+//! Pattern captures (`in {r:}`, `=> r`) assign like any other write.
+//!
 //! A receiver-less call to one of [`SeedOptions::translation_markers`] with a
 //! single string literal argument (gettext's `__('Title')`) lowers to
 //! [`SeedValue::Translatable`] holding the source string. The markers are
@@ -73,7 +78,7 @@ use std::path::Path;
 use lib_ruby_parser::nodes::{
     And, Arg, Begin as BeginNode, Block, Blockarg, Case, CaseMatch, Class as ClassNode,
     Def as DefNode, Defs as DefsNode, Ensure, For, If, IfMod, IfTernary, KwBegin, Kwarg, Kwoptarg,
-    Kwrestarg, Lvasgn, Module as ModuleNode, Numblock, Optarg, Or, Rescue, Restarg,
+    Kwrestarg, Lvasgn, MatchVar, Module as ModuleNode, Numblock, Optarg, Or, Rescue, Restarg,
     SClass as SclassNode, Send as SendNode, Shadowarg, Until, UntilPost, While, WhilePost,
 };
 use lib_ruby_parser::traverse::visitor::{
@@ -172,7 +177,8 @@ pub struct SeedOptions {
     /// (`["__"]` for gettext-style seeds).
     pub translation_markers: Vec<String>,
     /// Lower a bare local to the value it was bound to; see the module doc
-    /// for exactly which assignments bind. Off by default.
+    /// for exactly which assignments bind. Off by default. Only seed-row
+    /// extraction follows locals: class macros and class constants ignore it.
     pub follow_locals: bool,
     /// Method names peeled off the end of a class constant's expression before
     /// lowering (`["freeze", "with_indifferent_access"]`); only
@@ -240,6 +246,9 @@ pub fn extract_seed_rows_with(
     (rows, report)
 }
 
+/// Largest value, counted in [`SeedValue`] nodes, that a local may be bound to.
+const MAX_BOUND_NODES: usize = 4096;
+
 struct Collector<'a> {
     lowerer: Lowerer<'a>,
     file: &'a str,
@@ -250,7 +259,7 @@ struct Collector<'a> {
     depth: usize,
 }
 
-/// The locals a subtree assigns anywhere in it.
+/// The locals a subtree assigns anywhere in it, pattern captures included.
 #[derive(Default)]
 struct AssignedLocals(Vec<String>);
 
@@ -258,6 +267,10 @@ impl Visitor for AssignedLocals {
     fn on_lvasgn(&mut self, node: &Lvasgn) {
         self.0.push(node.name.clone());
         visit_lvasgn(self, node);
+    }
+
+    fn on_match_var(&mut self, node: &MatchVar) {
+        self.0.push(node.name.clone());
     }
 }
 
@@ -290,14 +303,17 @@ impl Collector<'_> {
             && let Some(value) = assign.value.as_deref()
         {
             self.visit(value);
-            let lowered = self.lowerer.lower(value);
-            // A partly unresolved value is not bound: substituting it would copy its
-            // unresolved parts into every row that reads the local.
-            if self.lowerer.options.follow_locals && count_unresolved(&lowered) == 0 {
-                self.lowerer.locals.insert(assign.name.clone(), lowered);
-            } else {
-                self.lowerer.locals.remove(&assign.name);
+            if self.lowerer.options.follow_locals {
+                let lowered = self.lowerer.lower(value);
+                // A partly unresolved value is not bound: substituting it would copy its
+                // unresolved parts into every row that reads the local. An oversized one
+                // is not bound either, so repeated `x = [x, x]` cannot grow without limit.
+                if count_unresolved(&lowered) == 0 && node_count(&lowered) <= MAX_BOUND_NODES {
+                    self.lowerer.locals.insert(assign.name.clone(), lowered);
+                    return;
+                }
             }
+            self.lowerer.locals.remove(&assign.name);
         } else {
             self.visit(stmt);
         }
@@ -345,7 +361,10 @@ impl Visitor for Collector<'_> {
                 args: node.args.iter().map(|a| self.lowerer.lower(a)).collect(),
             });
         }
+        // A paren group in a receiver or argument is an expression, not a statement list.
+        self.depth += 1;
         visit_send(self, node);
+        self.depth -= 1;
     }
 
     fn on_begin(&mut self, node: &BeginNode) {
@@ -361,6 +380,10 @@ impl Visitor for Collector<'_> {
     fn on_lvasgn(&mut self, node: &Lvasgn) {
         self.unbind(&node.name);
         visit_lvasgn(self, node);
+    }
+
+    fn on_match_var(&mut self, node: &MatchVar) {
+        self.unbind(&node.name);
     }
 
     fn on_class(&mut self, node: &ClassNode) {
@@ -602,6 +625,25 @@ impl Lowerer<'_> {
         SeedValue::Str(text)
     }
 
+    /// A key that is a followed local reads as the key literal it is bound to.
+    fn followed_key(&self, key: &Node) -> SeedKey {
+        if self.options.follow_locals
+            && let Node::Lvar(_) = key
+        {
+            match self.lower(key) {
+                SeedValue::Str(s) => return SeedKey::Str(s),
+                SeedValue::Sym(s) => return SeedKey::Sym(s),
+                SeedValue::Int(n) => return SeedKey::Int(n),
+                SeedValue::Bool(b) => return SeedKey::Bool(b),
+                SeedValue::Nil => return SeedKey::Nil,
+                _ => {}
+            }
+        }
+        SeedKey::Unresolved {
+            source: self.source_of(key),
+        }
+    }
+
     fn lower_pairs(&self, pairs: &[Node]) -> SeedValue {
         let mut out = Vec::with_capacity(pairs.len());
         for pair in pairs {
@@ -613,9 +655,7 @@ impl Lowerer<'_> {
                     Node::False(_) => SeedKey::Bool(false),
                     Node::Nil(_) => SeedKey::Nil,
                     Node::Int(i) if let Some(n) = parse_int(&i.value) => SeedKey::Int(n),
-                    other => SeedKey::Unresolved {
-                        source: self.source_of(other),
-                    },
+                    other => self.followed_key(other),
                 };
                 out.push((key, self.lower(&p.value)));
             } else {
@@ -644,6 +684,19 @@ pub(crate) fn const_path(node: &Node) -> Option<String> {
 fn parse_int(text: &str) -> Option<i64> {
     let cleaned: String = text.chars().filter(|c| *c != '_').collect();
     cleaned.parse().ok()
+}
+
+fn node_count(value: &SeedValue) -> usize {
+    1 + match value {
+        SeedValue::Array(items) | SeedValue::Call { args: items, .. } => {
+            items.iter().map(node_count).sum()
+        }
+        SeedValue::Chain { base, args, .. } => {
+            node_count(base) + args.iter().map(node_count).sum::<usize>()
+        }
+        SeedValue::Hash(pairs) => pairs.iter().map(|(_, v)| 1 + node_count(v)).sum(),
+        _ => 0,
+    }
 }
 
 pub(crate) fn count_unresolved(value: &SeedValue) -> usize {
@@ -1190,6 +1243,91 @@ Overview.create_if_not_exists(\n\
                 method: "pluck".to_string(),
                 args: vec![SeedValue::Sym("id".to_string())],
             }
+        );
+    }
+
+    fn role_after(case: &str, body: &str) -> SeedValue {
+        let calls = [spec("Overview", "create_if_not_exists")];
+        let (rows, _) = scan_with(case, body, &calls, &following());
+        field(rows.last().unwrap(), "role").clone()
+    }
+
+    fn unresolved(source: &str) -> SeedValue {
+        SeedValue::Unresolved {
+            source: source.to_string(),
+        }
+    }
+
+    #[test]
+    fn pattern_captures_unbind_the_local() {
+        let read = "Overview.create_if_not_exists(role: r)\n";
+        let cases = [
+            ("hash_pattern", "case {r: 2}\nin {r:}\n  READ\nend\n"),
+            ("after_case", "case {r: 2}\nin {r:}\nend\nREAD"),
+            ("rightward", "{r: 2} => {r:}\nREAD"),
+            ("bind_as", "case [2]\nin [Integer => r]\nend\nREAD"),
+            ("rest", "case [2]\nin [*r]\nend\nREAD"),
+            ("top_level_var", "case 2\nin r\nend\nREAD"),
+        ];
+        for (case, tail) in cases {
+            let body = format!("r = 1\n{}", tail.replace("READ", read));
+            assert_eq!(role_after(case, &body), unresolved("r"), "{case}");
+        }
+        let pinned = "r = 1\ncase 1\nin ^r\n  READ\nend\n".replace("READ", read);
+        assert_eq!(role_after("pinned", &pinned), SeedValue::Int(1));
+    }
+
+    #[test]
+    fn bound_values_are_size_bounded() {
+        let mut body = String::from("x = [1]\n");
+        for _ in 0..40 {
+            body.push_str("x = [x, x]\n");
+        }
+        body.push_str("Overview.create_if_not_exists(role: x)\n");
+        assert_eq!(role_after("doublings", &body), unresolved("x"));
+        let small = "x = [1]\nx = [x, x]\nOverview.create_if_not_exists(role: x)\n";
+        let one = SeedValue::Array(vec![SeedValue::Int(1)]);
+        assert_eq!(
+            role_after("small", small),
+            SeedValue::Array(vec![one.clone(), one])
+        );
+    }
+
+    #[test]
+    fn an_assignment_in_a_paren_group_inside_call_arguments_unbinds() {
+        let read = "Overview.create_if_not_exists(role: r)\n";
+        for (case, stmt) in [
+            ("arg", "consume((r = 2; nil))\n"),
+            ("receiver", "(r = 2; nil).consume\n"),
+        ] {
+            let body = format!("r = 1\n{stmt}{read}");
+            assert_eq!(role_after(case, &body), unresolved("r"), "{case}");
+        }
+        let standalone = format!("r = 1\n(r = 2; nil)\n{read}");
+        assert_eq!(role_after("standalone", &standalone), SeedValue::Int(2));
+    }
+
+    #[test]
+    fn a_hash_key_read_from_a_followed_local_is_a_seed_key() {
+        let calls = [spec("Overview", "create_if_not_exists")];
+        let body = "k = :role\nn = 3\nf = 1.5\nu = compute\nOverview.create_if_not_exists({k => 1, n => 2, f => 3, u => 4, z => 5})\n";
+        let (rows, _) = scan_with("key_local", body, &calls, &following());
+        let SeedValue::Hash(pairs) = &rows[0].args[0] else {
+            panic!("expected a hash");
+        };
+        let keys: Vec<&SeedKey> = pairs.iter().map(|(k, _)| k).collect();
+        let key_unresolved = |source: &str| SeedKey::Unresolved {
+            source: source.to_string(),
+        };
+        assert_eq!(
+            keys,
+            vec![
+                &sym("role"),
+                &SeedKey::Int(3),
+                &key_unresolved("f"),
+                &key_unresolved("u"),
+                &key_unresolved("z"),
+            ]
         );
     }
 

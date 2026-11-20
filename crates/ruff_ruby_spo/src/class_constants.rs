@@ -18,7 +18,9 @@
 //! [`SeedOptions::transparent_methods`] are peeled off the end of the
 //! expression (`.freeze`, `.with_indifferent_access`), then the rest lowers
 //! exactly as in the seed arm (shared `Lowerer`). Without the configuration
-//! such a call keeps the whole value [`SeedValue::Unresolved`].
+//! such a call keeps the whole value [`SeedValue::Unresolved`]. Locals are never
+//! followed here, whatever [`SeedOptions::follow_locals`] says: it applies to
+//! seed-row extraction only.
 //!
 //! # Conservation
 //!
@@ -223,6 +225,25 @@ mod tests {
             report.constants_found,
             report.constants_fully_literal + report.constants_with_unresolved
         );
+    }
+
+    #[test]
+    fn constants_keep_source_order_across_nested_classes() {
+        let body = "class A\n  X = 1\n  class B\n    Y = 2\n  end\n  Z = 3\nend\n";
+        let (rows, _) = scan("order", body, &SeedOptions::default());
+        let found: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.class.as_str(), r.name.as_str()))
+            .collect();
+        assert_eq!(found, vec![("A", "X"), ("A::B", "Y"), ("A", "Z")]);
+    }
+
+    #[test]
+    fn an_absolute_class_path_ignores_the_enclosing_modules() {
+        let body = "module A\n  class ::B\n    X = 1\n  end\n  module ::C\n    Y = 2\n  end\nend\n";
+        let (rows, _) = scan("absolute", body, &SeedOptions::default());
+        let classes: Vec<&str> = rows.iter().map(|r| r.class.as_str()).collect();
+        assert_eq!(classes, vec!["B", "C"]);
     }
 
     #[test]

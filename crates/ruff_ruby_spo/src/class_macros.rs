@@ -38,7 +38,7 @@ use std::fs;
 use std::path::Path;
 
 use lib_ruby_parser::nodes::{Block, Class as ClassNode, Module as ModuleNode};
-use lib_ruby_parser::traverse::visitor::{Visitor, visit_class, visit_module};
+use lib_ruby_parser::traverse::visitor::Visitor;
 use lib_ruby_parser::{Node, Parser, ParserOptions};
 
 use crate::seeds::{Lowerer, SeedOptions, SeedValue, const_path, count_unresolved};
@@ -151,27 +151,31 @@ struct ClassWalker<'a, 'b, F> {
 
 impl<F: FnMut(&str, Option<&String>, &Node)> Visitor for ClassWalker<'_, '_, F> {
     fn on_class(&mut self, node: &ClassNode) {
+        self.visit(&node.name);
+        if let Some(superclass) = node.superclass.as_deref() {
+            self.visit(superclass);
+        }
         let superclass = node.superclass.as_deref().and_then(const_path);
         self.enter(&node.name, superclass.as_ref(), node.body.as_deref());
-        visit_class(self, node);
         self.path.pop();
     }
 
     fn on_module(&mut self, node: &ModuleNode) {
+        self.visit(&node.name);
         self.enter(&node.name, None, node.body.as_deref());
-        visit_module(self, node);
         self.path.pop();
     }
 }
 
 impl<F: FnMut(&str, Option<&String>, &Node)> ClassWalker<'_, '_, F> {
-    /// Push the declared name onto the path and report the body's direct
-    /// statements; the caller pops after visiting the children.
+    /// Push the declared name onto the path, then report each direct statement
+    /// and visit it before the next, so nested classes keep source order; the
+    /// caller pops.
     fn enter(&mut self, name: &Node, superclass: Option<&String>, body: Option<&Node>) {
         let declared = const_path(name).unwrap_or_else(|| self.lowerer.source_of(name));
         let full = match self.path.last() {
-            Some(outer) => format!("{outer}::{declared}"),
-            None => declared,
+            Some(outer) if !is_absolute(name) => format!("{outer}::{declared}"),
+            _ => declared,
         };
         self.path.push(full);
         self.classes_seen += 1;
@@ -180,11 +184,27 @@ impl<F: FnMut(&str, Option<&String>, &Node)> ClassWalker<'_, '_, F> {
             Some(Node::Begin(b)) => {
                 for stmt in &b.statements {
                     (self.on_statement)(&class, superclass, stmt);
+                    self.visit(stmt);
                 }
             }
-            Some(stmt) => (self.on_statement)(&class, superclass, stmt),
+            Some(stmt) => {
+                (self.on_statement)(&class, superclass, stmt);
+                self.visit(stmt);
+            }
             None => {}
         }
+    }
+}
+
+/// `::A` or `::A::B`: a path rooted at the top level, not at the enclosing module.
+fn is_absolute(name: &Node) -> bool {
+    match name {
+        Node::Const(c) => match c.scope.as_deref() {
+            Some(Node::Cbase(_)) => true,
+            Some(scope) => is_absolute(scope),
+            None => false,
+        },
+        _ => false,
     }
 }
 
@@ -343,6 +363,28 @@ mod tests {
         assert_eq!(rows[0].class, "A::B::C");
         assert_eq!(rows[0].superclass, None);
         assert_eq!(report.classes_seen, 2);
+    }
+
+    #[test]
+    fn nested_class_rows_keep_source_order() {
+        let body = "class A\n  permit! :x\n  class B\n    permit! :y\n  end\n  permit! :z\nend\n";
+        let (rows, _) = scan("order", body, &["permit!"]);
+        let found: Vec<(&str, &SeedValue)> = rows
+            .iter()
+            .map(|r| (r.class.as_str(), &r.args[0]))
+            .collect();
+        assert_eq!(
+            found,
+            vec![("A", &sym("x")), ("A::B", &sym("y")), ("A", &sym("z"))]
+        );
+    }
+
+    #[test]
+    fn an_absolute_class_path_ignores_the_enclosing_modules() {
+        let body = "module A\n  class ::B\n    permit! :x\n  end\n  module ::C\n    permit! :y\n  end\n  class D\n    permit! :z\n  end\nend\n";
+        let (rows, _) = scan("absolute", body, &["permit!"]);
+        let classes: Vec<&str> = rows.iter().map(|r| r.class.as_str()).collect();
+        assert_eq!(classes, vec!["B", "C", "A::D"]);
     }
 
     #[test]
