@@ -98,16 +98,16 @@ pub fn extract_class_macros(
             continue;
         };
         report.files_scanned += 1;
+        let lowerer = Lowerer::new(&src, options);
         let mut collector = Collector {
-            lowerer: Lowerer { src: &src, options },
+            lowerer: &lowerer,
             file: rel,
             names,
-            path: Vec::new(),
-            classes_seen: 0,
             rows: Vec::new(),
         };
-        collector.visit(&ast);
-        report.classes_seen += collector.classes_seen;
+        report.classes_seen += walk_class_bodies(&ast, &lowerer, |class, superclass, stmt| {
+            collector.statement(class, superclass, stmt);
+        });
         for row in collector.rows {
             let unresolved = row.args.iter().map(count_unresolved).sum::<usize>();
             report.calls_found += 1;
@@ -123,17 +123,33 @@ pub fn extract_class_macros(
     (rows, report)
 }
 
-struct Collector<'a> {
-    lowerer: Lowerer<'a>,
-    file: &'a str,
-    names: &'a [&'a str],
+/// The class walk shared by the arms that read a class body's direct
+/// statements: calls `on_statement(class_path, superclass, statement)` for each
+/// direct statement of every class and module, nested ones included, and
+/// returns how many classes and modules were seen.
+pub(crate) fn walk_class_bodies<F>(ast: &Node, lowerer: &Lowerer<'_>, on_statement: F) -> usize
+where
+    F: FnMut(&str, Option<&String>, &Node),
+{
+    let mut walker = ClassWalker {
+        lowerer,
+        on_statement,
+        path: Vec::new(),
+        classes_seen: 0,
+    };
+    walker.visit(ast);
+    walker.classes_seen
+}
+
+struct ClassWalker<'a, 'b, F> {
+    lowerer: &'a Lowerer<'b>,
+    on_statement: F,
     /// Full paths of the enclosing classes and modules, outermost first.
     path: Vec<String>,
     classes_seen: usize,
-    rows: Vec<ClassMacroRow>,
 }
 
-impl Visitor for Collector<'_> {
+impl<F: FnMut(&str, Option<&String>, &Node)> Visitor for ClassWalker<'_, '_, F> {
     fn on_class(&mut self, node: &ClassNode) {
         let superclass = node.superclass.as_deref().and_then(const_path);
         self.enter(&node.name, superclass.as_ref(), node.body.as_deref());
@@ -148,8 +164,8 @@ impl Visitor for Collector<'_> {
     }
 }
 
-impl Collector<'_> {
-    /// Push the declared name onto the path and harvest the body's direct
+impl<F: FnMut(&str, Option<&String>, &Node)> ClassWalker<'_, '_, F> {
+    /// Push the declared name onto the path and report the body's direct
     /// statements; the caller pops after visiting the children.
     fn enter(&mut self, name: &Node, superclass: Option<&String>, body: Option<&Node>) {
         let declared = const_path(name).unwrap_or_else(|| self.lowerer.source_of(name));
@@ -159,20 +175,31 @@ impl Collector<'_> {
         };
         self.path.push(full);
         self.classes_seen += 1;
+        let class = self.path.last().map_or("", String::as_str).to_string();
         match body {
             Some(Node::Begin(b)) => {
                 for stmt in &b.statements {
-                    self.statement(stmt, superclass);
+                    (self.on_statement)(&class, superclass, stmt);
                 }
             }
-            Some(stmt) => self.statement(stmt, superclass),
+            Some(stmt) => (self.on_statement)(&class, superclass, stmt),
             None => {}
         }
     }
+}
 
-    fn statement(&mut self, stmt: &Node, superclass: Option<&String>) {
+/// The macro-call rows among a class body's direct statements.
+struct Collector<'a> {
+    lowerer: &'a Lowerer<'a>,
+    file: &'a str,
+    names: &'a [&'a str],
+    rows: Vec<ClassMacroRow>,
+}
+
+impl Collector<'_> {
+    fn statement(&mut self, class: &str, superclass: Option<&String>, stmt: &Node) {
         match stmt {
-            Node::Send(_) => self.row(stmt, None, superclass),
+            Node::Send(_) => self.row(class, stmt, None, superclass),
             Node::Block(Block {
                 call,
                 begin_l,
@@ -185,22 +212,25 @@ impl Collector<'_> {
                     .as_bytes()
                     .get(begin_l.begin..end_l.end)
                     .map(|b| String::from_utf8_lossy(b).into_owned());
-                self.row(call, block, superclass);
+                self.row(class, call, block, superclass);
             }
             _ => {}
         }
     }
 
-    fn row(&mut self, call: &Node, block: Option<String>, superclass: Option<&String>) {
+    fn row(
+        &mut self,
+        class: &str,
+        call: &Node,
+        block: Option<String>,
+        superclass: Option<&String>,
+    ) {
         let Node::Send(send) = call else { return };
         if send.recv.is_some() || !self.names.contains(&send.method_name.as_str()) {
             return;
         }
-        let Some(class) = self.path.last() else {
-            return;
-        };
         self.rows.push(ClassMacroRow {
-            class: class.clone(),
+            class: class.to_string(),
             superclass: superclass.cloned(),
             file: self.file.to_string(),
             line: self.lowerer.line_of(send.expression_l.begin),

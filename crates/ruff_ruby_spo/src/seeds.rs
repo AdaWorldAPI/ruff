@@ -28,6 +28,27 @@
 //! `nil` literal becomes [`SeedKey::Unresolved`]. A `**splat` hash entry is one unresolved key
 //! plus one unresolved value, both holding the splat's source text.
 //!
+//! A call on a constant path whose arguments all lower to resolved values
+//! (`Role.find_by(name: 'Agent')`) is [`SeedValue::Call`]; a further call on
+//! such a value (`….id`, `….pluck(:id)`) is [`SeedValue::Chain`], with empty
+//! `args` for a plain attribute read. Nothing is evaluated: the value names
+//! what the consumer has to resolve against its own data. An operator, a
+//! safe-navigation call, a block, or any argument that is itself unresolved
+//! keeps the whole expression [`SeedValue::Unresolved`].
+//!
+//! With [`SeedOptions::follow_locals`], a bare local read lowers to the value
+//! the local was last bound to. A local binds only through `name = <expr>` as
+//! a direct statement of a straight-line statement list: the file's top level,
+//! a class, module, `def` or `class << self` body, or a parenthesised
+//! sequence, reached without passing through any `if`/`unless`/ternary, `case`,
+//! loop, block, lambda, `begin`/`rescue`/`ensure` or `&&`/`||`. A later
+//! assignment to the same name rebinds it. The name is unbound, and reads stay
+//! unresolved, when it is assigned in any other position (inside one of the
+//! constructs above, as `x = 1 if c`, `x ||= v`, `a, x = v`, or inside call
+//! arguments), when the assigned value is itself unresolved, or when a block
+//! or method parameter of the same name shadows it. A class, module, `def` or
+//! `class << self` body starts with no bindings and does not leak its own.
+//!
 //! A receiver-less call to one of [`SeedOptions::translation_markers`] with a
 //! single string literal argument (gettext's `__('Title')`) lowers to
 //! [`SeedValue::Translatable`] holding the source string. The markers are
@@ -45,11 +66,22 @@
 //! No SPO triples are emitted: the shared `Predicate` set has no variant for
 //! seed rows, and adding one is outside this arm.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use lib_ruby_parser::nodes::Send as SendNode;
-use lib_ruby_parser::traverse::visitor::{Visitor, visit_send};
+use lib_ruby_parser::nodes::{
+    And, Arg, Begin as BeginNode, Block, Blockarg, Case, CaseMatch, Class as ClassNode,
+    Def as DefNode, Defs as DefsNode, Ensure, For, If, IfMod, IfTernary, KwBegin, Kwarg, Kwoptarg,
+    Kwrestarg, Lvasgn, Module as ModuleNode, Numblock, Optarg, Or, Rescue, Restarg,
+    SClass as SclassNode, Send as SendNode, Shadowarg, Until, UntilPost, While, WhilePost,
+};
+use lib_ruby_parser::traverse::visitor::{
+    Visitor, visit_and, visit_begin, visit_block, visit_case, visit_case_match, visit_ensure,
+    visit_for, visit_if, visit_if_mod, visit_if_ternary, visit_kw_begin, visit_lvasgn,
+    visit_numblock, visit_or, visit_rescue, visit_send, visit_until, visit_until_post, visit_while,
+    visit_while_post,
+};
 use lib_ruby_parser::{Node, Parser, ParserOptions};
 
 /// A call to harvest: the constant path of the receiver and the method name.
@@ -90,6 +122,21 @@ pub enum SeedValue {
     /// A string marked for translation (`__('Title')`), holding the source
     /// string, untranslated.
     Translatable(String),
+    /// `Receiver.method(args)` on a constant path (no leading `::`); every
+    /// argument is resolved (no [`SeedValue::Unresolved`] inside).
+    Call {
+        receiver: String,
+        method: String,
+        args: Vec<SeedValue>,
+    },
+    /// `<base>.method(args)` where `base` is a `Call` or another `Chain` and
+    /// every argument is resolved; a plain attribute read (`….id`) has empty
+    /// `args`.
+    Chain {
+        base: Box<SeedValue>,
+        method: String,
+        args: Vec<SeedValue>,
+    },
     /// Any other expression; `source` is its text from the byte range.
     Unresolved {
         source: String,
@@ -124,6 +171,13 @@ pub struct SeedOptions {
     /// Receiver-less method names that mark a string for translation
     /// (`["__"]` for gettext-style seeds).
     pub translation_markers: Vec<String>,
+    /// Lower a bare local to the value it was bound to; see the module doc
+    /// for exactly which assignments bind. Off by default.
+    pub follow_locals: bool,
+    /// Method names peeled off the end of a class constant's expression before
+    /// lowering (`["freeze", "with_indifferent_access"]`); only
+    /// [`extract_class_constants`](crate::extract_class_constants) reads it.
+    pub transparent_methods: Vec<String>,
 }
 
 /// Read every file in `files` (paths relative to `root`) and return one
@@ -164,12 +218,13 @@ pub fn extract_seed_rows_with(
         };
         report.files_scanned += 1;
         let mut collector = Collector {
-            lowerer: Lowerer { src: &src, options },
+            lowerer: Lowerer::new(&src, options),
             file: rel,
             specs: calls,
             rows: Vec::new(),
+            depth: 0,
         };
-        collector.visit(&ast);
+        collector.statement(&ast);
         for row in collector.rows {
             let unresolved = row.args.iter().map(count_unresolved).sum::<usize>();
             report.calls_found += 1;
@@ -190,6 +245,62 @@ struct Collector<'a> {
     file: &'a str,
     specs: &'a [SeedCallSpec],
     rows: Vec<SeedRow>,
+    /// Number of enclosing constructs in which an assignment may not run (or
+    /// may run more than once); a local binds only at depth 0.
+    depth: usize,
+}
+
+/// A visitor hook that counts an enclosing construct for [`Collector::depth`].
+macro_rules! branching {
+    ($($method:ident($node:ident, $walk:ident)),* $(,)?) => {
+        $(
+            fn $method(&mut self, node: &$node) {
+                self.depth += 1;
+                $walk(self, node);
+                self.depth -= 1;
+            }
+        )*
+    };
+}
+
+impl Collector<'_> {
+    /// One statement of a straight-line list: `name = <expr>` binds or unbinds
+    /// the local, anything else is walked.
+    fn statement(&mut self, stmt: &Node) {
+        if self.depth == 0
+            && let Node::Lvasgn(assign) = stmt
+            && let Some(value) = assign.value.as_deref()
+        {
+            self.visit(value);
+            let lowered = self.lowerer.lower(value);
+            // A partly unresolved value is not bound: substituting it would copy its
+            // unresolved parts into every row that reads the local.
+            if self.lowerer.options.follow_locals && count_unresolved(&lowered) == 0 {
+                self.lowerer.locals.insert(assign.name.clone(), lowered);
+            } else {
+                self.lowerer.locals.remove(&assign.name);
+            }
+        } else {
+            self.visit(stmt);
+        }
+    }
+
+    fn unbind(&mut self, name: &str) {
+        self.lowerer.locals.remove(name);
+    }
+
+    /// Enter a new local scope (class, module, `def`): no bindings come in.
+    fn enter_scope(&mut self) -> (HashMap<String, SeedValue>, usize) {
+        (
+            std::mem::take(&mut self.lowerer.locals),
+            std::mem::take(&mut self.depth),
+        )
+    }
+
+    fn leave_scope(&mut self, saved: (HashMap<String, SeedValue>, usize)) {
+        self.lowerer.locals = saved.0;
+        self.depth = saved.1;
+    }
 }
 
 impl Visitor for Collector<'_> {
@@ -210,6 +321,134 @@ impl Visitor for Collector<'_> {
         }
         visit_send(self, node);
     }
+
+    fn on_begin(&mut self, node: &BeginNode) {
+        if self.depth == 0 {
+            for stmt in &node.statements {
+                self.statement(stmt);
+            }
+        } else {
+            visit_begin(self, node);
+        }
+    }
+
+    fn on_lvasgn(&mut self, node: &Lvasgn) {
+        self.unbind(&node.name);
+        visit_lvasgn(self, node);
+    }
+
+    fn on_class(&mut self, node: &ClassNode) {
+        self.visit(&node.name);
+        if let Some(superclass) = node.superclass.as_deref() {
+            self.visit(superclass);
+        }
+        let saved = self.enter_scope();
+        if let Some(body) = node.body.as_deref() {
+            self.statement(body);
+        }
+        self.leave_scope(saved);
+    }
+
+    fn on_module(&mut self, node: &ModuleNode) {
+        self.visit(&node.name);
+        let saved = self.enter_scope();
+        if let Some(body) = node.body.as_deref() {
+            self.statement(body);
+        }
+        self.leave_scope(saved);
+    }
+
+    fn on_s_class(&mut self, node: &SclassNode) {
+        self.visit(&node.expr);
+        let saved = self.enter_scope();
+        if let Some(body) = node.body.as_deref() {
+            self.statement(body);
+        }
+        self.leave_scope(saved);
+    }
+
+    fn on_def(&mut self, node: &DefNode) {
+        let saved = self.enter_scope();
+        if let Some(args) = node.args.as_deref() {
+            self.visit(args);
+        }
+        if let Some(body) = node.body.as_deref() {
+            self.statement(body);
+        }
+        self.leave_scope(saved);
+    }
+
+    fn on_defs(&mut self, node: &DefsNode) {
+        self.visit(&node.definee);
+        let saved = self.enter_scope();
+        if let Some(args) = node.args.as_deref() {
+            self.visit(args);
+        }
+        if let Some(body) = node.body.as_deref() {
+            self.statement(body);
+        }
+        self.leave_scope(saved);
+    }
+
+    fn on_arg(&mut self, node: &Arg) {
+        self.unbind(&node.name);
+    }
+
+    fn on_optarg(&mut self, node: &Optarg) {
+        self.unbind(&node.name);
+        self.visit(&node.default);
+    }
+
+    fn on_kwarg(&mut self, node: &Kwarg) {
+        self.unbind(&node.name);
+    }
+
+    fn on_kwoptarg(&mut self, node: &Kwoptarg) {
+        self.unbind(&node.name);
+        self.visit(&node.default);
+    }
+
+    fn on_shadowarg(&mut self, node: &Shadowarg) {
+        self.unbind(&node.name);
+    }
+
+    fn on_restarg(&mut self, node: &Restarg) {
+        if let Some(name) = &node.name {
+            self.unbind(name);
+        }
+    }
+
+    fn on_kwrestarg(&mut self, node: &Kwrestarg) {
+        if let Some(name) = &node.name {
+            self.unbind(name);
+        }
+    }
+
+    fn on_blockarg(&mut self, node: &Blockarg) {
+        if let Some(name) = &node.name {
+            self.unbind(name);
+        }
+    }
+
+    branching! {
+        on_if(If, visit_if),
+        on_if_mod(IfMod, visit_if_mod),
+        on_if_ternary(IfTernary, visit_if_ternary),
+        on_case(Case, visit_case),
+        on_case_match(CaseMatch, visit_case_match),
+        on_while(While, visit_while),
+        on_while_post(WhilePost, visit_while_post),
+        on_until(Until, visit_until),
+        on_until_post(UntilPost, visit_until_post),
+        on_for(For, visit_for),
+        on_block(Block, visit_block),
+        on_numblock(Numblock, visit_numblock),
+        on_kw_begin(KwBegin, visit_kw_begin),
+        on_rescue(Rescue, visit_rescue),
+        on_ensure(Ensure, visit_ensure),
+        on_and(And, visit_and),
+        on_or(Or, visit_or),
+    }
 }
 
 /// Source-aware lowering of AST nodes to [`SeedValue`]s, shared with the
@@ -217,6 +456,18 @@ impl Visitor for Collector<'_> {
 pub(crate) struct Lowerer<'a> {
     pub(crate) src: &'a str,
     pub(crate) options: &'a SeedOptions,
+    /// Locals bound so far; only filled when [`SeedOptions::follow_locals`].
+    locals: HashMap<String, SeedValue>,
+}
+
+impl<'a> Lowerer<'a> {
+    pub(crate) fn new(src: &'a str, options: &'a SeedOptions) -> Self {
+        Self {
+            src,
+            options,
+            locals: HashMap::new(),
+        }
+    }
 }
 
 impl Lowerer<'_> {
@@ -262,6 +513,12 @@ impl Lowerer<'_> {
             Node::Array(a) => SeedValue::Array(a.elements.iter().map(|e| self.lower(e)).collect()),
             Node::Hash(h) => self.lower_pairs(&h.pairs),
             Node::Kwargs(k) => self.lower_pairs(&k.pairs),
+            Node::Lvar(var)
+                if self.options.follow_locals && self.locals.contains_key(&var.name) =>
+            {
+                self.locals[&var.name].clone()
+            }
+            Node::Send(call) if let Some(value) = self.lower_call(call) => value,
             Node::Send(call)
                 if call.recv.is_none()
                     && self.options.translation_markers.contains(&call.method_name)
@@ -272,6 +529,35 @@ impl Lowerer<'_> {
             }
             _ => self.unresolved(node),
         }
+    }
+
+    /// `Const.method(args)` as [`SeedValue::Call`], or `<call>.method(args)`
+    /// as [`SeedValue::Chain`]; `None` unless every argument is resolved and
+    /// the method is a plain name (not an operator or a setter).
+    fn lower_call(&self, call: &SendNode) -> Option<SeedValue> {
+        let recv = call.recv.as_deref()?;
+        let name = call.method_name.as_str();
+        let body = name.strip_suffix(['?', '!']).unwrap_or(name);
+        if body.is_empty() || !body.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let args: Vec<SeedValue> = call.args.iter().map(|a| self.lower(a)).collect();
+        if args.iter().any(|a| count_unresolved(a) > 0) {
+            return None;
+        }
+        if let Some(receiver) = const_path(recv) {
+            return Some(SeedValue::Call {
+                receiver,
+                method: call.method_name.clone(),
+                args,
+            });
+        }
+        let base = self.lower(recv);
+        matches!(base, SeedValue::Call { .. } | SeedValue::Chain { .. }).then(|| SeedValue::Chain {
+            base: Box::new(base),
+            method: call.method_name.clone(),
+            args,
+        })
     }
 
     /// A `dstr`/heredoc is a literal only when every part is a plain string.
@@ -337,7 +623,12 @@ fn parse_int(text: &str) -> Option<i64> {
 pub(crate) fn count_unresolved(value: &SeedValue) -> usize {
     match value {
         SeedValue::Unresolved { .. } => 1,
-        SeedValue::Array(items) => items.iter().map(count_unresolved).sum(),
+        SeedValue::Array(items) | SeedValue::Call { args: items, .. } => {
+            items.iter().map(count_unresolved).sum()
+        }
+        SeedValue::Chain { base, args, .. } => {
+            count_unresolved(base) + args.iter().map(count_unresolved).sum::<usize>()
+        }
         SeedValue::Hash(pairs) => pairs
             .iter()
             .map(|(k, v)| {
@@ -425,7 +716,7 @@ mod tests {
 
     #[test]
     fn non_literal_nested_value_is_unresolved_with_source() {
-        let body = "ObjectManager::Attribute.add(name: 'x', data_option: { options: Ticket::State.by_category(:open).pluck(:id) })\n";
+        let body = "ObjectManager::Attribute.add(name: 'x', data_option: { options: Ticket::State.by_category(state).pluck(:id) })\n";
         let (rows, report) = scan("t2", body, &[spec("ObjectManager::Attribute", "add")]);
         assert_eq!(rows.len(), 1);
         assert_eq!(report.calls_found, 1);
@@ -439,7 +730,7 @@ mod tests {
                 SeedValue::Hash(vec![(
                     sym("options"),
                     SeedValue::Unresolved {
-                        source: "Ticket::State.by_category(:open).pluck(:id)".to_string()
+                        source: "Ticket::State.by_category(state).pluck(:id)".to_string()
                     }
                 )])
             )
@@ -459,6 +750,7 @@ mod tests {
         let calls = [spec("Setting", "create_if_not_exists")];
         let marked = SeedOptions {
             translation_markers: vec!["__".to_string()],
+            ..Default::default()
         };
         let (with, with_report) = extract_seed_rows_with(&root, &["seed.rb"], &calls, &marked);
         let (without, without_report) = extract_seed_rows(&root, &["seed.rb"], &calls);
@@ -523,6 +815,39 @@ mod tests {
             )
         );
         assert_eq!(report.unresolved_values, 1);
+    }
+
+    #[test]
+    fn a_local_whose_value_is_partly_unresolved_is_not_bound() {
+        let root = scratch_dir("t_partial_local");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("seed.rb"),
+            "opts = { a: 1, b: compute }\nSetting.create_if_not_exists(x: opts)\nSetting.create_if_not_exists(y: opts)\n",
+        )
+        .unwrap();
+        let options = SeedOptions {
+            follow_locals: true,
+            ..Default::default()
+        };
+        let (rows, report) = extract_seed_rows_with(
+            &root,
+            &["seed.rb"],
+            &[spec("Setting", "create_if_not_exists")],
+            &options,
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            only_kwargs(&rows[0])[0],
+            (
+                sym("x"),
+                SeedValue::Unresolved {
+                    source: "opts".to_string()
+                }
+            )
+        );
+        assert_eq!(report.unresolved_values, 2);
     }
 
     #[test]
@@ -597,6 +922,213 @@ mod tests {
         );
     }
 
+    const OVERVIEWS: &str = "overview_role = Role.find_by(name: 'Agent')\n\
+Overview.create_if_not_exists(\n\
+  name: __('My Assigned Tickets'), link: 'my_assigned', prio: 1000,\n\
+  role_ids:  [overview_role.id],\n\
+  condition: { 'ticket.state_id' => { operator: 'is', value: Ticket::State.by_category_ids(:open) },\n\
+               'ticket.owner_id' => { operator: 'is', pre_condition: 'current_user.id' } },\n\
+)\n\
+overview_role = Role.find_by(name: 'Customer')\n\
+Overview.create_if_not_exists(\n\
+  name: __('My Tickets'), link: 'my_tickets', prio: 1100,\n\
+  role_ids:  [overview_role.id],\n\
+  condition: { 'ticket.state_id' => { operator: 'is', value: Ticket::State.by_category_ids(:open) } },\n\
+)\n";
+
+    fn scan_with(
+        case: &str,
+        body: &str,
+        calls: &[SeedCallSpec],
+        options: &SeedOptions,
+    ) -> (Vec<SeedRow>, SeedScanReport) {
+        let root = scratch_dir(case);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("seed.rb"), body).unwrap();
+        let result = extract_seed_rows_with(&root, &["seed.rb"], calls, options);
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    fn following() -> SeedOptions {
+        SeedOptions {
+            translation_markers: vec!["__".to_string()],
+            follow_locals: true,
+            ..Default::default()
+        }
+    }
+
+    fn find_role(name: &str) -> SeedValue {
+        SeedValue::Call {
+            receiver: "Role".to_string(),
+            method: "find_by".to_string(),
+            args: vec![SeedValue::Hash(vec![(sym("name"), string(name))])],
+        }
+    }
+
+    fn role_id(name: &str) -> SeedValue {
+        SeedValue::Chain {
+            base: Box::new(find_role(name)),
+            method: "id".to_string(),
+            args: Vec::new(),
+        }
+    }
+
+    fn field<'r>(row: &'r SeedRow, key: &str) -> &'r SeedValue {
+        &only_kwargs(row)
+            .iter()
+            .find(|(k, _)| *k == sym(key))
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn followed_locals_resolve_named_calls_and_rebind() {
+        let calls = [spec("Overview", "create_if_not_exists")];
+        let (rows, report) = scan_with("t9", OVERVIEWS, &calls, &following());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            field(&rows[0], "role_ids"),
+            &SeedValue::Array(vec![role_id("Agent")])
+        );
+        assert_eq!(
+            field(&rows[1], "role_ids"),
+            &SeedValue::Array(vec![role_id("Customer")])
+        );
+        let SeedValue::Hash(condition) = field(&rows[0], "condition") else {
+            panic!("expected a hash");
+        };
+        let SeedValue::Hash(state) = &condition[0].1 else {
+            panic!("expected a hash");
+        };
+        assert_eq!(
+            state[1],
+            (
+                sym("value"),
+                SeedValue::Call {
+                    receiver: "Ticket::State".to_string(),
+                    method: "by_category_ids".to_string(),
+                    args: vec![SeedValue::Sym("open".to_string())],
+                }
+            )
+        );
+        assert_eq!(report.unresolved_values, 0);
+        assert_eq!(report.rows_fully_literal, 2);
+    }
+
+    #[test]
+    fn without_follow_locals_the_local_read_stays_unresolved() {
+        let calls = [spec("Overview", "create_if_not_exists")];
+        let options = SeedOptions {
+            follow_locals: false,
+            ..following()
+        };
+        let (rows, report) = scan_with("t10", OVERVIEWS, &calls, &options);
+        let unresolved = SeedValue::Unresolved {
+            source: "overview_role.id".to_string(),
+        };
+        assert_eq!(
+            field(&rows[0], "role_ids"),
+            &SeedValue::Array(vec![unresolved.clone()])
+        );
+        assert_eq!(
+            field(&rows[1], "role_ids"),
+            &SeedValue::Array(vec![unresolved])
+        );
+        assert_eq!(report.unresolved_values, 2);
+    }
+
+    #[test]
+    fn only_straight_line_assignments_bind() {
+        let calls = [spec("Overview", "create_if_not_exists")];
+        let unresolved = |source: &str| SeedValue::Unresolved {
+            source: source.to_string(),
+        };
+        let cases = [
+            ("if_branch", "if cond\n  r = Role.find_by(name: 'A')\nend\n"),
+            ("modifier", "r = Role.find_by(name: 'A') if cond\n"),
+            ("or_assign", "r ||= Role.find_by(name: 'A')\n"),
+            ("block", "[1].each { r = Role.find_by(name: 'A') }\n"),
+        ];
+        for (case, assign) in cases {
+            let body = format!("{assign}Overview.create_if_not_exists(role: r)\n");
+            let (rows, _) = scan_with(case, &body, &calls, &following());
+            assert_eq!(field(&rows[0], "role"), &unresolved("r"), "{case}");
+        }
+        let body = "r = Role.find_by(name: 'A')\nif cond\n  r = 1\nend\nOverview.create_if_not_exists(role: r)\n";
+        let (rows, _) = scan_with("rebound_in_if", body, &calls, &following());
+        assert_eq!(field(&rows[0], "role"), &unresolved("r"));
+        let body = "r = Role.find_by(name: 'A')\n[1].each do |r|\n  Overview.create_if_not_exists(role: r)\nend\n";
+        let (rows, _) = scan_with("shadowed", body, &calls, &following());
+        assert_eq!(field(&rows[0], "role"), &unresolved("r"));
+        let body =
+            "r = Role.find_by(name: 'A')\ndef x\n  Overview.create_if_not_exists(role: r)\nend\n";
+        let (rows, _) = scan_with("def_scope", body, &calls, &following());
+        assert_eq!(field(&rows[0], "role"), &unresolved("r"));
+        let body = "r = Role.find_by(name: 'A')\nOverview.create_if_not_exists(role: r)\n";
+        let (rows, _) = scan_with("straight", body, &calls, &following());
+        assert_eq!(field(&rows[0], "role"), &find_role("A"));
+    }
+
+    #[test]
+    fn a_local_bound_to_an_unresolved_value_unbinds() {
+        let calls = [spec("Overview", "create_if_not_exists")];
+        let body =
+            "r = Role.find_by(name: 'A')\nr = compute\nOverview.create_if_not_exists(role: r)\n";
+        let (rows, _) = scan_with("t12", body, &calls, &following());
+        assert_eq!(
+            field(&rows[0], "role"),
+            &SeedValue::Unresolved {
+                source: "r".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_call_with_an_unbound_local_argument_stays_unresolved() {
+        let calls = [spec("Overview", "create_if_not_exists")];
+        let body = "Overview.create_if_not_exists(a: Foo.bar(baz), b: Foo.bar(1), c: Foo + 1, d: Foo.bar(1).baz = 2)\n";
+        let (rows, _) = scan_with("t13", body, &calls, &following());
+        assert_eq!(
+            field(&rows[0], "a"),
+            &SeedValue::Unresolved {
+                source: "Foo.bar(baz)".to_string()
+            }
+        );
+        assert_eq!(
+            field(&rows[0], "b"),
+            &SeedValue::Call {
+                receiver: "Foo".to_string(),
+                method: "bar".to_string(),
+                args: vec![SeedValue::Int(1)],
+            }
+        );
+        assert!(matches!(field(&rows[0], "c"), SeedValue::Unresolved { .. }));
+        assert!(matches!(field(&rows[0], "d"), SeedValue::Unresolved { .. }));
+    }
+
+    #[test]
+    fn a_call_chain_keeps_its_structure() {
+        let calls = [spec("Overview", "create_if_not_exists")];
+        let body =
+            "Overview.create_if_not_exists(ids: Ticket::State.by_category(:open).pluck(:id))\n";
+        let (rows, report) = scan_with("t14", body, &calls, &following());
+        assert_eq!(report.unresolved_values, 0);
+        assert_eq!(
+            field(&rows[0], "ids"),
+            &SeedValue::Chain {
+                base: Box::new(SeedValue::Call {
+                    receiver: "Ticket::State".to_string(),
+                    method: "by_category".to_string(),
+                    args: vec![SeedValue::Sym("open".to_string())],
+                }),
+                method: "pluck".to_string(),
+                args: vec![SeedValue::Sym("id".to_string())],
+            }
+        );
+    }
+
     /// Run with `ZAMMAD_SRC=/path/to/zammad cargo test -p ruff_ruby_spo
     /// seeds::tests::zammad_seed_measurement -- --ignored --nocapture`.
     #[test]
@@ -629,6 +1161,8 @@ mod tests {
         for (receiver, method, file) in targets {
             let options = SeedOptions {
                 translation_markers: vec!["__".to_string()],
+                follow_locals: true,
+                ..Default::default()
             };
             let (rows, report) =
                 extract_seed_rows_with(root, &[file], &[spec(receiver, method)], &options);
@@ -642,7 +1176,7 @@ mod tests {
         }
         let mut ranked: Vec<_> = shapes.into_iter().collect();
         ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
-        for (shape, (count, example)) in ranked.iter().take(5) {
+        for (shape, (count, example)) in ranked.iter().take(12) {
             println!("{count:5}  {shape}  e.g. {example}");
         }
     }
@@ -657,9 +1191,12 @@ mod tests {
             SeedValue::Unresolved { source } => {
                 let shape: String = source
                     .chars()
-                    .take_while(|c| !matches!(c, '(' | '.' | ' '))
+                    .take_while(|c| !matches!(c, '(' | ' ' | '\n'))
                     .collect();
-                let entry = out.entry(shape).or_insert((0, format!("{file}:{line}")));
+                let example: String = source.chars().take(60).collect();
+                let entry = out
+                    .entry(shape)
+                    .or_insert((0, format!("{file}:{line} `{example}`")));
                 entry.0 += 1;
             }
             SeedValue::Array(items) => {
