@@ -38,7 +38,7 @@ use std::fs;
 use std::path::Path;
 
 use lib_ruby_parser::nodes::{Block, Class as ClassNode, Module as ModuleNode};
-use lib_ruby_parser::traverse::visitor::{Visitor, visit_class, visit_module};
+use lib_ruby_parser::traverse::visitor::Visitor;
 use lib_ruby_parser::{Node, Parser, ParserOptions};
 
 use crate::seeds::{Lowerer, SeedOptions, SeedValue, const_path, count_unresolved};
@@ -98,16 +98,16 @@ pub fn extract_class_macros(
             continue;
         };
         report.files_scanned += 1;
+        let lowerer = Lowerer::new(&src, options);
         let mut collector = Collector {
-            lowerer: Lowerer { src: &src, options },
+            lowerer: &lowerer,
             file: rel,
             names,
-            path: Vec::new(),
-            classes_seen: 0,
             rows: Vec::new(),
         };
-        collector.visit(&ast);
-        report.classes_seen += collector.classes_seen;
+        report.classes_seen += walk_class_bodies(&ast, &lowerer, |class, superclass, stmt| {
+            collector.statement(class, superclass, stmt);
+        });
         for row in collector.rows {
             let unresolved = row.args.iter().map(count_unresolved).sum::<usize>();
             report.calls_found += 1;
@@ -123,56 +123,103 @@ pub fn extract_class_macros(
     (rows, report)
 }
 
-struct Collector<'a> {
-    lowerer: Lowerer<'a>,
-    file: &'a str,
-    names: &'a [&'a str],
+/// The class walk shared by the arms that read a class body's direct
+/// statements: calls `on_statement(class_path, superclass, statement)` for each
+/// direct statement of every class and module, nested ones included, and
+/// returns how many classes and modules were seen.
+pub(crate) fn walk_class_bodies<F>(ast: &Node, lowerer: &Lowerer<'_>, on_statement: F) -> usize
+where
+    F: FnMut(&str, Option<&String>, &Node),
+{
+    let mut walker = ClassWalker {
+        lowerer,
+        on_statement,
+        path: Vec::new(),
+        classes_seen: 0,
+    };
+    walker.visit(ast);
+    walker.classes_seen
+}
+
+struct ClassWalker<'a, 'b, F> {
+    lowerer: &'a Lowerer<'b>,
+    on_statement: F,
     /// Full paths of the enclosing classes and modules, outermost first.
     path: Vec<String>,
     classes_seen: usize,
-    rows: Vec<ClassMacroRow>,
 }
 
-impl Visitor for Collector<'_> {
+impl<F: FnMut(&str, Option<&String>, &Node)> Visitor for ClassWalker<'_, '_, F> {
     fn on_class(&mut self, node: &ClassNode) {
+        self.visit(&node.name);
+        if let Some(superclass) = node.superclass.as_deref() {
+            self.visit(superclass);
+        }
         let superclass = node.superclass.as_deref().and_then(const_path);
         self.enter(&node.name, superclass.as_ref(), node.body.as_deref());
-        visit_class(self, node);
         self.path.pop();
     }
 
     fn on_module(&mut self, node: &ModuleNode) {
+        self.visit(&node.name);
         self.enter(&node.name, None, node.body.as_deref());
-        visit_module(self, node);
         self.path.pop();
     }
 }
 
-impl Collector<'_> {
-    /// Push the declared name onto the path and harvest the body's direct
-    /// statements; the caller pops after visiting the children.
+impl<F: FnMut(&str, Option<&String>, &Node)> ClassWalker<'_, '_, F> {
+    /// Push the declared name onto the path, then report each direct statement
+    /// and visit it before the next, so nested classes keep source order; the
+    /// caller pops.
     fn enter(&mut self, name: &Node, superclass: Option<&String>, body: Option<&Node>) {
         let declared = const_path(name).unwrap_or_else(|| self.lowerer.source_of(name));
         let full = match self.path.last() {
-            Some(outer) => format!("{outer}::{declared}"),
-            None => declared,
+            Some(outer) if !is_absolute(name) => format!("{outer}::{declared}"),
+            _ => declared,
         };
         self.path.push(full);
         self.classes_seen += 1;
+        let class = self.path.last().map_or("", String::as_str).to_string();
         match body {
             Some(Node::Begin(b)) => {
                 for stmt in &b.statements {
-                    self.statement(stmt, superclass);
+                    (self.on_statement)(&class, superclass, stmt);
+                    self.visit(stmt);
                 }
             }
-            Some(stmt) => self.statement(stmt, superclass),
+            Some(stmt) => {
+                (self.on_statement)(&class, superclass, stmt);
+                self.visit(stmt);
+            }
             None => {}
         }
     }
+}
 
-    fn statement(&mut self, stmt: &Node, superclass: Option<&String>) {
+/// `::A` or `::A::B`: a path rooted at the top level, not at the enclosing module.
+fn is_absolute(name: &Node) -> bool {
+    match name {
+        Node::Const(c) => match c.scope.as_deref() {
+            Some(Node::Cbase(_)) => true,
+            Some(scope) => is_absolute(scope),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// The macro-call rows among a class body's direct statements.
+struct Collector<'a> {
+    lowerer: &'a Lowerer<'a>,
+    file: &'a str,
+    names: &'a [&'a str],
+    rows: Vec<ClassMacroRow>,
+}
+
+impl Collector<'_> {
+    fn statement(&mut self, class: &str, superclass: Option<&String>, stmt: &Node) {
         match stmt {
-            Node::Send(_) => self.row(stmt, None, superclass),
+            Node::Send(_) => self.row(class, stmt, None, superclass),
             Node::Block(Block {
                 call,
                 begin_l,
@@ -185,22 +232,25 @@ impl Collector<'_> {
                     .as_bytes()
                     .get(begin_l.begin..end_l.end)
                     .map(|b| String::from_utf8_lossy(b).into_owned());
-                self.row(call, block, superclass);
+                self.row(class, call, block, superclass);
             }
             _ => {}
         }
     }
 
-    fn row(&mut self, call: &Node, block: Option<String>, superclass: Option<&String>) {
+    fn row(
+        &mut self,
+        class: &str,
+        call: &Node,
+        block: Option<String>,
+        superclass: Option<&String>,
+    ) {
         let Node::Send(send) = call else { return };
         if send.recv.is_some() || !self.names.contains(&send.method_name.as_str()) {
             return;
         }
-        let Some(class) = self.path.last() else {
-            return;
-        };
         self.rows.push(ClassMacroRow {
-            class: class.clone(),
+            class: class.to_string(),
             superclass: superclass.cloned(),
             file: self.file.to_string(),
             line: self.lowerer.line_of(send.expression_l.begin),
@@ -313,6 +363,28 @@ mod tests {
         assert_eq!(rows[0].class, "A::B::C");
         assert_eq!(rows[0].superclass, None);
         assert_eq!(report.classes_seen, 2);
+    }
+
+    #[test]
+    fn nested_class_rows_keep_source_order() {
+        let body = "class A\n  permit! :x\n  class B\n    permit! :y\n  end\n  permit! :z\nend\n";
+        let (rows, _) = scan("order", body, &["permit!"]);
+        let found: Vec<(&str, &SeedValue)> = rows
+            .iter()
+            .map(|r| (r.class.as_str(), &r.args[0]))
+            .collect();
+        assert_eq!(
+            found,
+            vec![("A", &sym("x")), ("A::B", &sym("y")), ("A", &sym("z"))]
+        );
+    }
+
+    #[test]
+    fn an_absolute_class_path_ignores_the_enclosing_modules() {
+        let body = "module A\n  class ::B\n    permit! :x\n  end\n  module ::C\n    permit! :y\n  end\n  class D\n    permit! :z\n  end\nend\n";
+        let (rows, _) = scan("absolute", body, &["permit!"]);
+        let classes: Vec<&str> = rows.iter().map(|r| r.class.as_str()).collect();
+        assert_eq!(classes, vec!["B", "C", "A::D"]);
     }
 
     #[test]
