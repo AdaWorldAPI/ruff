@@ -3246,6 +3246,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruff_coffee_spo"
+version = "0.1.0"
+
+[[package]]
 name = "ruff_command_line"
 version = "0.0.17"
 dependencies = [

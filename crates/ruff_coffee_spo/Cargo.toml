@@ -1,0 +1,14 @@
+[package]
+name = "ruff_coffee_spo"
+version = "0.1.0"
+publish = false
+edition = "2024"
+rust-version = { workspace = true }
+description = "Minimal CoffeeScript frontend: a tokenizer and a call finder that harvests config-call registrations such as App.Config.set('ticket/zoom/:ticket_id', Router, 'Routes') as data. No parser, no dependencies."
+license = "MIT"
+
+[lib]
+name = "ruff_coffee_spo"
+
+[lints]
+workspace = true
