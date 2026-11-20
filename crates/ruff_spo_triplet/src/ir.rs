@@ -347,6 +347,22 @@ pub struct Function {
     /// consumers (OGAR lifts) read the struct field directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub onchange: Vec<String>,
+    /// Methods the body calls on its own object, as written: receiver-less
+    /// calls and `self.` calls that are neither a write nor one of the
+    /// [`Self::calls`] mutators nor a plain `self.<field>` read (so
+    /// `leaf_or_manually_scheduled?` and `validate_after_soonest_start`, but
+    /// not `self.name`). First-seen order, deduplicated. Not expanded as a
+    /// triple — consumers read the struct field directly. Additive +
+    /// serde-defaulted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_calls: Vec<String>,
+    /// Methods the body sends to a receiver the frontend was told to track
+    /// (`model.leaf?` records `leaf?`), as written, first-seen order,
+    /// deduplicated. A `<recv>.<name> = …` is a write of `<name>` and lands
+    /// in [`Self::writes`] instead. Not expanded as a triple. Additive +
+    /// serde-defaulted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receiver_reads: Vec<String>,
 }
 
 impl Model {
@@ -998,6 +1014,8 @@ mod dto_surface_tests {
         "onchange",
         "raises",
         "reads",
+        "receiver_reads",
+        "self_calls",
         "traverses",
         "writes",
     ];
@@ -1139,6 +1157,8 @@ mod dto_surface_tests {
             calls: vec!["m.n".into()],
             constrains: vec!["d".into()],
             onchange: vec!["e".into()],
+            self_calls: vec!["g".into()],
+            receiver_reads: vec!["h".into()],
         }
     }
 

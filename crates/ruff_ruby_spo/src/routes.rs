@@ -29,6 +29,8 @@
 //!   member/nested-resource conventions).
 //! - Standalone verb calls (`get`/`post`/`put`/`patch`/`delete`/`match`),
 //!   resolving `to:` / fat-arrow / `action:` + ambient-controller forms.
+//! - `nested do … end` in a plural `resources` block, walked as if its
+//!   statements were written directly in that block.
 //! - `concern` define + `concerns` replay (call form and array/kwarg
 //!   form), same-file only.
 //! - `root`, `match … via: [...]` expansion.
@@ -241,12 +243,18 @@ pub struct RouteScanReport {
     /// `config/application.rb`, a `+` chain of resolvable parts, or an
     /// interpolation of resolvable parts; anything else lands here.
     pub escaped_dynamic: usize,
-    /// Unknown DSL call names, deduped (never `direct`/`resolve` — zero
-    /// corpus occurrences, per the frozen spec's non-goals; `draw` is a
-    /// load idiom, see [`Self::escaped_route_loads`]).
+    /// The distinct names in [`Self::escaped_other_calls`], sorted and
+    /// deduplicated: every escaped declaration unit that is not a redirect,
+    /// mount, proc, `via: :all` or dynamic escape. `draw` is a load idiom,
+    /// see [`Self::escaped_route_loads`].
     pub escaped_other: Vec<String>,
-    /// The name of every unknown DSL call, one per call in scan order:
-    /// `escaped_other` lists a repeated name once.
+    /// One entry per escaped declaration unit counted as "other", in scan
+    /// order, so a repeated name is listed once per occurrence. The name
+    /// is the call as written for an unknown DSL call (`use_doorkeeper`),
+    /// for `direct`/`resolve` and for a `nested` outside a plural
+    /// `resources` block. An unresolved name in `concerns :a, :b` is
+    /// recorded as the synthetic `concern:<name>`, one entry per name, not
+    /// one per `concerns` call (`handle_concerns_replay`).
     pub escaped_other_calls: Vec<String>,
     /// A later declaration reusing an already-seen (stem, verb) with a
     /// DIFFERENT controller#action — the entry stays in `entries`, but no
@@ -706,6 +714,10 @@ enum Frame {
     },
     Member,
     Collection,
+    /// An explicit `nested do … end` inside a plural `resources` block.
+    /// It adds no segments of its own; it only records that Rails'
+    /// scope level is no longer `:resources`.
+    Nested,
 }
 
 /// `helper_prefix` — outer→inner join (`_`) of every `Namespace.name` and
@@ -1000,6 +1012,7 @@ fn dispatch<'a>(name: &str, args: &[Node], block_body: Option<&'a Node>, w: &mut
             }
             w.stack.pop();
         }
+        "nested" => handle_nested(args, block_body, w),
         "concern" => handle_concern_def(args, block_body, w),
         "concerns" => handle_concerns_replay(args, w),
         "get" | "post" | "put" | "patch" | "delete" => {
@@ -1630,6 +1643,37 @@ fn handle_controller<'a>(args: &[Node], block_body: Option<&'a Node>, w: &mut Wa
 // ─────────────────────────────────────────────────────────────────────────
 // Concerns
 // ─────────────────────────────────────────────────────────────────────────
+
+/// `nested do … end` — Rails (`Mapper::Resources#nested`) wraps child
+/// `resources` and naked verbs of a `resources` block in `nested` itself
+/// (`apply_common_behavior_for`, `map_match`), so an explicit one in a
+/// plural `resources` block declares what its statements declare written
+/// directly. Anywhere else it stays an escape: outside a resource scope
+/// (or inside a `nested`, `member` or `collection`, whose scope level is
+/// not `:resources`/`:resource`) Rails raises, and in a singular `resource`
+/// a naked verb is wrapped in `member` but inside an explicit `nested` it
+/// is not, so the names differ and this arm does not model them.
+fn handle_nested<'a>(args: &[Node], block_body: Option<&'a Node>, w: &mut Walker<'a>) {
+    let scope_level = w.stack.iter().rposition(|f| {
+        matches!(
+            f,
+            Frame::Resources { .. }
+                | Frame::Resource { .. }
+                | Frame::Member
+                | Frame::Collection
+                | Frame::Nested
+        )
+    });
+    let in_plural_resources =
+        scope_level.is_some_and(|i| matches!(w.stack[i], Frame::Resources { .. }));
+    if in_plural_resources && let Some(body) = block_body {
+        w.stack.push(Frame::Nested);
+        walk_stmt(body, w);
+        w.stack.pop();
+    } else if block_body.is_some() || !args.is_empty() {
+        w.escape(EscapeKind::Other("nested".to_string()));
+    }
+}
 
 fn handle_concern_def<'a>(args: &[Node], block_body: Option<&'a Node>, w: &mut Walker<'a>) {
     let positionals = positional_args(args);
@@ -2714,6 +2758,101 @@ mod tests {
         );
     }
 
+    fn assert_identity(r: &RouteScanReport) {
+        let sum = r.entries_emitted
+            + r.entries_without_stem
+            + r.escaped_redirects
+            + r.escaped_mounts
+            + r.escaped_procs
+            + r.escaped_via_all
+            + r.escaped_dynamic
+            + r.escaped_other_calls.len();
+        assert_eq!(r.declared_routes, sum, "{r:?}");
+    }
+
+    /// Inside a `resources` block Rails wraps child resources and naked
+    /// verbs in `nested` itself, so an explicit `nested do … end` declares
+    /// the same routes as its statements written directly in the block.
+    #[test]
+    fn nested_in_resources_block_is_transparent() {
+        let (plain, plain_report) = table_from(
+            "nested_plain",
+            concat!(
+                "  resources :photos do\n",
+                "    get :preview, on: :member\n",
+                "    resources :comments, only: %i[index]\n",
+                "    get :search\n",
+                "  end\n",
+            ),
+        );
+        let (wrapped, wrapped_report) = table_from(
+            "nested_wrapped",
+            concat!(
+                "  resources :photos do\n",
+                "    get :preview, on: :member\n",
+                "    nested do\n",
+                "      resources :comments, only: %i[index]\n",
+                "      get :search\n",
+                "    end\n",
+                "  end\n",
+            ),
+        );
+        assert!(plain.entries.len() > 7, "{:?}", plain.entries);
+        assert_eq!(plain.entries, wrapped.entries);
+        assert_eq!(wrapped_report.escaped_other_calls, Vec::<String>::new());
+        assert_eq!(plain_report.declared_routes, wrapped_report.declared_routes);
+        assert_identity(&plain_report);
+        assert_identity(&wrapped_report);
+    }
+
+    /// Outside a plural resource scope `nested` stays one escaped call:
+    /// at top level and under `scope` Rails raises, and in a singular
+    /// `resource` or under `member` its naming differs from writing the
+    /// statements directly (`nested` there is not what `resource` wraps a
+    /// naked verb in), which this arm does not model.
+    #[test]
+    fn nested_outside_a_plural_resource_scope_stays_escaped() {
+        let cases: [(&str, &str); 5] = [
+            (
+                "nested_top",
+                "  nested do\n    resources :comments, only: %i[index]\n  end\n",
+            ),
+            (
+                "nested_scope",
+                "  scope :admin do\n    nested do\n      get :x, to: \"a#b\"\n    end\n  end\n",
+            ),
+            (
+                "nested_singular",
+                "  resource :profile do\n    nested do\n      get :x\n    end\n  end\n",
+            ),
+            (
+                "nested_member",
+                "  resources :photos do\n    member do\n      nested do\n        get :x\n      end\n    end\n  end\n",
+            ),
+            (
+                "nested_twice",
+                "  resources :photos do\n    nested do\n      nested do\n        get :x\n      end\n    end\n  end\n",
+            ),
+        ];
+        for (case, body) in cases {
+            let (t, r) = table_from(case, body);
+            assert_eq!(r.escaped_other_calls, vec!["nested".to_string()], "{case}");
+            assert_eq!(r.escaped_other, vec!["nested".to_string()], "{case}");
+            assert!(
+                t.entries.iter().all(|e| e.action != "x"),
+                "{case}: the body of an escaped `nested` is not walked: {:?}",
+                t.entries
+            );
+            assert_identity(&r);
+        }
+        let (t, r) = table_from(
+            "nested_top_only",
+            "  nested do\n    resources :comments\n  end\n",
+        );
+        assert!(t.entries.is_empty());
+        assert_eq!(r.declared_routes, 1);
+    }
+
     /// F(7) — singular `resource` (six routes, pluralised controller).
     #[test]
     fn singular_resource_six_routes_pluralized_controller() {
@@ -2992,10 +3131,24 @@ mod tests {
         );
     }
 
+    /// Prints the routes report for the checkout named by `OPENPROJECT_SRC`.
+    #[test]
+    #[ignore = "needs an OpenProject checkout in OPENPROJECT_SRC"]
+    #[allow(clippy::print_stderr)]
+    fn openproject_routes_report() {
+        let Ok(root) = std::env::var("OPENPROJECT_SRC") else {
+            return;
+        };
+        let (table, report) = extract_routes_with_report(Path::new(&root), "openproject");
+        assert_identity(&report);
+        eprintln!("{report:#?}\nentries={}", table.entries.len());
+    }
+
     /// §7 / F1 — the corpus drift fuse. Env-gated (`RAILS_CORPUS_SRC`),
     /// self-skipping so CI doesn't require the `OpenProject` checkout.
     /// Assertions per the frozen v3 pre-registered census — narrow-only
-    /// after a first green run, per F1's own discipline.
+    /// after a first green run, per F1's own discipline. The pinned numbers
+    /// are measured on `OpenProject` dev at 27251944.
     #[test]
     #[allow(clippy::print_stderr)]
     fn corpus_drift_fuse_against_real_openproject_routes() {
@@ -3006,20 +3159,21 @@ mod tests {
         let (table, report) =
             extract_routes_with_report(std::path::Path::new(&root), "openproject");
 
-        assert_eq!(report.files_scanned, 29, "files_scanned");
+        assert_eq!(report.files_scanned, 32, "files_scanned");
         assert_eq!(report.escaped_mounts, 9, "escaped_mounts");
         assert_eq!(report.escaped_via_all, 6, "escaped_via_all");
-        // `escaped_dynamic` is the MEASURED count (13), not R3's pre-registration
+        // `escaped_dynamic` is the MEASURED count (14), not R3's pre-registration
         // of 2 — that estimate grep-counted the two `.each` loop *sites*, but the
         // faithful walker counts every route *declaration* it conservatively
         // declines rather than emit a wrong fact: the two interpolated `.each`
         // bodies (config `workspace_type`/`revision` loops) plus module routes
         // carrying a non-literal-shaped `action:`/path alongside benign unknown
-        // kwargs (`work_package_split_view:`, a `defaults:` hash) in calendar
-        // (4), team_planner (4), boards (1), backlogs (1). All are counted, none
-        // silently dropped (honest denominator). Tightening their classification
-        // so more emit a fact is tracked as follow-up polish, not a fact bug.
-        assert_eq!(report.escaped_dynamic, 13, "escaped_dynamic (measured)");
+        // kwargs (`work_package_split_view:`, a `defaults:` hash). All are
+        // counted, none silently dropped (honest denominator). Tightening their
+        // classification so more emit a fact is tracked as follow-up polish, not
+        // a fact bug. One of the 14 only became visible once `nested do … end`
+        // in a `resources` block was walked instead of escaped.
+        assert_eq!(report.escaped_dynamic, 14, "escaped_dynamic (measured)");
         // `escaped_other` is the unknown-DSL-call allowlist: exactly the
         // Doorkeeper OAuth macro. A known verb must NEVER appear here (that was
         // the pre-fix bug where a bare `get`/`post` with no resolvable controller
@@ -3029,11 +3183,7 @@ mod tests {
             vec!["use_doorkeeper".to_string()],
             "escaped_other must be exactly the Doorkeeper macro — no verb leakage"
         );
-        assert!(
-            report.declared_routes >= 974,
-            "declared_routes {} below the 974 floor (156 resources + 110 resource + 708 verb-calls)",
-            report.declared_routes
-        );
+        assert_eq!(report.declared_routes, 2058, "declared_routes (measured)");
 
         // Spot-checks with a confidently-derivable controller#action.
         let spot: &[(&str, RouteVerb, &str, &str)] = &[
