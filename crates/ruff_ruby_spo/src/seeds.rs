@@ -275,11 +275,24 @@ impl Visitor for AssignedLocals {
 
     // A method, class or module body has its own local scope: its assignments
     // never touch the enclosing locals.
+    // Header expressions (a superclass, a `def self.` or `class <<` target)
+    // still run in the enclosing scope, so they are visited.
     fn on_def(&mut self, _: &DefNode) {}
-    fn on_defs(&mut self, _: &DefsNode) {}
-    fn on_class(&mut self, _: &ClassNode) {}
-    fn on_module(&mut self, _: &ModuleNode) {}
-    fn on_s_class(&mut self, _: &SclassNode) {}
+    fn on_defs(&mut self, node: &DefsNode) {
+        self.visit(&node.definee);
+    }
+    fn on_class(&mut self, node: &ClassNode) {
+        self.visit(&node.name);
+        if let Some(superclass) = node.superclass.as_deref() {
+            self.visit(superclass);
+        }
+    }
+    fn on_module(&mut self, node: &ModuleNode) {
+        self.visit(&node.name);
+    }
+    fn on_s_class(&mut self, node: &SclassNode) {
+        self.visit(&node.expr);
+    }
 }
 
 /// A visitor hook that counts an enclosing construct for [`Collector::depth`].
@@ -997,6 +1010,38 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&root);
         assert_eq!(only_kwargs(&rows[0])[0], (sym("role"), SeedValue::Int(1)));
+    }
+
+    #[test]
+    fn an_assignment_in_a_class_header_unbinds_the_enclosing_local() {
+        let root = scratch_dir("t_class_header");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("seed.rb"),
+            "r = 1\n2.times do\n  Setting.create_if_not_exists(role: r)\n  class Example < (r = 2; Object)\n  end\nend\n",
+        )
+        .unwrap();
+        let options = SeedOptions {
+            follow_locals: true,
+            ..Default::default()
+        };
+        let (rows, _) = extract_seed_rows_with(
+            &root,
+            &["seed.rb"],
+            &[spec("Setting", "create_if_not_exists")],
+            &options,
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            only_kwargs(&rows[0])[0],
+            (
+                sym("role"),
+                SeedValue::Unresolved {
+                    source: "r".to_string()
+                }
+            )
+        );
     }
 
     #[test]
