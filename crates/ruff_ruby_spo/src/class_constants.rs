@@ -92,13 +92,13 @@ pub fn extract_class_constants(
         report.files_scanned += 1;
         let lowerer = Lowerer::new(&src, options);
         let mut found = Vec::new();
-        report.classes_seen += walk_class_bodies(&ast, &lowerer, |class, _, stmt| {
+        report.classes_seen += walk_class_bodies(&ast, &lowerer, |scope, stmt| {
             if let Node::Casgn(assign) = stmt
                 && assign.scope.is_none()
                 && let Some(value) = assign.value.as_deref()
             {
                 found.push(ClassConstantRow {
-                    class: class.to_string(),
+                    class: scope.class.to_string(),
                     name: assign.name.clone(),
                     file: (*rel).to_string(),
                     line: lowerer.line_of(assign.expression_l.begin),

@@ -50,6 +50,10 @@ pub struct ClassMacroRow {
     pub class: String,
     /// Constant path of `< X` when the class declares a literal one.
     pub superclass: Option<String>,
+    /// Ruby's `Module.nesting` at the class, innermost first: the class itself,
+    /// then each enclosing module or class. The superclass is evaluated in
+    /// `nesting[1..]`; constants in the body resolve in `nesting`.
+    pub nesting: Vec<String>,
     pub file: String,
     /// 1-based line of the call.
     pub line: u32,
@@ -105,8 +109,8 @@ pub fn extract_class_macros(
             names,
             rows: Vec::new(),
         };
-        report.classes_seen += walk_class_bodies(&ast, &lowerer, |class, superclass, stmt| {
-            collector.statement(class, superclass, stmt);
+        report.classes_seen += walk_class_bodies(&ast, &lowerer, |scope, stmt| {
+            collector.statement(&scope, stmt);
         });
         for row in collector.rows {
             let unresolved = row.args.iter().map(count_unresolved).sum::<usize>();
@@ -123,13 +127,29 @@ pub fn extract_class_macros(
     (rows, report)
 }
 
+/// The class a walked statement sits in.
+pub(crate) struct ClassScope<'a> {
+    /// Full constant path of the class or module.
+    pub class: &'a str,
+    pub superclass: Option<&'a String>,
+    /// The opened scopes, outermost first, the class itself last.
+    pub nesting: &'a [String],
+}
+
+impl ClassScope<'_> {
+    /// `nesting` in Ruby's `Module.nesting` order: innermost first.
+    pub(crate) fn module_nesting(&self) -> Vec<String> {
+        self.nesting.iter().rev().cloned().collect()
+    }
+}
+
 /// The class walk shared by the arms that read a class body's direct
-/// statements: calls `on_statement(class_path, superclass, statement)` for each
-/// direct statement of every class and module, nested ones included, and
-/// returns how many classes and modules were seen.
+/// statements: calls `on_statement(scope, statement)` for each direct
+/// statement of every class and module, nested ones included, and returns how
+/// many classes and modules were seen.
 pub(crate) fn walk_class_bodies<F>(ast: &Node, lowerer: &Lowerer<'_>, on_statement: F) -> usize
 where
-    F: FnMut(&str, Option<&String>, &Node),
+    F: FnMut(ClassScope<'_>, &Node),
 {
     let mut walker = ClassWalker {
         lowerer,
@@ -149,7 +169,7 @@ struct ClassWalker<'a, 'b, F> {
     classes_seen: usize,
 }
 
-impl<F: FnMut(&str, Option<&String>, &Node)> Visitor for ClassWalker<'_, '_, F> {
+impl<F: FnMut(ClassScope<'_>, &Node)> Visitor for ClassWalker<'_, '_, F> {
     fn on_class(&mut self, node: &ClassNode) {
         self.visit(&node.name);
         if let Some(superclass) = node.superclass.as_deref() {
@@ -167,7 +187,7 @@ impl<F: FnMut(&str, Option<&String>, &Node)> Visitor for ClassWalker<'_, '_, F> 
     }
 }
 
-impl<F: FnMut(&str, Option<&String>, &Node)> ClassWalker<'_, '_, F> {
+impl<F: FnMut(ClassScope<'_>, &Node)> ClassWalker<'_, '_, F> {
     /// Push the declared name onto the path, then report each direct statement
     /// and visit it before the next, so nested classes keep source order; the
     /// caller pops.
@@ -179,20 +199,28 @@ impl<F: FnMut(&str, Option<&String>, &Node)> ClassWalker<'_, '_, F> {
         };
         self.path.push(full);
         self.classes_seen += 1;
-        let class = self.path.last().map_or("", String::as_str).to_string();
         match body {
             Some(Node::Begin(b)) => {
                 for stmt in &b.statements {
-                    (self.on_statement)(&class, superclass, stmt);
+                    self.report(superclass, stmt);
                     self.visit(stmt);
                 }
             }
             Some(stmt) => {
-                (self.on_statement)(&class, superclass, stmt);
+                self.report(superclass, stmt);
                 self.visit(stmt);
             }
             None => {}
         }
+    }
+
+    fn report(&mut self, superclass: Option<&String>, stmt: &Node) {
+        let scope = ClassScope {
+            class: self.path.last().map_or("", String::as_str),
+            superclass,
+            nesting: &self.path,
+        };
+        (self.on_statement)(scope, stmt);
     }
 }
 
@@ -217,9 +245,9 @@ struct Collector<'a> {
 }
 
 impl Collector<'_> {
-    fn statement(&mut self, class: &str, superclass: Option<&String>, stmt: &Node) {
+    fn statement(&mut self, scope: &ClassScope<'_>, stmt: &Node) {
         match stmt {
-            Node::Send(_) => self.row(class, stmt, None, superclass),
+            Node::Send(_) => self.row(scope, stmt, None),
             Node::Block(Block {
                 call,
                 begin_l,
@@ -232,26 +260,21 @@ impl Collector<'_> {
                     .as_bytes()
                     .get(begin_l.begin..end_l.end)
                     .map(|b| String::from_utf8_lossy(b).into_owned());
-                self.row(class, call, block, superclass);
+                self.row(scope, call, block);
             }
             _ => {}
         }
     }
 
-    fn row(
-        &mut self,
-        class: &str,
-        call: &Node,
-        block: Option<String>,
-        superclass: Option<&String>,
-    ) {
+    fn row(&mut self, scope: &ClassScope<'_>, call: &Node, block: Option<String>) {
         let Node::Send(send) = call else { return };
         if send.recv.is_some() || !self.names.contains(&send.method_name.as_str()) {
             return;
         }
         self.rows.push(ClassMacroRow {
-            class: class.to_string(),
-            superclass: superclass.cloned(),
+            class: scope.class.to_string(),
+            superclass: scope.superclass.cloned(),
+            nesting: scope.module_nesting(),
             file: self.file.to_string(),
             line: self.lowerer.line_of(send.expression_l.begin),
             name: send.method_name.clone(),
@@ -363,6 +386,33 @@ mod tests {
         assert_eq!(rows[0].class, "A::B::C");
         assert_eq!(rows[0].superclass, None);
         assert_eq!(report.classes_seen, 2);
+    }
+
+    #[test]
+    fn nesting_tells_a_nested_class_from_the_compact_form() {
+        let nested =
+            "module Queries\n  class UpdateContract < BaseContract\n    permit :x\n  end\nend\n";
+        let (rows, _) = scan("nest1", nested, &["permit"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].superclass.as_deref(), Some("BaseContract"));
+        assert_eq!(rows[0].nesting, ["Queries::UpdateContract", "Queries"]);
+
+        let compact = "class Queries::UpdateContract < BaseContract\n  permit :x\nend\n";
+        let (rows, _) = scan("nest2", compact, &["permit"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].nesting, ["Queries::UpdateContract"]);
+    }
+
+    #[test]
+    fn nesting_lists_every_open_scope_and_stops_at_an_absolute_name() {
+        let deep = "module A\n  module B\n    class C\n      permit :x\n    end\n  end\nend\n";
+        let (rows, _) = scan("nest3", deep, &["permit"]);
+        assert_eq!(rows[0].nesting, ["A::B::C", "A::B", "A"]);
+
+        let absolute = "module A\n  class ::D\n    permit :x\n  end\nend\n";
+        let (rows, _) = scan("nest4", absolute, &["permit"]);
+        assert_eq!(rows[0].class, "D");
+        assert_eq!(rows[0].nesting, ["D", "A"]);
     }
 
     #[test]
