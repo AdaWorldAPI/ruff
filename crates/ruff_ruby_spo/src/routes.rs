@@ -47,10 +47,12 @@
 //! A stem this arm emits MUST be one Rails actually generates, else it
 //! emits no triple and counts the miss — never a guess.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use lib_ruby_parser::nodes::{Lvasgn, Send as SendNode};
+use lib_ruby_parser::traverse::visitor::{Visitor, visit_lvasgn, visit_send};
 use lib_ruby_parser::{Node, Parser, ParserOptions};
 use ruff_spo_triplet::{Predicate, Provenance, Triple};
 
@@ -161,6 +163,14 @@ pub struct RouteEntry {
     pub scope: RouteScopeKind,
     /// Path relative to the corpus root, `/`-joined.
     pub file: String,
+    /// The URL path this route is mounted at, with the enclosing
+    /// `namespace`/`scope` path prefix applied (`"/api/v1/tickets/:id"`).
+    /// `Some` only for a standalone verb call (or `root`) whose path is a
+    /// string literal or resolves statically (see [`RouteScanReport`]);
+    /// `None` for routes under `resources`/`resource` (their path also
+    /// carries the resource segments, which this arm does not compose) and
+    /// for symbol-only declarations. Independent of [`Self::stem`].
+    pub path: Option<String>,
 }
 
 /// The full set of routes harvested from one corpus. `resolve` is THE
@@ -189,11 +199,28 @@ impl RouteTable {
 /// [`crate::navigation::NavScanReport`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteScanReport {
-    /// `config/routes.rb` + every `modules/*/config/routes.rb` found.
+    /// `config/routes.rb`, every `modules/*/config/routes.rb` found, plus
+    /// every file reached from those through a load idiom
+    /// ([`Self::files_loaded`]). Each file is scanned once.
     pub files_scanned: usize,
+    /// The subset of [`Self::files_scanned`] reached through a load idiom
+    /// (`Dir.glob(…).each { load … }`, `require`, `require_dependency`, or
+    /// `draw(:name)`) rather than being a root or module routes file.
+    pub files_loaded: usize,
+    /// Load sites whose target files could not be determined statically: a
+    /// `Dir.glob`/`Dir[]` argument that is not a literal or a resolvable
+    /// interpolation (or that points outside the corpus), a `draw` with a
+    /// non-literal name, and a `draw(:name)` whose file does not exist. A
+    /// glob that is resolvable but matches nothing is not an escape. These
+    /// are load sites, not route declarations, so they sit outside the
+    /// `declared_routes` identity below.
+    pub escaped_route_loads: usize,
     /// Every route-declaration unit processed (one per verb — a
     /// `via: [:get, :post]` expands to two; `via: :all` is one opaque
-    /// site) — the total the identity in [`Self`]'s doc balances against.
+    /// site). Balances as `declared_routes == entries_emitted +
+    /// entries_without_stem + escaped_redirects + escaped_mounts +
+    /// escaped_procs + escaped_via_all + escaped_dynamic +
+    /// escaped_other.len()`.
     pub declared_routes: usize,
     /// [`RouteEntry`] records with `stem.is_some()` — the triple-emitting
     /// subset.
@@ -207,10 +234,16 @@ pub struct RouteScanReport {
     pub escaped_via_all: usize,
     /// Non-literal name/path/`as:`/`controller:`/`action:`/`to:` values —
     /// a route whose target can't be statically resolved (`.each` loops,
-    /// non-literal kwarg values).
+    /// non-literal kwarg values). A standalone route path counts as
+    /// resolvable when it is a literal, a local variable assigned a
+    /// resolvable string, `Rails.configuration.<x>` /
+    /// `Rails.application.config.<x>` set to a literal in
+    /// `config/application.rb`, a `+` chain of resolvable parts, or an
+    /// interpolation of resolvable parts; anything else lands here.
     pub escaped_dynamic: usize,
-    /// Unknown DSL call names, deduped (never `direct`/`resolve`/`draw` —
-    /// zero corpus occurrences, per the frozen spec's non-goals).
+    /// Unknown DSL call names, deduped (never `direct`/`resolve` — zero
+    /// corpus occurrences, per the frozen spec's non-goals; `draw` is a
+    /// load idiom, see [`Self::escaped_route_loads`]).
     pub escaped_other: Vec<String>,
     /// A later declaration reusing an already-seen (stem, verb) with a
     /// DIFFERENT controller#action — the entry stays in `entries`, but no
@@ -220,7 +253,8 @@ pub struct RouteScanReport {
 }
 
 /// Scan `<root>/config/routes.rb` + every `<root>/modules/*/config/
-/// routes.rb`. Thin wrapper over [`extract_routes_with_report`].
+/// routes.rb`, and every file those load. Thin wrapper over
+/// [`extract_routes_with_report`].
 #[must_use]
 pub fn extract_routes(root: &Path, namespace: &str) -> RouteTable {
     extract_routes_with_report(root, namespace).0
@@ -235,23 +269,117 @@ pub fn extract_routes(root: &Path, namespace: &str) -> RouteTable {
 /// namespace-free (bare stems), so it is not consumed inside this scan.
 #[must_use]
 pub fn extract_routes_with_report(root: &Path, _namespace: &str) -> (RouteTable, RouteScanReport) {
-    let mut table = RouteTable::default();
-    let mut report = RouteScanReport::default();
-    let mut seen_stem_verb: Vec<(String, RouteVerb, String)> = Vec::new();
-
+    let mut scan = Scan {
+        root,
+        config: read_app_config(root),
+        table: RouteTable::default(),
+        report: RouteScanReport::default(),
+        seen_stem_verb: Vec::new(),
+        visited: HashSet::new(),
+    };
     for path in collect_route_files(root) {
-        let Ok(src) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let rel = relative_path(root, &path);
-        report.files_scanned += 1;
-        walk_route_file(&src, &rel, &mut table, &mut report, &mut seen_stem_verb);
+        scan.scan_file(&path, false);
     }
+    let Scan {
+        table, mut report, ..
+    } = scan;
     report.entries_emitted = table.entries.iter().filter(|e| e.stem.is_some()).count();
     report.entries_without_stem = table.entries.iter().filter(|e| e.stem.is_none()).count();
     report.escaped_other.sort();
     report.escaped_other.dedup();
     (table, report)
+}
+
+struct Scan<'r> {
+    root: &'r Path,
+    config: HashMap<String, String>,
+    table: RouteTable,
+    report: RouteScanReport,
+    seen_stem_verb: Vec<(String, RouteVerb, String)>,
+    /// Canonicalised paths already scanned, so a file reached twice (two
+    /// globs, a glob plus `draw`, a root file that is also loaded) is
+    /// scanned once.
+    visited: HashSet<PathBuf>,
+}
+
+impl Scan<'_> {
+    /// Scan `path` unless already scanned, then the files it loads.
+    fn scan_file(&mut self, path: &Path, loaded: bool) {
+        let key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if self.visited.contains(&key) {
+            return;
+        }
+        let Ok(src) = fs::read_to_string(path) else {
+            return;
+        };
+        self.visited.insert(key);
+        let rel = relative_path(self.root, path);
+        self.report.files_scanned += 1;
+        if loaded {
+            self.report.files_loaded += 1;
+        }
+        let file_dir = path.parent().unwrap_or(self.root).to_path_buf();
+        let Some(ast) = parse_source(&src, &rel) else {
+            return;
+        };
+        let env = StrEnv::new(&self.config, &file_dir, self.root);
+        if let Some(body) = find_draw_body(&ast) {
+            let mut w = Walker {
+                file: rel,
+                stack: Vec::new(),
+                concerns: HashMap::new(),
+                entries: &mut self.table.entries,
+                report: &mut self.report,
+                seen: &mut self.seen_stem_verb,
+                env,
+            };
+            walk_stmt(body, &mut w);
+        }
+        let discovery = discover_loads(&ast, StrEnv::new(&self.config, &file_dir, self.root));
+        let mut targets = Vec::new();
+        if discovery.has_load_call {
+            for glob in &discovery.globs {
+                match glob
+                    .as_deref()
+                    .and_then(|pattern| expand_glob(pattern, &file_dir))
+                {
+                    Some(found) => targets.extend(found),
+                    None => self.report.escaped_route_loads += 1,
+                }
+            }
+        }
+        for name in &discovery.draws {
+            let target = name
+                .as_deref()
+                .map(|n| self.root.join("config/routes").join(format!("{n}.rb")))
+                .filter(|p| p.is_file());
+            match target {
+                Some(t) => targets.push(t),
+                None => self.report.escaped_route_loads += 1,
+            }
+        }
+        let canonical_root =
+            fs::canonicalize(self.root).unwrap_or_else(|_| self.root.to_path_buf());
+        for target in targets {
+            let inside = fs::canonicalize(&target)
+                .map(|c| c.starts_with(&canonical_root))
+                .unwrap_or(false);
+            if inside {
+                self.scan_file(&target, true);
+            } else {
+                self.report.escaped_route_loads += 1;
+            }
+        }
+    }
+}
+
+fn parse_source(src: &str, file: &str) -> Option<Node> {
+    let options = ParserOptions {
+        buffer_name: file.to_string(),
+        ..Default::default()
+    };
+    let parser = Parser::new(src.as_bytes().to_vec(), options);
+    parser.do_parse().ast.map(|b| *b)
 }
 
 /// `<root>/config/routes.rb` + every `<root>/modules/*/config/routes.rb`,
@@ -272,6 +400,263 @@ fn collect_route_files(root: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Static string resolution + load discovery
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What a route-path expression can be resolved against: local variables
+/// assigned a resolvable string so far, literal `config.<x> = '…'`
+/// assignments from `config/application.rb`, and the file's location.
+struct StrEnv<'a> {
+    locals: HashMap<String, String>,
+    config: &'a HashMap<String, String>,
+    file_dir: String,
+    root: String,
+}
+
+impl<'a> StrEnv<'a> {
+    fn new(config: &'a HashMap<String, String>, file_dir: &Path, root: &Path) -> Self {
+        Self {
+            locals: HashMap::new(),
+            config,
+            file_dir: file_dir.to_string_lossy().into_owned(),
+            root: root.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Record `name = value`: a resolvable string is remembered, anything
+    /// else forgets an earlier binding so a stale value is never reused.
+    fn assign(&mut self, name: &str, value: Option<&Node>) {
+        match value.and_then(|v| eval_str(v, self)) {
+            Some(resolved) => {
+                self.locals.insert(name.to_string(), resolved);
+            }
+            None => {
+                self.locals.remove(name);
+            }
+        }
+    }
+}
+
+/// `Rails.configuration` / `Rails.application.config`.
+fn is_rails_config(node: &Node) -> bool {
+    let Node::Send(s) = node else { return false };
+    match (s.recv.as_deref(), s.method_name.as_str()) {
+        (Some(Node::Const(c)), "configuration") => c.name == "Rails" && c.scope.is_none(),
+        (Some(Node::Send(app)), "config") => {
+            app.method_name == "application"
+                && matches!(app.recv.as_deref(), Some(Node::Const(c)) if c.name == "Rails")
+        }
+        _ => false,
+    }
+}
+
+fn is_const_named(node: Option<&Node>, name: &str) -> bool {
+    matches!(node, Some(Node::Const(c)) if c.name == name && c.scope.is_none())
+}
+
+/// Statically evaluate `node` to a string: a literal, a bound local, an
+/// interpolation or `+` chain of resolvable parts, a literal
+/// `Rails.configuration.<x>` setting, or the file-location idioms
+/// (`__dir__`, `File.expand_path(<resolvable>)`, `Rails.root.join(…)`).
+/// `None` means "not statically resolvable" — never a guess.
+fn eval_str(node: &Node, env: &StrEnv<'_>) -> Option<String> {
+    match node {
+        Node::Str(s) => Some(s.value.to_string_lossy()),
+        Node::Dstr(d) => d
+            .parts
+            .iter()
+            .map(|part| eval_str(part, env))
+            .collect::<Option<String>>(),
+        Node::Begin(b) => match b.statements.as_slice() {
+            [only] => eval_str(only, env),
+            _ => None,
+        },
+        Node::Lvar(l) => env.locals.get(&l.name).cloned(),
+        Node::Send(s) => match (s.recv.as_deref(), s.method_name.as_str(), s.args.as_slice()) {
+            (Some(lhs), "+", [rhs]) => Some(eval_str(lhs, env)? + &eval_str(rhs, env)?),
+            (Some(recv), name, []) if is_rails_config(recv) => env.config.get(name).cloned(),
+            (None, "__dir__", []) => Some(env.file_dir.clone()),
+            (recv, "expand_path", [arg]) if is_const_named(recv, "File") => eval_str(arg, env),
+            (Some(Node::Send(root)), "join", parts)
+                if root.method_name == "root"
+                    && is_const_named(root.recv.as_deref(), "Rails")
+                    && !parts.is_empty() =>
+            {
+                let mut joined = env.root.clone();
+                for part in parts {
+                    joined.push('/');
+                    joined.push_str(eval_str(part, env)?.trim_matches('/'));
+                }
+                Some(joined)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `config.<x> = '<literal>'` assignments in `<root>/config/application.rb`,
+/// read once. Only literal right-hand sides are kept.
+fn read_app_config(root: &Path) -> HashMap<String, String> {
+    struct Collect(HashMap<String, String>);
+    impl Visitor for Collect {
+        fn on_send(&mut self, node: &SendNode) {
+            if let (Some(recv), Some(name), [value]) = (
+                node.recv.as_deref(),
+                node.method_name.strip_suffix('='),
+                node.args.as_slice(),
+            ) && matches!(recv, Node::Send(c) if c.recv.is_none() && c.method_name == "config")
+                && let Node::Str(lit) = value
+            {
+                self.0.insert(name.to_string(), lit.value.to_string_lossy());
+            }
+            visit_send(self, node);
+        }
+    }
+    let mut collect = Collect(HashMap::new());
+    if let Ok(src) = fs::read_to_string(root.join("config/application.rb"))
+        && let Some(ast) = parse_source(&src, "config/application.rb")
+    {
+        collect.visit(&ast);
+    }
+    collect.0
+}
+
+/// Load idioms found in one routes file, in source order.
+#[derive(Default)]
+struct LoadDiscovery {
+    /// A bare `load`/`require`/`require_dependency` call occurs somewhere in
+    /// the file; only then are its `Dir.glob` results treated as loaded.
+    has_load_call: bool,
+    /// Every `Dir.glob(…)`/`Dir[…]` pattern; `None` when unresolvable.
+    globs: Vec<Option<String>>,
+    /// Every bare `draw(:name)`; `None` for a non-literal name.
+    draws: Vec<Option<String>>,
+}
+
+struct LoadFinder<'a> {
+    env: StrEnv<'a>,
+    found: LoadDiscovery,
+}
+
+impl Visitor for LoadFinder<'_> {
+    fn on_lvasgn(&mut self, node: &Lvasgn) {
+        visit_lvasgn(self, node);
+        self.env.assign(&node.name, node.value.as_deref());
+    }
+
+    fn on_send(&mut self, node: &SendNode) {
+        match (node.recv.as_deref(), node.method_name.as_str()) {
+            (None, "load" | "require" | "require_dependency") => {
+                self.found.has_load_call = true;
+            }
+            (None, "draw") if !node.args.is_empty() => {
+                let name = node.args.first().and_then(sym_or_str);
+                self.found.draws.push(name);
+            }
+            (recv, "glob" | "[]") if is_const_named(recv, "Dir") => {
+                let pattern = node.args.first().and_then(|a| eval_str(a, &self.env));
+                self.found.globs.push(pattern);
+            }
+            _ => {}
+        }
+        visit_send(self, node);
+    }
+}
+
+fn discover_loads(ast: &Node, env: StrEnv<'_>) -> LoadDiscovery {
+    let mut finder = LoadFinder {
+        env,
+        found: LoadDiscovery::default(),
+    };
+    finder.visit(ast);
+    finder.found
+}
+
+/// Expand a literal glob (`*` and `**` only; a relative pattern is taken
+/// relative to `base`) to the sorted files it matches. `None` for syntax
+/// this does not model (`?`, `[…]`, `{…}`), so the caller counts an escape
+/// instead of guessing.
+fn expand_glob(pattern: &str, base: &Path) -> Option<Vec<PathBuf>> {
+    if pattern.contains(['?', '[', '{']) {
+        return None;
+    }
+    let absolute = Path::new(pattern).is_absolute();
+    let mut fixed = if absolute {
+        PathBuf::from("/")
+    } else {
+        base.to_path_buf()
+    };
+    let components: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty()).collect();
+    let first_wild = components
+        .iter()
+        .position(|c| c.contains('*'))
+        .unwrap_or(components.len());
+    for c in &components[..first_wild] {
+        fixed.push(c);
+    }
+    let mut out = Vec::new();
+    glob_walk(&fixed, &components[first_wild..], &mut out);
+    out.sort();
+    out.dedup();
+    Some(out)
+}
+
+fn glob_walk(dir: &Path, rest: &[&str], out: &mut Vec<PathBuf>) {
+    let Some((head, tail)) = rest.split_first() else {
+        if dir.is_file() {
+            out.push(dir.to_path_buf());
+        }
+        return;
+    };
+    if !head.contains('*') {
+        glob_walk(&dir.join(head), tail, out);
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    children.sort();
+    if *head == "**" {
+        glob_walk(dir, tail, out);
+        for child in children.iter().filter(|c| c.is_dir()) {
+            let hidden = child
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+            if !hidden {
+                glob_walk(child, rest, out);
+            }
+        }
+        return;
+    }
+    for child in children {
+        let Some(name) = child.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if (!name.starts_with('.') || head.starts_with('.')) && wildcard_match(head, &name) {
+            glob_walk(&child, tail, out);
+        }
+    }
+}
+
+/// `*`-only wildcard match of one path component.
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let Some((first, rest)) = pattern.split_once('*') else {
+        return pattern == name;
+    };
+    let Some(after_first) = name.strip_prefix(first) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    (0..=after_first.len())
+        .filter(|i| after_first.is_char_boundary(*i))
+        .any(|i| wildcard_match(rest, &after_first[i..]))
 }
 
 fn relative_path(root: &Path, path: &Path) -> String {
@@ -311,6 +696,7 @@ enum Frame {
         as_prefix: Option<String>,
         module: Option<String>,
         controller: Option<String>,
+        path: Option<String>,
     },
     Controller {
         name: String,
@@ -358,6 +744,32 @@ fn controller_prefix(stack: &[Frame]) -> String {
     } else {
         format!("{}/", parts.join("/"))
     }
+}
+
+/// `path_prefix` — outer→inner join (`/`) of every `Namespace.name` and
+/// `Scope.path` (Some only), with a leading `/` and no trailing one (empty
+/// when no contributor).
+fn path_prefix(stack: &[Frame]) -> String {
+    let mut out = String::new();
+    for f in stack {
+        let part = match f {
+            Frame::Namespace { name } => name,
+            Frame::Scope { path: Some(p), .. } => p,
+            _ => continue,
+        };
+        let trimmed = part.trim_matches('/');
+        if !trimmed.is_empty() {
+            out.push('/');
+            out.push_str(trimmed);
+        }
+    }
+    out
+}
+
+/// Mount `path` under `prefix` (the output of [`path_prefix`]), always
+/// rooted at `/`.
+fn join_path(prefix: &str, path: &str) -> String {
+    format!("{prefix}/{}", path.trim_start_matches('/'))
 }
 
 /// `ambient_controller` — innermost `Controller.name` frame, or innermost
@@ -441,6 +853,9 @@ struct Walker<'a> {
     /// Running (stem, verb) → "controller#action" ledger for the C3
     /// duplicate-conflict tie-break.
     seen: &'a mut Vec<(String, RouteVerb, String)>,
+    /// Local string variables and `application.rb` settings that route
+    /// paths resolve against.
+    env: StrEnv<'a>,
 }
 
 impl Walker<'_> {
@@ -456,6 +871,7 @@ impl Walker<'_> {
         controller: String,
         action: String,
         scope: RouteScopeKind,
+        path: Option<String>,
     ) {
         self.report.declared_routes += 1;
         if let Some(s) = &stem {
@@ -475,6 +891,7 @@ impl Walker<'_> {
             action,
             scope,
             file: self.file.clone(),
+            path,
         });
     }
 
@@ -489,35 +906,6 @@ impl Walker<'_> {
             EscapeKind::Other(name) => self.report.escaped_other.push(name),
         }
     }
-}
-
-fn walk_route_file(
-    src: &str,
-    file: &str,
-    table: &mut RouteTable,
-    report: &mut RouteScanReport,
-    seen: &mut Vec<(String, RouteVerb, String)>,
-) {
-    let options = ParserOptions {
-        buffer_name: file.to_string(),
-        ..Default::default()
-    };
-    let parser = Parser::new(src.as_bytes().to_vec(), options);
-    let Some(ast) = parser.do_parse().ast.map(|b| *b) else {
-        return;
-    };
-    let Some(body) = find_draw_body(&ast) else {
-        return;
-    };
-    let mut w = Walker {
-        file: file.to_string(),
-        stack: Vec::new(),
-        concerns: HashMap::new(),
-        entries: &mut table.entries,
-        report,
-        seen,
-    };
-    walk_stmt(body, &mut w);
 }
 
 /// Find `Rails.application.routes.draw do … end`'s body. Matched on the
@@ -576,6 +964,7 @@ fn walk_stmt<'a>(node: &'a Node, w: &mut Walker<'a>) {
         Node::Send(s) if s.recv.is_none() => {
             dispatch(&s.method_name, &s.args, None, w);
         }
+        Node::Lvasgn(a) => w.env.assign(&a.name, a.value.as_deref()),
         _ => {}
     }
 }
@@ -632,9 +1021,12 @@ fn dispatch<'a>(name: &str, args: &[Node], block_body: Option<&'a Node>, w: &mut
                 walk_stmt(body, w);
             }
         }
-        "direct" | "resolve" | "draw" => {
+        "direct" | "resolve" => {
             w.escape(EscapeKind::Other(name.to_string()));
         }
+        // `draw(:name)` loads another routes file; the file collector
+        // follows it and counts what it cannot resolve.
+        "draw" => {}
         // Rack-app-mount idioms and anything else unrecognised.
         _ => {
             if block_body.is_some() || !args.is_empty() {
@@ -956,6 +1348,7 @@ fn handle_one_resources<'a>(
             as_prefix: None,
             module: Some(m.clone()),
             controller: None,
+            path: None,
         });
     }
 
@@ -1032,6 +1425,7 @@ fn handle_one_resource<'a>(
             as_prefix: None,
             module: Some(m.clone()),
             controller: None,
+            path: None,
         });
     }
 
@@ -1113,6 +1507,7 @@ fn emit_canonical_resources(allowed: &[String], idx: usize, w: &mut Walker<'_>) 
                 controller.clone(),
                 "index".to_string(),
                 RouteScopeKind::Canonical,
+                None,
             ),
             "create" => w.emit(
                 Some(collection_stem.clone()),
@@ -1120,6 +1515,7 @@ fn emit_canonical_resources(allowed: &[String], idx: usize, w: &mut Walker<'_>) 
                 controller.clone(),
                 "create".to_string(),
                 RouteScopeKind::Canonical,
+                None,
             ),
             "new" => w.emit(
                 Some(format!("new_{member_stem}")),
@@ -1127,6 +1523,7 @@ fn emit_canonical_resources(allowed: &[String], idx: usize, w: &mut Walker<'_>) 
                 controller.clone(),
                 "new".to_string(),
                 RouteScopeKind::Canonical,
+                None,
             ),
             "edit" => w.emit(
                 Some(format!("edit_{member_stem}")),
@@ -1134,6 +1531,7 @@ fn emit_canonical_resources(allowed: &[String], idx: usize, w: &mut Walker<'_>) 
                 controller.clone(),
                 "edit".to_string(),
                 RouteScopeKind::Canonical,
+                None,
             ),
             "show" => w.emit(
                 Some(member_stem.clone()),
@@ -1141,6 +1539,7 @@ fn emit_canonical_resources(allowed: &[String], idx: usize, w: &mut Walker<'_>) 
                 controller.clone(),
                 "show".to_string(),
                 RouteScopeKind::Canonical,
+                None,
             ),
             "update" => {
                 w.emit(
@@ -1149,6 +1548,7 @@ fn emit_canonical_resources(allowed: &[String], idx: usize, w: &mut Walker<'_>) 
                     controller.clone(),
                     "update".to_string(),
                     RouteScopeKind::Canonical,
+                    None,
                 );
                 w.emit(
                     Some(member_stem.clone()),
@@ -1156,6 +1556,7 @@ fn emit_canonical_resources(allowed: &[String], idx: usize, w: &mut Walker<'_>) 
                     controller.clone(),
                     "update".to_string(),
                     RouteScopeKind::Canonical,
+                    None,
                 );
             }
             "destroy" => w.emit(
@@ -1164,6 +1565,7 @@ fn emit_canonical_resources(allowed: &[String], idx: usize, w: &mut Walker<'_>) 
                 controller.clone(),
                 "destroy".to_string(),
                 RouteScopeKind::Canonical,
+                None,
             ),
             _ => {}
         }
@@ -1188,14 +1590,18 @@ fn handle_scope<'a>(args: &[Node], block_body: Option<&'a Node>, w: &mut Walker<
     // A bare positional String/Symbol first arg is a URL path segment —
     // NO helper-prefix effect (v3 §6 item 5: "no prefix effect"; S1 #12:
     // a bare Symbol is coerced the same way — neither contributes to
-    // `helper_prefix`/`controller_prefix`).
+    // `helper_prefix`/`controller_prefix`). It does feed `path_prefix`.
     let as_prefix = kwarg(&pairs, "as").and_then(sym_or_str);
     let module = kwarg(&pairs, "module").and_then(sym_or_str);
     let controller = kwarg(&pairs, "controller").and_then(sym_or_str);
+    let path = kwarg(&pairs, "path")
+        .or_else(|| positional_args(args).first().copied())
+        .and_then(|n| sym_or_str(n).or_else(|| eval_str(n, &w.env)));
     w.stack.push(Frame::Scope {
         as_prefix,
         module,
         controller,
+        path,
     });
     if let Some(body) = block_body {
         walk_stmt(body, w);
@@ -1306,12 +1712,14 @@ fn handle_root(args: &[Node], w: &mut Walker<'_>) {
     };
     let cp = controller_prefix(&w.stack);
     let controller = apply_controller_override(ctrl, &cp);
+    let path = join_path(&path_prefix(&w.stack), "/");
     w.emit(
         Some(stem),
         RouteVerb::Get,
         controller,
         action.to_string(),
         RouteScopeKind::Standalone,
+        Some(path),
     );
 }
 
@@ -1514,7 +1922,7 @@ fn resolve_member_collection(
         }
     };
 
-    w.emit(stem, verb, controller, action, style);
+    w.emit(stem, verb, controller, action, style, None);
 }
 
 /// A naked verb call directly inside a `Resources`/`Resource` body (no
@@ -1619,7 +2027,7 @@ fn resolve_naked_in_resource(
         None => None,
     };
 
-    w.emit(stem, verb, controller, action, RouteScopeKind::Member);
+    w.emit(stem, verb, controller, action, RouteScopeKind::Member, None);
 }
 
 /// Standalone verb calls — not under any `Resources`/`Resource`. v2 §3
@@ -1637,6 +2045,26 @@ fn resolve_standalone(
     }
     let cp = controller_prefix(&w.stack);
     let hp = helper_prefix(&w.stack);
+
+    let path_source = positionals
+        .first()
+        .copied()
+        .or_else(|| fat_arrow.map(|(k, _)| k));
+    // A symbol names an action, not a path; only a string expression carries
+    // one. A string expression that cannot be resolved is not guessed.
+    let path_string = match path_source {
+        Some(Node::Sym(_)) | None => None,
+        Some(node) => match eval_str(node, &w.env) {
+            Some(resolved) => Some(resolved),
+            None => {
+                w.escape(EscapeKind::Dynamic);
+                return;
+            }
+        },
+    };
+    let path = path_string
+        .as_deref()
+        .map(|p| join_path(&path_prefix(&w.stack), p));
 
     // Rails fallback controller for a bare verb call (explicit action / bare
     // symbol) that has no resource/`controller` frame: the enclosing module
@@ -1687,6 +2115,7 @@ fn resolve_standalone(
                         String::new(),
                         tv.clone(),
                         RouteScopeKind::Standalone,
+                        path,
                     );
                     return;
                 }
@@ -1698,7 +2127,14 @@ fn resolve_standalone(
         } else if let Some(ns) = &ns_ctrl {
             (ns.clone(), av)
         } else {
-            w.emit(None, verb, String::new(), av, RouteScopeKind::Standalone);
+            w.emit(
+                None,
+                verb,
+                String::new(),
+                av,
+                RouteScopeKind::Standalone,
+                path,
+            );
             return;
         }
     } else if let Some(sym) = positionals.first().and_then(|n| sym_str(n)) {
@@ -1707,7 +2143,14 @@ fn resolve_standalone(
         } else if let Some(ns) = &ns_ctrl {
             (ns.clone(), sym)
         } else {
-            w.emit(None, verb, String::new(), sym, RouteScopeKind::Standalone);
+            w.emit(
+                None,
+                verb,
+                String::new(),
+                sym,
+                RouteScopeKind::Standalone,
+                path,
+            );
             return;
         }
     } else {
@@ -1718,17 +2161,15 @@ fn resolve_standalone(
             String::new(),
             String::new(),
             RouteScopeKind::Standalone,
+            path,
         );
         return;
     };
 
     let as_val = kwarg(pairs, "as").and_then(sym_or_str);
-    let path_source = positionals
-        .first()
-        .copied()
-        .or_else(|| fat_arrow.map(|(k, _)| k));
     let derived = path_source
         .and_then(sym_or_str)
+        .or(path_string)
         .and_then(|s| path_auto_name(&s));
     let stem = as_val
         .filter(|a| !a.is_empty())
@@ -1739,7 +2180,14 @@ fn resolve_standalone(
                 .map(|d| format!("{hp}{d}"))
         });
 
-    w.emit(stem, verb, controller, action, RouteScopeKind::Standalone);
+    w.emit(
+        stem,
+        verb,
+        controller,
+        action,
+        RouteScopeKind::Standalone,
+        path,
+    );
 }
 
 impl RouteTable {
@@ -1826,6 +2274,228 @@ mod tests {
         t.entries
             .iter()
             .find(|e| e.stem.as_deref() == Some(stem) && e.verb == verb)
+    }
+
+    /// Scan a tree of `(relative path, contents)` files.
+    fn scan_tree(case: &str, files: &[(&str, &str)]) -> (RouteTable, RouteScanReport) {
+        let root = scratch_dir(case);
+        for (rel, body) in files {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        let result = extract_routes_with_report(&root, "app");
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    const GLOB_LOADER: &str = concat!(
+        "Rails.application.routes.draw do\n",
+        "  dir = File.expand_path(__dir__)\n",
+        "  files = Dir.glob(\"#{dir}/routes/*.rb\")\n",
+        "  files.each do |file|\n",
+        "    load file\n",
+        "  end\n",
+        "end\n",
+    );
+
+    fn draw_file(body: &str) -> String {
+        format!("Rails.application.routes.draw do\n{body}\nend\n")
+    }
+
+    /// A routes file that globs `config/routes/*.rb` and loads each match
+    /// follows the loaded files, scanning each once.
+    #[test]
+    fn dir_glob_load_idiom_follows_loaded_files() {
+        let a = draw_file("  get \"/a\", to: \"a#index\"");
+        let b = draw_file("  get \"/b\", to: \"b#index\"");
+        let (t, r) = scan_tree(
+            "glob_load",
+            &[
+                ("config/routes.rb", GLOB_LOADER),
+                ("config/routes/a.rb", &a),
+                ("config/routes/b.rb", &b),
+                ("config/routes/notes.txt", "not ruby"),
+            ],
+        );
+        assert_eq!(r.files_scanned, 3, "{r:?}");
+        assert_eq!(r.files_loaded, 2, "{r:?}");
+        assert_eq!(r.escaped_route_loads, 0, "{r:?}");
+        assert_eq!(t.entries.len(), 2);
+        assert_eq!(
+            entry(&t, "a", RouteVerb::Get).unwrap().file,
+            "config/routes/a.rb"
+        );
+        assert_eq!(entry(&t, "b", RouteVerb::Get).unwrap().controller, "b");
+    }
+
+    /// `draw(:admin)` loads `config/routes/admin.rb`.
+    #[test]
+    fn draw_symbol_loads_named_routes_file() {
+        let admin = draw_file("  get \"/dash\", to: \"dash#show\"");
+        let (t, r) = scan_tree(
+            "draw_sym",
+            &[
+                (
+                    "config/routes.rb",
+                    "Rails.application.routes.draw do\n  draw(:admin)\nend\n",
+                ),
+                ("config/routes/admin.rb", &admin),
+            ],
+        );
+        assert_eq!(r.files_scanned, 2, "{r:?}");
+        assert_eq!(r.files_loaded, 1, "{r:?}");
+        assert_eq!(r.escaped_route_loads, 0, "{r:?}");
+        assert_eq!(r.escaped_other, Vec::<String>::new());
+        assert_eq!(entry(&t, "dash", RouteVerb::Get).unwrap().action, "show");
+    }
+
+    const APPLICATION_RB: &str = "module App\n  class Application < Rails::Application\n    config.api_path = '/api/v1'\n  end\nend\n";
+
+    fn scan_with_api_path(case: &str, body: &str) -> (RouteTable, RouteScanReport) {
+        scan_tree(
+            case,
+            &[
+                ("config/application.rb", APPLICATION_RB),
+                (
+                    "config/routes.rb",
+                    &draw_file(&format!(
+                        "  api_path = Rails.configuration.api_path\n{body}"
+                    )),
+                ),
+            ],
+        )
+    }
+
+    /// `local + 'literal'` resolves through the `application.rb` setting.
+    #[test]
+    fn local_plus_literal_resolves_to_a_path() {
+        let (t, r) = scan_with_api_path(
+            "path_plus",
+            "  match api_path + '/tickets/:id', to: 'tickets#show', via: :get\n",
+        );
+        assert_eq!(r.declared_routes, 1, "{r:?}");
+        assert_eq!(r.escaped_dynamic, 0, "{r:?}");
+        let e = &t.entries[0];
+        assert_eq!(e.path.as_deref(), Some("/api/v1/tickets/:id"));
+        assert_eq!(e.controller, "tickets");
+        assert_eq!(e.action, "show");
+        assert_eq!(e.verb, RouteVerb::Get);
+    }
+
+    /// `"#{local}/literal"` interpolation resolves the same way, and the
+    /// path derives the Rails auto-name like a literal path would.
+    #[test]
+    fn interpolated_local_resolves_to_a_path() {
+        let (t, r) = scan_with_api_path(
+            "path_interp",
+            "  match \"#{api_path}/tickets\", to: 'tickets#index', via: :get\n",
+        );
+        assert_eq!(r.escaped_dynamic, 0, "{r:?}");
+        assert_eq!(t.entries.len(), 1);
+        assert_eq!(t.entries[0].path.as_deref(), Some("/api/v1/tickets"));
+        assert_eq!(t.entries[0].stem.as_deref(), Some("api_v1_tickets"));
+    }
+
+    /// A namespace/scope path prefix is applied to the resolved path;
+    /// `Rails.configuration.<x>` resolves without a local.
+    #[test]
+    fn scope_prefix_and_direct_config_read_apply_to_path() {
+        let (t, _) = scan_with_api_path(
+            "path_scope",
+            concat!(
+                "  namespace :admin do\n",
+                "    scope 'v2' do\n",
+                "      get '/stats', to: 'stats#index'\n",
+                "    end\n",
+                "  end\n",
+                "  get Rails.configuration.api_path + '/ping', to: 'ping#show'\n",
+            ),
+        );
+        assert_eq!(t.entries.len(), 2);
+        assert_eq!(t.entries[0].path.as_deref(), Some("/admin/v2/stats"));
+        assert_eq!(t.entries[1].path.as_deref(), Some("/api/v1/ping"));
+    }
+
+    /// A local assigned something unresolvable keeps the route
+    /// `escaped_dynamic`, emitting nothing, and forgets an earlier binding.
+    #[test]
+    fn unresolvable_local_stays_escaped_dynamic() {
+        let (t, r) = scan_with_api_path(
+            "path_unresolved",
+            concat!(
+                "  p = compute_path\n",
+                "  match p + '/x', to: 'a#b', via: :get\n",
+                "  api_path = compute_path\n",
+                "  match api_path + '/y', to: 'a#b', via: :get\n",
+                "  match 'ok', to: 'a#b', via: :get\n",
+            ),
+        );
+        assert_eq!(r.escaped_dynamic, 2, "{r:?}");
+        assert_eq!(r.declared_routes, 3, "{r:?}");
+        assert_eq!(t.entries.len(), 1);
+        assert_eq!(t.entries[0].path.as_deref(), Some("/ok"));
+    }
+
+    /// A load glob that cannot be resolved is counted, not guessed; a
+    /// resolvable glob that matches nothing is not an escape.
+    #[test]
+    fn unresolvable_glob_is_counted_as_escaped_route_load() {
+        let (t, r) = scan_tree(
+            "glob_escape",
+            &[(
+                "config/routes.rb",
+                concat!(
+                    "Rails.application.routes.draw do\n",
+                    "  Dir.glob(pattern_from_env).each { |f| load f }\n",
+                    "  Dir.glob(\"#{__dir__}/none/*.rb\").each { |f| load f }\n",
+                    "end\n",
+                ),
+            )],
+        );
+        assert_eq!(r.escaped_route_loads, 1, "{r:?}");
+        assert_eq!(r.files_scanned, 1, "{r:?}");
+        assert_eq!(r.files_loaded, 0, "{r:?}");
+        assert!(t.entries.is_empty());
+    }
+
+    /// A file reached through both a glob and `draw` is scanned once.
+    #[test]
+    fn file_reached_twice_is_scanned_once() {
+        let a = draw_file("  get \"/a\", to: \"a#index\"");
+        let root_rb = concat!(
+            "Rails.application.routes.draw do\n",
+            "  Dir.glob(\"#{__dir__}/routes/*.rb\").each { |f| load f }\n",
+            "  Dir[\"#{__dir__}/routes/a.rb\"].each { |f| load f }\n",
+            "  draw(:a)\n",
+            "end\n",
+        );
+        let (t, r) = scan_tree(
+            "twice",
+            &[("config/routes.rb", root_rb), ("config/routes/a.rb", &a)],
+        );
+        assert_eq!(r.files_scanned, 2, "{r:?}");
+        assert_eq!(r.files_loaded, 1, "{r:?}");
+        assert_eq!(t.entries.len(), 1);
+    }
+
+    /// A glob is only a load site when the file actually loads something.
+    #[test]
+    fn glob_without_a_load_call_is_not_followed() {
+        let a = draw_file("  get \"/a\", to: \"a#index\"");
+        let (t, r) = scan_tree(
+            "glob_no_load",
+            &[
+                (
+                    "config/routes.rb",
+                    "Rails.application.routes.draw do\n  names = Dir.glob(\"#{__dir__}/routes/*.rb\")\nend\n",
+                ),
+                ("config/routes/a.rb", &a),
+            ],
+        );
+        assert_eq!(r.files_scanned, 1, "{r:?}");
+        assert_eq!(r.escaped_route_loads, 0, "{r:?}");
+        assert!(t.entries.is_empty());
     }
 
     /// F(1) — canonical seven incl. patch+put double; `only:`/`except:`.
@@ -2293,6 +2963,24 @@ mod tests {
             + r.escaped_dynamic
             + r.escaped_other.len();
         assert_eq!(r.declared_routes, sum, "{r:?}");
+    }
+
+    /// Prints the scan report for the checkout named by `ZAMMAD_SRC`.
+    /// Ignored so CI never needs the checkout; run with
+    /// `ZAMMAD_SRC=… cargo test -p ruff_ruby_spo --lib zammad_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a Zammad checkout in ZAMMAD_SRC"]
+    #[allow(clippy::print_stderr)]
+    fn zammad_report() {
+        let Ok(root) = std::env::var("ZAMMAD_SRC") else {
+            return;
+        };
+        let (table, report) = extract_routes_with_report(Path::new(&root), "zammad");
+        let with_path = table.entries.iter().filter(|e| e.path.is_some()).count();
+        eprintln!(
+            "{report:#?}\nentries={} with_path={with_path}",
+            table.entries.len()
+        );
     }
 
     /// §7 / F1 — the corpus drift fuse. Env-gated (`RAILS_CORPUS_SRC`),
