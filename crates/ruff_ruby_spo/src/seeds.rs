@@ -24,9 +24,14 @@
 //! [`SeedValue`]. Everything else (method calls, constants, locals,
 //! interpolation, ranges, lambdas, `**splat` entries) becomes
 //! [`SeedValue::Unresolved`] carrying its exact source text. Nothing is
-//! guessed. A hash key that is not a string or symbol literal becomes
-//! [`SeedKey::Unresolved`]. A `**splat` hash entry is one unresolved key
+//! guessed. A hash key that is not a string, symbol, integer, boolean or
+//! `nil` literal becomes [`SeedKey::Unresolved`]. A `**splat` hash entry is one unresolved key
 //! plus one unresolved value, both holding the splat's source text.
+//!
+//! A receiver-less call to one of [`SeedOptions::translation_markers`] with a
+//! single string literal argument (gettext's `__('Title')`) lowers to
+//! [`SeedValue::Translatable`] holding the source string. The markers are
+//! configuration: without them such a call stays unresolved.
 //!
 //! # Conservation
 //!
@@ -61,7 +66,10 @@ pub struct SeedCallSpec {
 pub enum SeedKey {
     Str(String),
     Sym(String),
-    /// A key that is not a string or symbol literal; `source` is its text.
+    Int(i64),
+    Bool(bool),
+    Nil,
+    /// A key that is not one of the literals above; `source` is its text.
     Unresolved {
         source: String,
     },
@@ -79,6 +87,9 @@ pub enum SeedValue {
     Nil,
     Array(Vec<SeedValue>),
     Hash(Vec<(SeedKey, SeedValue)>),
+    /// A string marked for translation (`__('Title')`), holding the source
+    /// string, untranslated.
+    Translatable(String),
     /// Any other expression; `source` is its text from the byte range.
     Unresolved {
         source: String,
@@ -107,6 +118,14 @@ pub struct SeedScanReport {
     pub unresolved_values: usize,
 }
 
+/// How literal values are lowered beyond plain Ruby literals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeedOptions {
+    /// Receiver-less method names that mark a string for translation
+    /// (`["__"]` for gettext-style seeds).
+    pub translation_markers: Vec<String>,
+}
+
 /// Read every file in `files` (paths relative to `root`) and return one
 /// [`SeedRow`] per call matching any of `calls`, files in the given order and
 /// calls in source order within a file.
@@ -116,17 +135,31 @@ pub fn extract_seed_rows(
     files: &[&str],
     calls: &[SeedCallSpec],
 ) -> (Vec<SeedRow>, SeedScanReport) {
+    extract_seed_rows_with(root, files, calls, &SeedOptions::default())
+}
+
+/// [`extract_seed_rows`] with lowering options.
+#[must_use]
+pub fn extract_seed_rows_with(
+    root: &Path,
+    files: &[&str],
+    calls: &[SeedCallSpec],
+    options: &SeedOptions,
+) -> (Vec<SeedRow>, SeedScanReport) {
     let mut rows = Vec::new();
     let mut report = SeedScanReport::default();
     for rel in files {
         let Ok(src) = fs::read_to_string(root.join(rel)) else {
             continue;
         };
-        let options = ParserOptions {
+        let parser_options = ParserOptions {
             buffer_name: (*rel).to_string(),
             ..Default::default()
         };
-        let Some(ast) = Parser::new(src.as_bytes().to_vec(), options).do_parse().ast else {
+        let Some(ast) = Parser::new(src.as_bytes().to_vec(), parser_options)
+            .do_parse()
+            .ast
+        else {
             continue;
         };
         report.files_scanned += 1;
@@ -134,6 +167,7 @@ pub fn extract_seed_rows(
             src: &src,
             file: rel,
             specs: calls,
+            options,
             rows: Vec::new(),
         };
         collector.visit(&ast);
@@ -156,6 +190,7 @@ struct Collector<'a> {
     src: &'a str,
     file: &'a str,
     specs: &'a [SeedCallSpec],
+    options: &'a SeedOptions,
     rows: Vec<SeedRow>,
 }
 
@@ -222,6 +257,14 @@ impl Collector<'_> {
             Node::Array(a) => SeedValue::Array(a.elements.iter().map(|e| self.lower(e)).collect()),
             Node::Hash(h) => self.lower_pairs(&h.pairs),
             Node::Kwargs(k) => self.lower_pairs(&k.pairs),
+            Node::Send(call)
+                if call.recv.is_none()
+                    && self.options.translation_markers.contains(&call.method_name)
+                    && let [arg] = call.args.as_slice()
+                    && let SeedValue::Str(text) = self.lower(arg) =>
+            {
+                SeedValue::Translatable(text)
+            }
             _ => self.unresolved(node),
         }
     }
@@ -249,6 +292,10 @@ impl Collector<'_> {
                 let key = match p.key.as_ref() {
                     Node::Sym(s) => SeedKey::Sym(s.name.to_string_lossy()),
                     Node::Str(s) => SeedKey::Str(s.value.to_string_lossy()),
+                    Node::True(_) => SeedKey::Bool(true),
+                    Node::False(_) => SeedKey::Bool(false),
+                    Node::Nil(_) => SeedKey::Nil,
+                    Node::Int(i) if let Some(n) = parse_int(&i.value) => SeedKey::Int(n),
                     other => SeedKey::Unresolved {
                         source: self.source_of(other),
                     },
@@ -395,6 +442,85 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_translation_marker_lowers_to_a_translatable_string() {
+        let root = scratch_dir("t7");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("seed.rb"),
+            "Setting.create_if_not_exists(title: __('Title'), help: __(name), other: x.__('y'))\n",
+        )
+        .unwrap();
+        let calls = [spec("Setting", "create_if_not_exists")];
+        let marked = SeedOptions {
+            translation_markers: vec!["__".to_string()],
+        };
+        let (with, with_report) = extract_seed_rows_with(&root, &["seed.rb"], &calls, &marked);
+        let (without, without_report) = extract_seed_rows(&root, &["seed.rb"], &calls);
+        let _ = fs::remove_dir_all(&root);
+
+        let kw = only_kwargs(&with[0]);
+        assert_eq!(
+            kw[0],
+            (sym("title"), SeedValue::Translatable("Title".to_string()))
+        );
+        assert_eq!(
+            kw[1],
+            (
+                sym("help"),
+                SeedValue::Unresolved {
+                    source: "__(name)".to_string()
+                }
+            )
+        );
+        assert_eq!(
+            kw[2],
+            (
+                sym("other"),
+                SeedValue::Unresolved {
+                    source: "x.__('y')".to_string()
+                }
+            )
+        );
+        assert_eq!(with_report.unresolved_values, 2);
+        assert_eq!(
+            only_kwargs(&without[0])[0],
+            (
+                sym("title"),
+                SeedValue::Unresolved {
+                    source: "__('Title')".to_string()
+                }
+            )
+        );
+        assert_eq!(without_report.unresolved_values, 3);
+    }
+
+    #[test]
+    fn integer_boolean_and_nil_hash_keys_are_literal() {
+        let body = "Setting.create_if_not_exists(name: 'x', options: { true => 'yes', false => 'no', 10 => 'ten', nil => '-', k => 1 })\n";
+        let (rows, report) = scan("t8", body, &[spec("Setting", "create_if_not_exists")]);
+        assert_eq!(
+            only_kwargs(&rows[0])[1],
+            (
+                sym("options"),
+                SeedValue::Hash(vec![
+                    (SeedKey::Bool(true), string("yes")),
+                    (SeedKey::Bool(false), string("no")),
+                    (SeedKey::Int(10), string("ten")),
+                    (SeedKey::Nil, string("-")),
+                    (
+                        SeedKey::Unresolved {
+                            source: "k".to_string()
+                        },
+                        SeedValue::Int(1)
+                    ),
+                ])
+            )
+        );
+        assert_eq!(report.unresolved_values, 1);
+    }
+
+    #[test]
     fn finds_calls_in_blocks_and_conditionals() {
         let body = "[1, 2].each do |i|\n  Setting.create_if_not_exists(name: 'in_each')\nend\n\
                     if true\n  Setting.create_if_not_exists(name: 'in_if')\nend\n\
@@ -496,7 +622,11 @@ mod tests {
         let mut shapes: std::collections::BTreeMap<String, (usize, String)> =
             std::collections::BTreeMap::new();
         for (receiver, method, file) in targets {
-            let (rows, report) = extract_seed_rows(root, &[file], &[spec(receiver, method)]);
+            let options = SeedOptions {
+                translation_markers: vec!["__".to_string()],
+            };
+            let (rows, report) =
+                extract_seed_rows_with(root, &[file], &[spec(receiver, method)], &options);
             println!("{receiver}.{method} {file}: {report:?}");
             assert_eq!(rows.len(), report.calls_found);
             for row in &rows {
