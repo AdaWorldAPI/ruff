@@ -220,7 +220,7 @@ pub struct RouteScanReport {
     /// site). Balances as `declared_routes == entries_emitted +
     /// entries_without_stem + escaped_redirects + escaped_mounts +
     /// escaped_procs + escaped_via_all + escaped_dynamic +
-    /// escaped_other.len()`.
+    /// escaped_other_calls.len()`.
     pub declared_routes: usize,
     /// [`RouteEntry`] records with `stem.is_some()` — the triple-emitting
     /// subset.
@@ -245,6 +245,9 @@ pub struct RouteScanReport {
     /// corpus occurrences, per the frozen spec's non-goals; `draw` is a
     /// load idiom, see [`Self::escaped_route_loads`]).
     pub escaped_other: Vec<String>,
+    /// The name of every unknown DSL call, one per call in scan order:
+    /// `escaped_other` lists a repeated name once.
+    pub escaped_other_calls: Vec<String>,
     /// A later declaration reusing an already-seen (stem, verb) with a
     /// DIFFERENT controller#action — the entry stays in `entries`, but no
     /// second `RoutesTo` triple is emitted (`resolve` keeps returning the
@@ -903,7 +906,10 @@ impl Walker<'_> {
             EscapeKind::Proc => self.report.escaped_procs += 1,
             EscapeKind::ViaAll => self.report.escaped_via_all += 1,
             EscapeKind::Dynamic => self.report.escaped_dynamic += 1,
-            EscapeKind::Other(name) => self.report.escaped_other.push(name),
+            EscapeKind::Other(name) => {
+                self.report.escaped_other_calls.push(name.clone());
+                self.report.escaped_other.push(name);
+            }
         }
     }
 }
@@ -2952,8 +2958,11 @@ mod tests {
                 "  mount SomeEngine, at: \"/eng\"\n",
                 "  match \"/all\", to: \"a#b\", via: :all\n",
                 "  totally_unknown_dsl :foo\n",
+                "  totally_unknown_dsl :bar\n",
             ),
         );
+        assert_eq!(r.escaped_other, vec!["totally_unknown_dsl".to_string()]);
+        assert_eq!(r.escaped_other_calls.len(), 2);
         let sum = r.entries_emitted
             + r.entries_without_stem
             + r.escaped_redirects
@@ -2961,7 +2970,7 @@ mod tests {
             + r.escaped_procs
             + r.escaped_via_all
             + r.escaped_dynamic
-            + r.escaped_other.len();
+            + r.escaped_other_calls.len();
         assert_eq!(r.declared_routes, sum, "{r:?}");
     }
 
@@ -3094,7 +3103,7 @@ mod tests {
             + report.escaped_procs
             + report.escaped_via_all
             + report.escaped_dynamic
-            + report.escaped_other.len();
+            + report.escaped_other_calls.len();
         assert_eq!(report.declared_routes, sum, "{report:?}");
 
         eprintln!(
