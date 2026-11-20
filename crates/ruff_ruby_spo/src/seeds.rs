@@ -71,6 +71,7 @@
 //! No SPO triples are emitted: the shared `Predicate` set has no variant for
 //! seed rows, and adding one is outside this arm.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -248,6 +249,10 @@ pub fn extract_seed_rows_with(
 
 /// Largest value, counted in [`SeedValue`] nodes, that a local may be bound to.
 const MAX_BOUND_NODES: usize = 4096;
+/// The most substituted cost one top-level lowering may copy out of bound
+/// locals; a wide expression reading a large local many times stays unresolved
+/// past it instead of allocating every copy.
+const MAX_SUBSTITUTED_COST: usize = 4 * MAX_BOUND_NODES;
 
 struct Collector<'a> {
     lowerer: Lowerer<'a>,
@@ -330,7 +335,10 @@ impl Collector<'_> {
                 // unresolved parts into every row that reads the local. An oversized one
                 // is not bound either, so repeated `x = [x, x]` cannot grow without limit.
                 if count_unresolved(&lowered) == 0 && node_count(&lowered) <= MAX_BOUND_NODES {
-                    self.lowerer.locals.insert(assign.name.clone(), lowered);
+                    let cost = substitution_cost(&lowered);
+                    self.lowerer
+                        .locals
+                        .insert(assign.name.clone(), (lowered, cost));
                     return;
                 }
             }
@@ -345,14 +353,14 @@ impl Collector<'_> {
     }
 
     /// Enter a new local scope (class, module, `def`): no bindings come in.
-    fn enter_scope(&mut self) -> (HashMap<String, SeedValue>, usize) {
+    fn enter_scope(&mut self) -> (HashMap<String, (SeedValue, usize)>, usize) {
         (
             std::mem::take(&mut self.lowerer.locals),
             std::mem::take(&mut self.depth),
         )
     }
 
-    fn leave_scope(&mut self, saved: (HashMap<String, SeedValue>, usize)) {
+    fn leave_scope(&mut self, saved: (HashMap<String, (SeedValue, usize)>, usize)) {
         self.lowerer.locals = saved.0;
         self.depth = saved.1;
     }
@@ -527,7 +535,9 @@ pub(crate) struct Lowerer<'a> {
     pub(crate) src: &'a str,
     pub(crate) options: &'a SeedOptions,
     /// Locals bound so far; only filled when [`SeedOptions::follow_locals`].
-    locals: HashMap<String, SeedValue>,
+    locals: HashMap<String, (SeedValue, usize)>,
+    /// Substituted cost spent by the current top-level [`Lowerer::lower`].
+    spent: Cell<usize>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -536,6 +546,7 @@ impl<'a> Lowerer<'a> {
             src,
             options,
             locals: HashMap::new(),
+            spent: Cell::new(0),
         }
     }
 }
@@ -567,7 +578,13 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Lower one expression; the substitution budget starts afresh.
     pub(crate) fn lower(&self, node: &Node) -> SeedValue {
+        self.spent.set(0);
+        self.lower_node(node)
+    }
+
+    fn lower_node(&self, node: &Node) -> SeedValue {
         match node {
             Node::Str(s) => SeedValue::Str(s.value.to_string_lossy()),
             Node::Dstr(d) => self.concat_parts(node, &d.parts),
@@ -580,20 +597,25 @@ impl Lowerer<'_> {
             Node::True(_) => SeedValue::Bool(true),
             Node::False(_) => SeedValue::Bool(false),
             Node::Nil(_) => SeedValue::Nil,
-            Node::Array(a) => SeedValue::Array(a.elements.iter().map(|e| self.lower(e)).collect()),
+            Node::Array(a) => {
+                SeedValue::Array(a.elements.iter().map(|e| self.lower_node(e)).collect())
+            }
             Node::Hash(h) => self.lower_pairs(&h.pairs),
             Node::Kwargs(k) => self.lower_pairs(&k.pairs),
             Node::Lvar(var)
-                if self.options.follow_locals && self.locals.contains_key(&var.name) =>
+                if self.options.follow_locals
+                    && let Some((value, cost)) = self.locals.get(&var.name)
+                    && self.spent.get() + cost <= MAX_SUBSTITUTED_COST =>
             {
-                self.locals[&var.name].clone()
+                self.spent.set(self.spent.get() + cost);
+                value.clone()
             }
             Node::Send(call) if let Some(value) = self.lower_call(call) => value,
             Node::Send(call)
                 if call.recv.is_none()
                     && self.options.translation_markers.contains(&call.method_name)
                     && let [arg] = call.args.as_slice()
-                    && let SeedValue::Str(text) = self.lower(arg) =>
+                    && let SeedValue::Str(text) = self.lower_node(arg) =>
             {
                 SeedValue::Translatable(text)
             }
@@ -611,7 +633,7 @@ impl Lowerer<'_> {
         if body.is_empty() || !body.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return None;
         }
-        let args: Vec<SeedValue> = call.args.iter().map(|a| self.lower(a)).collect();
+        let args: Vec<SeedValue> = call.args.iter().map(|a| self.lower_node(a)).collect();
         if args.iter().any(|a| count_unresolved(a) > 0) {
             return None;
         }
@@ -622,7 +644,7 @@ impl Lowerer<'_> {
                 args,
             });
         }
-        let base = self.lower(recv);
+        let base = self.lower_node(recv);
         matches!(base, SeedValue::Call { .. } | SeedValue::Chain { .. }).then(|| SeedValue::Chain {
             base: Box::new(base),
             method: call.method_name.clone(),
@@ -651,7 +673,7 @@ impl Lowerer<'_> {
         if self.options.follow_locals
             && let Node::Lvar(_) = key
         {
-            match self.lower(key) {
+            match self.lower_node(key) {
                 SeedValue::Str(s) => return SeedKey::Str(s),
                 SeedValue::Sym(s) => return SeedKey::Sym(s),
                 SeedValue::Int(n) => return SeedKey::Int(n),
@@ -678,7 +700,7 @@ impl Lowerer<'_> {
                     Node::Int(i) if let Some(n) = parse_int(&i.value) => SeedKey::Int(n),
                     other => self.followed_key(other),
                 };
-                out.push((key, self.lower(&p.value)));
+                out.push((key, self.lower_node(&p.value)));
             } else {
                 let source = self.source_of(pair);
                 out.push((
@@ -705,6 +727,26 @@ pub(crate) fn const_path(node: &Node) -> Option<String> {
 fn parse_int(text: &str) -> Option<i64> {
     let cleaned: String = text.chars().filter(|c| *c != '_').collect();
     cleaned.parse().ok()
+}
+
+/// What substituting a bound value costs: its nodes plus its string bytes in
+/// units of 64, so one huge string costs like many small nodes.
+fn substitution_cost(value: &SeedValue) -> usize {
+    node_count(value) + string_bytes(value) / 64
+}
+
+fn string_bytes(value: &SeedValue) -> usize {
+    match value {
+        SeedValue::Str(s) | SeedValue::Sym(s) | SeedValue::Translatable(s) => s.len(),
+        SeedValue::Array(items) | SeedValue::Call { args: items, .. } => {
+            items.iter().map(string_bytes).sum()
+        }
+        SeedValue::Chain { base, args, .. } => {
+            string_bytes(base) + args.iter().map(string_bytes).sum::<usize>()
+        }
+        SeedValue::Hash(pairs) => pairs.iter().map(|(_, v)| string_bytes(v)).sum(),
+        _ => 0,
+    }
 }
 
 fn node_count(value: &SeedValue) -> usize {
@@ -1042,6 +1084,43 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn a_wide_expression_of_large_reads_stops_substituting_at_the_budget() {
+        let root = scratch_dir("t_wide_reads");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut body = String::from("x = [1]\n");
+        for _ in 0..10 {
+            body.push_str("x = [x, x]\n");
+        }
+        let reads = vec!["x"; 10_000].join(", ");
+        body.push_str("Setting.create_if_not_exists(v: [");
+        body.push_str(&reads);
+        body.push_str("])\n");
+        fs::write(root.join("seed.rb"), body).unwrap();
+        let options = SeedOptions {
+            follow_locals: true,
+            ..Default::default()
+        };
+        let (rows, _) = extract_seed_rows_with(
+            &root,
+            &["seed.rb"],
+            &[spec("Setting", "create_if_not_exists")],
+            &options,
+        );
+        let _ = fs::remove_dir_all(&root);
+        let SeedValue::Array(items) = &only_kwargs(&rows[0])[0].1 else {
+            panic!("expected an array");
+        };
+        let substituted = items
+            .iter()
+            .filter(|v| !matches!(v, SeedValue::Unresolved { .. }))
+            .count();
+        // A bound `x` costs 3071 nodes; the budget admits five copies.
+        assert_eq!(substituted, MAX_SUBSTITUTED_COST / 3071);
+        assert_eq!(items.len(), 10_000);
     }
 
     #[test]
