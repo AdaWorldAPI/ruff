@@ -35,6 +35,7 @@ use ruff_spo_triplet::{
 };
 
 mod actions;
+mod class_macros;
 pub mod events;
 mod functions;
 mod menu;
@@ -53,6 +54,7 @@ pub use actions::{
     ActionScanReport, ActionVerb, RubyActionEdge, extract_action_edges,
     extract_action_edges_with_report,
 };
+pub use class_macros::{ClassMacroReport, ClassMacroRow, extract_class_macros};
 pub use menu::{MenuScanReport, extract_menu_edges, extract_menu_edges_with_report};
 pub use menu_regions::{
     Position, RegionEntry, RegionScanReport, extract_menu_guards, extract_menu_quads,

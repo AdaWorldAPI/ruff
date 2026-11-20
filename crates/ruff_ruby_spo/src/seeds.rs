@@ -164,10 +164,9 @@ pub fn extract_seed_rows_with(
         };
         report.files_scanned += 1;
         let mut collector = Collector {
-            src: &src,
+            lowerer: Lowerer { src: &src, options },
             file: rel,
             specs: calls,
-            options,
             rows: Vec::new(),
         };
         collector.visit(&ast);
@@ -187,10 +186,9 @@ pub fn extract_seed_rows_with(
 }
 
 struct Collector<'a> {
-    src: &'a str,
+    lowerer: Lowerer<'a>,
     file: &'a str,
     specs: &'a [SeedCallSpec],
-    options: &'a SeedOptions,
     rows: Vec<SeedRow>,
 }
 
@@ -206,16 +204,23 @@ impl Visitor for Collector<'_> {
             self.rows.push(SeedRow {
                 call: spec.clone(),
                 file: self.file.to_string(),
-                line: self.line_of(node.expression_l.begin),
-                args: node.args.iter().map(|a| self.lower(a)).collect(),
+                line: self.lowerer.line_of(node.expression_l.begin),
+                args: node.args.iter().map(|a| self.lowerer.lower(a)).collect(),
             });
         }
         visit_send(self, node);
     }
 }
 
-impl Collector<'_> {
-    fn line_of(&self, offset: usize) -> u32 {
+/// Source-aware lowering of AST nodes to [`SeedValue`]s, shared with the
+/// class-macro arm.
+pub(crate) struct Lowerer<'a> {
+    pub(crate) src: &'a str,
+    pub(crate) options: &'a SeedOptions,
+}
+
+impl Lowerer<'_> {
+    pub(crate) fn line_of(&self, offset: usize) -> u32 {
         let newlines = self
             .src
             .as_bytes()
@@ -226,7 +231,7 @@ impl Collector<'_> {
         u32::try_from(newlines + 1).unwrap_or(u32::MAX)
     }
 
-    fn source_of(&self, node: &Node) -> String {
+    pub(crate) fn source_of(&self, node: &Node) -> String {
         let loc = node.expression();
         self.src
             .as_bytes()
@@ -241,7 +246,7 @@ impl Collector<'_> {
         }
     }
 
-    fn lower(&self, node: &Node) -> SeedValue {
+    pub(crate) fn lower(&self, node: &Node) -> SeedValue {
         match node {
             Node::Str(s) => SeedValue::Str(s.value.to_string_lossy()),
             Node::Dstr(d) => self.concat_parts(node, &d.parts),
@@ -316,7 +321,7 @@ impl Collector<'_> {
 }
 
 /// `A`, `A::B`, `::A::B` as `A`, `A::B`, `A::B`; `None` for any other receiver.
-fn const_path(node: &Node) -> Option<String> {
+pub(crate) fn const_path(node: &Node) -> Option<String> {
     let Node::Const(c) = node else { return None };
     match c.scope.as_deref() {
         None | Some(Node::Cbase(_)) => Some(c.name.clone()),
@@ -329,7 +334,7 @@ fn parse_int(text: &str) -> Option<i64> {
     cleaned.parse().ok()
 }
 
-fn count_unresolved(value: &SeedValue) -> usize {
+pub(crate) fn count_unresolved(value: &SeedValue) -> usize {
     match value {
         SeedValue::Unresolved { .. } => 1,
         SeedValue::Array(items) => items.iter().map(count_unresolved).sum(),
