@@ -44,6 +44,7 @@ mod parse;
 mod representers;
 mod routes;
 mod schema;
+mod seeds;
 mod views;
 mod walk;
 mod widgets;
@@ -67,6 +68,7 @@ pub use routes::{
     extract_routes_with_report,
 };
 pub use schema::{SchemaReport, extract_app_with_schema};
+pub use seeds::{SeedCallSpec, SeedKey, SeedRow, SeedScanReport, SeedValue, extract_seed_rows};
 pub use views::{
     ViewFieldSet, ViewScanReport, ViewTarget, extract_view_field_sets,
     extract_view_field_sets_with_report,
