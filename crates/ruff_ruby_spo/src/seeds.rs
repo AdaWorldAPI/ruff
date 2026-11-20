@@ -250,11 +250,29 @@ struct Collector<'a> {
     depth: usize,
 }
 
+/// The locals a subtree assigns anywhere in it.
+#[derive(Default)]
+struct AssignedLocals(Vec<String>);
+
+impl Visitor for AssignedLocals {
+    fn on_lvasgn(&mut self, node: &Lvasgn) {
+        self.0.push(node.name.clone());
+        visit_lvasgn(self, node);
+    }
+}
+
 /// A visitor hook that counts an enclosing construct for [`Collector::depth`].
+/// The construct may run more than once or not at all, so every local it
+/// assigns is unbound before its body is lowered.
 macro_rules! branching {
     ($($method:ident($node:ident, $walk:ident)),* $(,)?) => {
         $(
             fn $method(&mut self, node: &$node) {
+                let mut assigned = AssignedLocals::default();
+                $walk(&mut assigned, node);
+                for name in &assigned.0 {
+                    self.unbind(name);
+                }
                 self.depth += 1;
                 $walk(self, node);
                 self.depth -= 1;
@@ -312,6 +330,14 @@ impl Visitor for Collector<'_> {
                 .iter()
                 .find(|s| s.receiver == path && s.method == node.method_name)
         {
+            // An argument may assign a local that a later argument reads.
+            let mut assigned = AssignedLocals::default();
+            for arg in &node.args {
+                assigned.visit(arg);
+            }
+            for name in &assigned.0 {
+                self.unbind(name);
+            }
             self.rows.push(SeedRow {
                 call: spec.clone(),
                 file: self.file.to_string(),
@@ -848,6 +874,44 @@ mod tests {
             )
         );
         assert_eq!(report.unresolved_values, 2);
+    }
+
+    #[test]
+    fn a_local_assigned_in_a_loop_or_a_preceding_argument_is_not_substituted() {
+        let root = scratch_dir("t_loop_local");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("seed.rb"),
+            "r = 1\n2.times { Setting.create_if_not_exists(role: r); r = 2 }\nq = 1\nSetting.create_if_not_exists(q = 2, q)\n",
+        )
+        .unwrap();
+        let options = SeedOptions {
+            follow_locals: true,
+            ..Default::default()
+        };
+        let (rows, _) = extract_seed_rows_with(
+            &root,
+            &["seed.rb"],
+            &[spec("Setting", "create_if_not_exists")],
+            &options,
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            only_kwargs(&rows[0])[0],
+            (
+                sym("role"),
+                SeedValue::Unresolved {
+                    source: "r".to_string()
+                }
+            )
+        );
+        assert_eq!(
+            rows[1].args[1],
+            SeedValue::Unresolved {
+                source: "q".to_string()
+            }
+        );
     }
 
     #[test]
