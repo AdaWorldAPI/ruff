@@ -36,6 +36,7 @@ use ruff_spo_triplet::{
 
 mod actions;
 mod class_constants;
+mod class_functions;
 mod class_macros;
 pub mod events;
 mod functions;
@@ -56,6 +57,10 @@ pub use actions::{
     extract_action_edges_with_report,
 };
 pub use class_constants::{ClassConstantReport, ClassConstantRow, extract_class_constants};
+pub use class_functions::{
+    ClassFunction, ClassFunctionReport, ClassFunctions, FunctionKind, FunctionOptions,
+    extract_class_functions,
+};
 pub use class_macros::{ClassMacroReport, ClassMacroRow, extract_class_macros};
 pub use menu::{MenuScanReport, extract_menu_edges, extract_menu_edges_with_report};
 pub use menu_regions::{

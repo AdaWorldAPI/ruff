@@ -28,6 +28,15 @@
 //!   body-pass triage (E-ACCIDENTAL-IMPERATIVE / OGAR F17) needs "does this
 //!   method call a writer", not every call.
 //!
+//! - **`Function::self_calls`** — receiver-less and `self.` calls that are
+//!   not writes, mutators or plain `self.<field>` reads (`validate_foo`,
+//!   `self.valid?`), in first-seen order.
+//! - **`Function::receiver_reads`** — sends to a receiver named in
+//!   [`crate::FunctionOptions::receivers`] (`model.leaf?` records `leaf?`),
+//!   in first-seen order; `model.x = …` is a `writes` entry. Without that
+//!   option nothing is a receiver read, and `model` itself is a `self_calls`
+//!   entry.
+//!
 //! Together, `writes` + `calls` are the **command-shape** facts that let the
 //! triage split a method into query (read-only) vs command (mutates state).
 //!
@@ -159,30 +168,11 @@ fn walk_class_body_for_defs(
             default_public,
         ),
         Node::Def(d) => {
-            let mut func = Function {
-                name: d.name.clone(),
-                reads: Vec::new(),
-                raises: Vec::new(),
-                traverses: Vec::new(),
-                writes: Vec::new(),
-                calls: Vec::new(),
-                guarded_writes: Vec::new(),
-                // Odoo decorator facts (#49) — no Ruby analogue; Rails hook
-                // targeting lives on Callback, not the Function. The literal
-                // stays exhaustive ON PURPOSE: a new IR fact must be a
-                // conscious decision for the Ruby arm, not a silent default.
-                constrains: Vec::new(),
-                onchange: Vec::new(),
+            let ctx = BodyContext {
+                known_relations,
+                receivers: &[],
             };
-            if let Some(fn_body) = d.body.as_deref() {
-                walk_method_body(fn_body, known_relations, &mut func);
-            }
-            dedup_in_place(&mut func.reads);
-            dedup_in_place(&mut func.raises);
-            dedup_in_place(&mut func.traverses);
-            dedup_in_place(&mut func.writes);
-            dedup_in_place(&mut func.calls);
-            dedup_in_place(&mut func.guarded_writes);
+            let func = function_from_body(&d.name, d.body.as_deref(), &ctx);
             out.push(func);
             // Visibility-at-def: the default in force where this `def` appeared.
             vis.push(*default_public);
@@ -364,11 +354,76 @@ fn claim_if_writes(branch: &Node, field: &str, func: &mut Function) {
     }
 }
 
-fn walk_method_body(node: &Node, known_relations: &[String], func: &mut Function) {
+/// What a body walk needs besides the body itself.
+pub(crate) struct BodyContext<'a> {
+    /// Association names that make `<rel>.each` a traversal.
+    pub(crate) known_relations: &'a [String],
+    /// Bare local or method names whose sends are recorded as
+    /// [`Function::receiver_reads`] (`model` for `model.leaf?`).
+    pub(crate) receivers: &'a [String],
+}
+
+/// Walk one method, lambda or block body into a [`Function`] named `name`.
+/// The shared entry for `def` bodies and for the lambda and block bodies of
+/// [`crate::extract_class_functions`].
+pub(crate) fn function_from_body(
+    name: &str,
+    body: Option<&Node>,
+    ctx: &BodyContext<'_>,
+) -> Function {
+    // The literal stays exhaustive ON PURPOSE: a new IR fact must be a
+    // conscious decision for the Ruby arm, not a silent default. The Odoo
+    // decorator facts (`constrains`, `onchange`) have no Ruby analogue; Rails
+    // hook targeting lives on Callback, not the Function.
+    let mut func = Function {
+        name: name.to_string(),
+        reads: Vec::new(),
+        raises: Vec::new(),
+        traverses: Vec::new(),
+        writes: Vec::new(),
+        calls: Vec::new(),
+        guarded_writes: Vec::new(),
+        constrains: Vec::new(),
+        onchange: Vec::new(),
+        self_calls: Vec::new(),
+        receiver_reads: Vec::new(),
+    };
+    if let Some(body) = body {
+        walk_method_body(body, ctx, &mut func);
+    }
+    dedup_in_place(&mut func.reads);
+    dedup_in_place(&mut func.raises);
+    dedup_in_place(&mut func.traverses);
+    dedup_in_place(&mut func.writes);
+    dedup_in_place(&mut func.calls);
+    dedup_in_place(&mut func.guarded_writes);
+    dedup_first_seen(&mut func.self_calls);
+    dedup_first_seen(&mut func.receiver_reads);
+    func
+}
+
+/// A listed receiver as the object of a send: a bare call or a local named in
+/// [`BodyContext::receivers`].
+fn is_listed_receiver(node: &Node, ctx: &BodyContext<'_>) -> bool {
+    let name = match node {
+        Node::Send(s) if s.recv.is_none() && s.args.is_empty() => &s.method_name,
+        Node::Lvar(l) => &l.name,
+        _ => return false,
+    };
+    ctx.receivers.contains(name)
+}
+
+/// A method name as Ruby spells a call: an attribute identifier, optionally
+/// ending in `?` or `!`. Operators (`==`, `[]`, `!`) are not.
+fn is_method_ident(name: &str) -> bool {
+    is_attr_ident(name.strip_suffix(['?', '!']).unwrap_or(name))
+}
+
+fn walk_method_body(node: &Node, ctx: &BodyContext<'_>, func: &mut Function) {
     match node {
         Node::Begin(b) => {
             for stmt in &b.statements {
-                walk_method_body(stmt, known_relations, func);
+                walk_method_body(stmt, ctx, func);
             }
         }
         // `raise X` / `raise X.new(...)` / `raise X, ...`.
@@ -399,11 +454,14 @@ fn walk_method_body(node: &Node, known_relations: &[String], func: &mut Function
                 // `self.<field>` — a plain attribute read (operator self-sends
                 // such as `self == other` are neither a read nor a write).
                 func.reads.push(s.method_name.clone());
+            } else if is_method_ident(method) {
+                // `self.valid?` / `self.refresh!` — a call on self, not a field.
+                func.self_calls.push(s.method_name.clone());
             }
             // Recurse into args (the RHS of a write, or call/read args, may
             // themselves contain a raise/read/write/call).
             for arg in &s.args {
-                walk_method_body(arg, known_relations, func);
+                walk_method_body(arg, ctx, func);
             }
         }
         // `self.<field> ||= v` — the nil/false-guarded default write. Same J1
@@ -419,7 +477,7 @@ fn walk_method_body(node: &Node, known_relations: &[String], func: &mut Function
                 func.writes.push(field.clone());
                 func.guarded_writes.push(field);
             }
-            walk_method_body(&o.value, known_relations, func);
+            walk_method_body(&o.value, ctx, func);
         }
         // `self.<field> += v` (and the other op-assign operators) — a
         // read-modify-write, NOT a guarded default: the field's current value
@@ -430,7 +488,7 @@ fn walk_method_body(node: &Node, known_relations: &[String], func: &mut Function
                 func.reads.push(field.to_string());
                 func.writes.push(field.to_string());
             }
-            walk_method_body(&o.value, known_relations, func);
+            walk_method_body(&o.value, ctx, func);
         }
         // `self.<field> &&= v` — the PRESENT-guarded write (assigns only when
         // the field is already truthy). A write, but the mirror image of the
@@ -440,56 +498,81 @@ fn walk_method_body(node: &Node, known_relations: &[String], func: &mut Function
             if let Some(field) = attr_of_self(&a.recv) {
                 func.writes.push(field.to_string());
             }
-            walk_method_body(&a.value, known_relations, func);
+            walk_method_body(&a.value, ctx, func);
         }
         // `<relation>.each` / `<relation>.<m>` — association walks, plus any
         // `ActiveRecord` lifecycle mutator dispatched on a non-self receiver
         // (`order.update`, `User.create`, bare `save`).
         Node::Send(s) => {
+            let listed_receiver = s
+                .recv
+                .as_deref()
+                .is_some_and(|r| is_listed_receiver(r, ctx));
             if is_ar_mutator(&s.method_name) {
                 func.calls.push(format!(
                     "{}.{}",
                     receiver_label(s.recv.as_deref()),
                     s.method_name
                 ));
+            } else if s.recv.is_none() {
+                if is_method_ident(&s.method_name) {
+                    func.self_calls.push(s.method_name.clone());
+                }
+            } else if listed_receiver {
+                if let Some(field) = s.method_name.strip_suffix('=')
+                    && is_attr_ident(field)
+                {
+                    func.writes.push(field.to_string());
+                } else if is_method_ident(&s.method_name) {
+                    func.receiver_reads.push(s.method_name.clone());
+                }
             }
-            if let Some(rel) = traversed_relation(s, known_relations) {
+            if let Some(rel) = traversed_relation(s, ctx.known_relations) {
                 func.traverses.push(rel);
             }
-            if let Some(recv) = s.recv.as_deref() {
-                walk_method_body(recv, known_relations, func);
+            // A listed receiver is the object of this send, not a call on self.
+            if !listed_receiver && let Some(recv) = s.recv.as_deref() {
+                walk_method_body(recv, ctx, func);
             }
             for arg in &s.args {
-                walk_method_body(arg, known_relations, func);
+                walk_method_body(arg, ctx, func);
             }
+        }
+        Node::Or(o) => {
+            walk_method_body(&o.lhs, ctx, func);
+            walk_method_body(&o.rhs, ctx, func);
+        }
+        Node::And(a) => {
+            walk_method_body(&a.lhs, ctx, func);
+            walk_method_body(&a.rhs, ctx, func);
         }
         // `for r in <rel>` — classic for-loop traversal.
         Node::For(f) => {
-            if let Some(rel) = node_relation_name(&f.iteratee, known_relations) {
+            if let Some(rel) = node_relation_name(&f.iteratee, ctx.known_relations) {
                 func.traverses.push(rel);
             }
             if let Some(body) = f.body.as_deref() {
-                walk_method_body(body, known_relations, func);
+                walk_method_body(body, ctx, func);
             }
         }
         // Walk into structural wrappers without changing func state.
         Node::Block(blk) => {
             if let Some(body) = blk.body.as_deref() {
-                walk_method_body(body, known_relations, func);
+                walk_method_body(body, ctx, func);
             }
-            walk_method_body(&blk.call, known_relations, func);
+            walk_method_body(&blk.call, ctx, func);
         }
         Node::If(i) => {
             // J1 guard detection (blank/nil-guarded default write) runs on the
             // block-form `if` too — same (cond, if_true, if_false) shape.
             detect_guarded_default(&i.cond, i.if_true.as_deref(), i.if_false.as_deref(), func);
             if let Some(b) = i.if_true.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
             if let Some(b) = i.if_false.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
-            walk_method_body(&i.cond, known_relations, func);
+            walk_method_body(&i.cond, ctx, func);
         }
         // `stmt if cond` / `stmt unless cond` — the postfix modifier form.
         // `if_true` is set for `if`, `if_false` for `unless`; never both.
@@ -499,58 +582,58 @@ fn walk_method_body(node: &Node, known_relations: &[String], func: &mut Function
             // write-if-blank (schema-default) idiom — detect it here.
             detect_guarded_default(&i.cond, i.if_true.as_deref(), i.if_false.as_deref(), func);
             if let Some(b) = i.if_true.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
             if let Some(b) = i.if_false.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
-            walk_method_body(&i.cond, known_relations, func);
+            walk_method_body(&i.cond, ctx, func);
         }
         Node::Case(c) => {
             for arm in &c.when_bodies {
-                walk_method_body(arm, known_relations, func);
+                walk_method_body(arm, ctx, func);
             }
             if let Some(b) = c.else_body.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
         }
         Node::Ensure(e) => {
             if let Some(b) = e.body.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
             if let Some(b) = e.ensure.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
         }
         Node::Rescue(r) => {
             if let Some(b) = r.body.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
             for arm in &r.rescue_bodies {
-                walk_method_body(arm, known_relations, func);
+                walk_method_body(arm, ctx, func);
             }
         }
         Node::RescueBody(r) => {
             if let Some(b) = r.body.as_deref() {
-                walk_method_body(b, known_relations, func);
+                walk_method_body(b, ctx, func);
             }
             if let Some(e) = r.exc_list.as_deref() {
-                walk_method_body(e, known_relations, func);
+                walk_method_body(e, ctx, func);
             }
         }
         Node::Return(r) => {
             for arg in &r.args {
-                walk_method_body(arg, known_relations, func);
+                walk_method_body(arg, ctx, func);
             }
         }
         Node::Lvasgn(a) => {
             if let Some(v) = a.value.as_deref() {
-                walk_method_body(v, known_relations, func);
+                walk_method_body(v, ctx, func);
             }
         }
         Node::Ivasgn(a) => {
             if let Some(v) = a.value.as_deref() {
-                walk_method_body(v, known_relations, func);
+                walk_method_body(v, ctx, func);
             }
         }
         _ => {}
@@ -705,6 +788,12 @@ pub(crate) fn node_relation_name(node: &Node, known: &[String]) -> Option<String
 fn dedup_in_place<T: Ord + Clone>(v: &mut Vec<T>) {
     v.sort();
     v.dedup();
+}
+
+/// Drop repeats, keeping each name where it first appeared.
+fn dedup_first_seen(v: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|name| seen.insert(name.clone()));
 }
 
 #[cfg(test)]

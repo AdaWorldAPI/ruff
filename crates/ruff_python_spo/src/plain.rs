@@ -655,6 +655,9 @@ fn function_from_raw(m: crate::RawMethod) -> Function {
         calls: m.calls,
         constrains: m.constrains,
         onchange: m.onchange,
+        // Ruby-arm facts, no Python analogue.
+        self_calls: Vec::new(),
+        receiver_reads: Vec::new(),
     }
 }
 

@@ -289,6 +289,9 @@ fn build_graph(classes: &[RawClass], namespace: &str) -> ModelGraph {
                         writes: m.writes.clone(),
                         guarded_writes: m.guarded_writes.clone(),
                         calls: m.calls.clone(),
+                        // Ruby-arm facts, no Python analogue.
+                        self_calls: Vec::new(),
+                        receiver_reads: Vec::new(),
                     })
                     .collect(),
                 name,
