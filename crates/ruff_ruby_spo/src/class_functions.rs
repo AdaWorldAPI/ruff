@@ -110,6 +110,10 @@ pub struct ClassFunctions {
     pub class: String,
     /// Constant path of `< X` when the class declares a literal one.
     pub superclass: Option<String>,
+    /// Ruby's `Module.nesting` at the class, innermost first: the class itself,
+    /// then each enclosing module or class. The superclass is evaluated in
+    /// `nesting[1..]`; constants in the body resolve in `nesting`.
+    pub nesting: Vec<String>,
     pub file: String,
     pub functions: Vec<ClassFunction>,
 }
@@ -158,18 +162,19 @@ pub fn extract_class_functions(
             receivers: &options.receivers,
         };
         let mut file_classes: Vec<ClassFunctions> = Vec::new();
-        let seen = walk_class_bodies(&ast, &lowerer, |class, superclass, stmt| {
+        let seen = walk_class_bodies(&ast, &lowerer, |scope, stmt| {
             let mut found = Vec::new();
             collect_statement(stmt, options, &ctx, &lowerer, &mut found);
             if found.is_empty() {
                 return;
             }
-            let at = match file_classes.iter().position(|c| c.class == class) {
+            let at = match file_classes.iter().position(|c| c.class == scope.class) {
                 Some(at) => at,
                 None => {
                     file_classes.push(ClassFunctions {
-                        class: class.to_string(),
-                        superclass: superclass.cloned(),
+                        class: scope.class.to_string(),
+                        superclass: scope.superclass.cloned(),
+                        nesting: scope.module_nesting(),
                         file: (*rel).to_string(),
                         functions: Vec::new(),
                     });
@@ -669,5 +674,32 @@ end
             names(&by_name(class, "attribute:b:writable").function.self_calls),
             ["ready?"]
         );
+    }
+
+    #[test]
+    fn nesting_tells_a_nested_class_from_the_compact_form() {
+        let nested = "module Queries\n  class UpdateContract < BaseContract\n    def run\n      go\n    end\n  end\nend\n";
+        let (classes, _) = scan("nest1", nested, &[]);
+        let class = only_class(&classes);
+        assert_eq!(class.superclass.as_deref(), Some("BaseContract"));
+        assert_eq!(class.nesting, ["Queries::UpdateContract", "Queries"]);
+
+        let compact =
+            "class Queries::UpdateContract < BaseContract\n  def run\n    go\n  end\nend\n";
+        let (classes, _) = scan("nest2", compact, &[]);
+        assert_eq!(only_class(&classes).nesting, ["Queries::UpdateContract"]);
+    }
+
+    #[test]
+    fn nesting_lists_every_open_scope_and_stops_at_an_absolute_name() {
+        let deep = "module A\n  module B\n    class C\n      def run\n        go\n      end\n    end\n  end\nend\n";
+        let (classes, _) = scan("nest3", deep, &[]);
+        assert_eq!(only_class(&classes).nesting, ["A::B::C", "A::B", "A"]);
+
+        let absolute = "module A\n  class ::D\n    def run\n      go\n    end\n  end\nend\n";
+        let (classes, _) = scan("nest4", absolute, &[]);
+        let class = only_class(&classes);
+        assert_eq!(class.class, "D");
+        assert_eq!(class.nesting, ["D", "A"]);
     }
 }
