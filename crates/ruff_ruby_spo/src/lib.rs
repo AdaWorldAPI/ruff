@@ -1356,6 +1356,39 @@ end
     }
 
     #[test]
+    fn multi_symbol_validation_emits_one_validation_per_target() {
+        let classes = extract_from_source(
+            r"
+class User < ApplicationRecord
+  validate :ensure_identifier, :ensure_email
+  validates :login, :email, presence: true
+  validates :name, length: { maximum: 80 }
+  validate { errors.add(:base, 'no') }
+end
+",
+        );
+        let validations: Vec<(ValidationKind, &str, usize)> = classes[0]
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::Validation(v) => Some((v.kind, v.target.as_str(), v.options.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            validations,
+            [
+                (ValidationKind::Validate, "ensure_identifier", 0),
+                (ValidationKind::Validate, "ensure_email", 0),
+                (ValidationKind::Validates, "login", 1),
+                (ValidationKind::Validates, "email", 1),
+                (ValidationKind::Validates, "name", 1),
+                (ValidationKind::Validate, "<block>", 0),
+            ]
+        );
+    }
+
+    #[test]
     fn callback_object_and_validator_class_keep_their_names() {
         let classes = extract_from_source(
             r"
