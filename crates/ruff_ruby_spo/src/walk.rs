@@ -374,21 +374,28 @@ fn emit_assoc(kind: AssocKind, args: &[Node], out: &mut Vec<Declaration>) {
 }
 
 fn emit_validation(kind: ValidationKind, args: &[Node], out: &mut Vec<Declaration>) {
-    // `validate :method_name` / `validates :attr, ...` — first arg is
-    // either a sym (attr/method name) or another shape (block form).
-    let target = args.first().and_then(sym_string).unwrap_or_else(|| {
-        if !args.is_empty() {
-            "<expr>".to_string()
-        } else {
-            "<empty>".to_string()
-        }
-    });
+    // `validates :a, :b, presence: true` and `validate :m, :n` register one
+    // validation per leading symbol, so one `Validation` is emitted per
+    // symbol. A declaration without a leading symbol (block form, or another
+    // expression) keeps its single placeholder.
     let options = args.iter().find_map(as_hash_options).unwrap_or_default();
-    out.push(Declaration::Validation(Validation {
-        kind,
-        target,
-        options,
-    }));
+    let targets: Vec<String> = args.iter().map_while(sym_string).collect();
+    if targets.is_empty() {
+        let target = if args.is_empty() { "<empty>" } else { "<expr>" };
+        out.push(Declaration::Validation(Validation {
+            kind,
+            target: target.to_string(),
+            options,
+        }));
+        return;
+    }
+    for target in targets {
+        out.push(Declaration::Validation(Validation {
+            kind,
+            target,
+            options: options.clone(),
+        }));
+    }
 }
 
 fn emit_callback(phase: &str, args: &[Node], out: &mut Vec<Declaration>) {
