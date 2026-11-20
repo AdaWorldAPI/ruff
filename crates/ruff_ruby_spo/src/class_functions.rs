@@ -66,6 +66,10 @@ pub struct FunctionOptions {
     /// Class-body calls whose lambda arguments and block are functions
     /// (`["attribute"]`).
     pub lambda_macros: Vec<String>,
+    /// Class-body calls whose block's statements are read as direct statements
+    /// of the class (`["included"]`: a concern's `included do … end` defines its
+    /// `def`s on every includer).
+    pub transparent_blocks: Vec<String>,
 }
 
 /// Where a [`ClassFunction`] came from.
@@ -215,8 +219,14 @@ fn collect_statement(
         Node::Send(send) => collect_macro(send, None, options, ctx, lowerer, out),
         Node::Block(blk) => {
             if let Node::Send(send) = blk.call.as_ref() {
-                let block = Some((blk.body.as_deref(), blk.expression_l.begin));
-                collect_macro(send, block, options, ctx, lowerer, out);
+                if send.recv.is_none() && options.transparent_blocks.contains(&send.method_name) {
+                    for inner in block_statements(blk.body.as_deref()) {
+                        collect_statement(inner, options, ctx, lowerer, out);
+                    }
+                } else {
+                    let block = Some((blk.body.as_deref(), blk.expression_l.begin));
+                    collect_macro(send, block, options, ctx, lowerer, out);
+                }
             }
         }
         Node::Numblock(blk) => {
@@ -226,6 +236,15 @@ fn collect_statement(
             }
         }
         _ => {}
+    }
+}
+
+/// The statements of a block body: one node, or the children of a `begin`.
+fn block_statements(body: Option<&Node>) -> &[Node] {
+    match body {
+        Some(Node::Begin(b)) => &b.statements,
+        Some(node) => std::slice::from_ref(node),
+        None => &[],
     }
 }
 
@@ -378,6 +397,7 @@ end
         let options = FunctionOptions {
             receivers: receivers.iter().map(|r| (*r).to_string()).collect(),
             lambda_macros: vec!["attribute".to_string()],
+            transparent_blocks: Vec::new(),
         };
         let result = extract_class_functions(&root, &["a.rb"], &options);
         let _ = fs::remove_dir_all(&root);
@@ -517,6 +537,29 @@ end
         assert_eq!(report.functions_found, 1);
     }
 
+    #[test]
+    fn defs_in_a_transparent_block_are_class_functions() {
+        let body = "module M\n  included do\n    def inner\n      helper\n    end\n\n    private def hidden\n    end\n  end\n\n  def outer\n  end\nend\n";
+        let root = std::env::temp_dir().join(format!(
+            "ruff_ruby_spo_class_functions_{}_transparent",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rb"), body).unwrap();
+        let options = FunctionOptions {
+            transparent_blocks: vec!["included".to_string()],
+            ..FunctionOptions::default()
+        };
+        let (classes, report) = extract_class_functions(&root, &["a.rb"], &options);
+        let _ = fs::remove_dir_all(&root);
+        let class = only_class(&classes);
+        let listed: Vec<&str> = class.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(listed, ["inner", "hidden", "outer"]);
+        assert_eq!(class.functions[0].function.self_calls, ["helper"]);
+        assert_eq!(report.defs_found, 3);
+    }
+
     fn ruby_files_under(dir: &Path, root: &Path, out: &mut Vec<String>) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -555,6 +598,7 @@ end
         let options = FunctionOptions {
             receivers: vec!["model".to_string()],
             lambda_macros: vec!["attribute".to_string()],
+            transparent_blocks: Vec::new(),
         };
         let (classes, report) = extract_class_functions(root, &refs, &options);
         eprintln!("files listed={} {report:#?}", refs.len());
