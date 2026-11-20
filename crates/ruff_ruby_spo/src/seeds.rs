@@ -24,8 +24,8 @@
 //! [`SeedValue`]. Everything else (method calls, constants, locals,
 //! interpolation, ranges, lambdas, `**splat` entries) becomes
 //! [`SeedValue::Unresolved`] carrying its exact source text. Nothing is
-//! guessed. A hash key that is not a string or symbol literal becomes
-//! [`SeedKey::Unresolved`]. A `**splat` hash entry is one unresolved key
+//! guessed. A hash key that is not a string, symbol, integer, boolean or
+//! `nil` literal becomes [`SeedKey::Unresolved`]. A `**splat` hash entry is one unresolved key
 //! plus one unresolved value, both holding the splat's source text.
 //!
 //! A receiver-less call to one of [`SeedOptions::translation_markers`] with a
@@ -66,7 +66,10 @@ pub struct SeedCallSpec {
 pub enum SeedKey {
     Str(String),
     Sym(String),
-    /// A key that is not a string or symbol literal; `source` is its text.
+    Int(i64),
+    Bool(bool),
+    Nil,
+    /// A key that is not one of the literals above; `source` is its text.
     Unresolved {
         source: String,
     },
@@ -289,6 +292,10 @@ impl Collector<'_> {
                 let key = match p.key.as_ref() {
                     Node::Sym(s) => SeedKey::Sym(s.name.to_string_lossy()),
                     Node::Str(s) => SeedKey::Str(s.value.to_string_lossy()),
+                    Node::True(_) => SeedKey::Bool(true),
+                    Node::False(_) => SeedKey::Bool(false),
+                    Node::Nil(_) => SeedKey::Nil,
+                    Node::Int(i) if let Some(n) = parse_int(&i.value) => SeedKey::Int(n),
                     other => SeedKey::Unresolved {
                         source: self.source_of(other),
                     },
@@ -486,6 +493,31 @@ mod tests {
             )
         );
         assert_eq!(without_report.unresolved_values, 3);
+    }
+
+    #[test]
+    fn integer_boolean_and_nil_hash_keys_are_literal() {
+        let body = "Setting.create_if_not_exists(name: 'x', options: { true => 'yes', false => 'no', 10 => 'ten', nil => '-', k => 1 })\n";
+        let (rows, report) = scan("t8", body, &[spec("Setting", "create_if_not_exists")]);
+        assert_eq!(
+            only_kwargs(&rows[0])[1],
+            (
+                sym("options"),
+                SeedValue::Hash(vec![
+                    (SeedKey::Bool(true), string("yes")),
+                    (SeedKey::Bool(false), string("no")),
+                    (SeedKey::Int(10), string("ten")),
+                    (SeedKey::Nil, string("-")),
+                    (
+                        SeedKey::Unresolved {
+                            source: "k".to_string()
+                        },
+                        SeedValue::Int(1)
+                    ),
+                ])
+            )
+        );
+        assert_eq!(report.unresolved_values, 1);
     }
 
     #[test]
