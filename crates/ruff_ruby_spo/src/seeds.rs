@@ -272,6 +272,14 @@ impl Visitor for AssignedLocals {
     fn on_match_var(&mut self, node: &MatchVar) {
         self.0.push(node.name.clone());
     }
+
+    // A method, class or module body has its own local scope: its assignments
+    // never touch the enclosing locals.
+    fn on_def(&mut self, _: &DefNode) {}
+    fn on_defs(&mut self, _: &DefsNode) {}
+    fn on_class(&mut self, _: &ClassNode) {}
+    fn on_module(&mut self, _: &ModuleNode) {}
+    fn on_s_class(&mut self, _: &SclassNode) {}
 }
 
 /// A visitor hook that counts an enclosing construct for [`Collector::depth`].
@@ -965,6 +973,30 @@ mod tests {
                 source: "q".to_string()
             }
         );
+    }
+
+    #[test]
+    fn an_assignment_in_a_nested_method_does_not_unbind_the_outer_local() {
+        let root = scratch_dir("t_def_scope");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("seed.rb"),
+            "r = 1\nif cond\n  def helper\n    r = 2\n  end\nend\nSetting.create_if_not_exists(role: r)\n",
+        )
+        .unwrap();
+        let options = SeedOptions {
+            follow_locals: true,
+            ..Default::default()
+        };
+        let (rows, _) = extract_seed_rows_with(
+            &root,
+            &["seed.rb"],
+            &[spec("Setting", "create_if_not_exists")],
+            &options,
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(only_kwargs(&rows[0])[0], (sym("role"), SeedValue::Int(1)));
     }
 
     #[test]
