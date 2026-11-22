@@ -25,7 +25,9 @@
 //!   expression.
 //! - A call chain rooted at `model` (plain or `&.`, no arguments except one
 //!   `&:sym` block-pass) becomes a [`GuardExpr::Fact`] with canonical text
-//!   (`model.effective_target_versions.any?(&:closed?)`). A no-argument call
+//!   (`model.effective_target_versions.any?(&:closed?)`). Each step keeps its
+//!   own `.` or `&.`: `model.owner` and `model&.owner` are different facts, so
+//!   `model.owner.nil? && !model.owner&.nil?` never collapses to `F && !F`. A no-argument call
 //!   directly on a constant (`WorkPackage.work_based_mode?`) is a fact too.
 //! - A receiver-less, argument-less call is inlined from the `def` found in the
 //!   guard's own class, else its scanned superclasses (lookup always starts at
@@ -143,7 +145,12 @@ pub fn extract_contract_guards_with_report(root: &Path) -> (Vec<ContractGuard>, 
             stack: Vec::new(),
             bindings: HashMap::new(),
         };
-        let outcome = match lowerer.lower_writable(pending.value, &mut frame) {
+        let lowered = if pending.overridden_by_splat {
+            Err("a `**` splat after `writable:` can override it".to_string())
+        } else {
+            lowerer.lower_writable(pending.value, &mut frame)
+        };
+        let outcome = match lowered {
             Ok(expr) => {
                 report.lowered += 1;
                 GuardOutcome::Lowered(expr)
@@ -219,7 +226,7 @@ struct DefRef<'a> {
 /// One `include A, B` / `prepend A, B` call as written.
 struct Mixin {
     prepend: bool,
-    /// Module nesting the call was written in.
+    /// Lexical nesting the call was written in.
     ns: Vec<String>,
     names: Vec<String>,
 }
@@ -253,6 +260,8 @@ struct Pending<'a> {
     line: usize,
     attribute: String,
     value: &'a Node,
+    /// A `**opts` splat written after the `writable:` pair can override it.
+    overridden_by_splat: bool,
 }
 
 #[derive(Default)]
@@ -264,7 +273,9 @@ struct Scan<'a> {
 
 impl<'a> Scan<'a> {
     /// Recurse through `module` / `class` / `begin` wrappers. `ns` is the
-    /// lexical module nesting.
+    /// lexical nesting, innermost last: one fully qualified name per enclosing
+    /// `module` / `class` keyword (Ruby's `Module.nesting`), so `class A::B` at
+    /// top level contributes the single scope `A::B`, never `A`.
     fn walk(&mut self, file: usize, src: &str, node: &'a Node, ns: &[String]) {
         match node {
             Node::Begin(b) => {
@@ -276,15 +287,12 @@ impl<'a> Scan<'a> {
                 let Some(local) = const_path(&m.name) else {
                     return;
                 };
-                let qualified = if ns.is_empty() {
-                    local
-                } else {
-                    format!("{}::{local}", ns.join("::"))
-                };
+                let qualified = qualify(ns, local);
                 self.classes
                     .entry(qualified.clone())
                     .or_insert_with(|| ClassEntry::new(true));
-                let nested: Vec<String> = qualified.split("::").map(str::to_string).collect();
+                let mut nested = ns.to_vec();
+                nested.push(qualified.clone());
                 if let Some(body) = m.body.as_deref() {
                     self.body(file, src, &qualified, &nested, body);
                 }
@@ -293,11 +301,7 @@ impl<'a> Scan<'a> {
                 let Some(local) = const_path(&c.name) else {
                     return;
                 };
-                let qualified = if ns.is_empty() {
-                    local
-                } else {
-                    format!("{}::{local}", ns.join("::"))
-                };
+                let qualified = qualify(ns, local);
                 // An absolute path (`::Base`) is recorded with an empty nesting
                 // so `resolve` bypasses lexical lookup.
                 let superclass = c.superclass.as_deref().and_then(|sup| {
@@ -316,7 +320,8 @@ impl<'a> Scan<'a> {
                 if entry.superclass.is_none() {
                     entry.superclass = superclass;
                 }
-                let nested: Vec<String> = qualified.split("::").map(str::to_string).collect();
+                let mut nested = ns.to_vec();
+                nested.push(qualified.clone());
                 if let Some(body) = c.body.as_deref() {
                     self.body(file, src, &qualified, &nested, body);
                 }
@@ -392,27 +397,52 @@ impl<'a> Scan<'a> {
             Some(Node::Hash(h)) => &h.pairs,
             _ => return,
         };
-        let writable = pairs.iter().find_map(|pair| match pair {
+        // The last `writable:` wins, as in Ruby; a splat after it can replace it.
+        let writable = pairs.iter().enumerate().rev().find_map(|(index, pair)| match pair {
             Node::Pair(p) if matches!(&*p.key, Node::Sym(k) if k.name.to_string_lossy() == "writable") => {
-                Some(&*p.value)
+                Some((index, &*p.value))
             }
             _ => None,
         });
-        if let Some(value) = writable {
+        if let Some((index, value)) = writable {
+            let overridden_by_splat = pairs[index + 1..]
+                .iter()
+                .any(|pair| matches!(pair, Node::Kwsplat(_)));
             self.pending.push(Pending {
                 class: class.to_string(),
                 file,
                 line: line_of(src, send.expression_l.begin),
                 attribute: sym.name.to_string_lossy(),
                 value,
+                overridden_by_splat,
             });
         }
     }
 }
 
-fn note_unresolved(list: &mut Vec<String>, what: String) {
-    if !list.contains(&what) {
-        list.push(what);
+/// Name of a class declared as `local` inside the innermost scope of `ns`.
+fn qualify(ns: &[String], local: String) -> String {
+    match ns.last() {
+        Some(scope) => format!("{scope}::{local}"),
+        None => local,
+    }
+}
+
+/// One step of a method-lookup order.
+enum Ancestor {
+    /// A scanned class or module, by qualified name.
+    Scanned(String),
+    /// A written name (`module X`, `superclass Y`) that resolves to nothing
+    /// scanned; it may define anything.
+    Unresolved(String),
+}
+
+fn note_unresolved(order: &mut Vec<Ancestor>, what: String) {
+    let known = order
+        .iter()
+        .any(|a| matches!(a, Ancestor::Unresolved(w) if *w == what));
+    if !known {
+        order.push(Ancestor::Unresolved(what));
     }
 }
 
@@ -468,8 +498,8 @@ struct Frame {
     file: usize,
     class: String,
     stack: Vec<String>,
-    /// Parameter name → what an identifier of that name stands for.
-    bindings: HashMap<String, Result<GuardExpr, String>>,
+    /// Parameter name → the fact or expression its default stands for.
+    bindings: HashMap<String, GuardExpr>,
 }
 
 struct Lowerer<'a> {
@@ -518,7 +548,7 @@ impl Lowerer<'_> {
                 self.snippet(node, st)
             )),
             Node::Lvar(l) => match st.bindings.get(&l.name) {
-                Some(bound) => bound.clone(),
+                Some(bound) => Ok(bound.clone()),
                 None => Err(format!("unbound local `{}`", l.name)),
             },
             Node::Send(s) => self.lower_send(node, s, st),
@@ -554,9 +584,9 @@ impl Lowerer<'_> {
     /// Canonical text of a call chain. `top` is true only for the outermost
     /// call, the one place a constant receiver is accepted.
     fn chain(&self, node: &Node, top: bool, st: &Frame) -> Result<String, String> {
-        let (recv, name, args) = match node {
-            Node::Send(s) => (s.recv.as_deref(), s.method_name.as_str(), &s.args),
-            Node::CSend(c) => (Some(&*c.recv), c.method_name.as_str(), &c.args),
+        let (recv, name, args, sep) = match node {
+            Node::Send(s) => (s.recv.as_deref(), s.method_name.as_str(), &s.args, "."),
+            Node::CSend(c) => (Some(&*c.recv), c.method_name.as_str(), &c.args, "&."),
             _ => return Err(self.unsupported(node, st)),
         };
         let Some(recv) = recv else {
@@ -585,18 +615,17 @@ impl Lowerer<'_> {
         };
         let base = match recv {
             Node::Lvar(l) => match st.bindings.get(&l.name) {
-                Some(Ok(GuardExpr::Fact(text))) => text.clone(),
-                Some(Ok(_)) => {
+                Some(GuardExpr::Fact(text)) => text.clone(),
+                Some(_) => {
                     return Err(format!("local `{}` is not bound to a fact", l.name));
                 }
-                Some(Err(reason)) => return Err(reason.clone()),
                 None => return Err(format!("unbound local `{}`", l.name)),
             },
             Node::Const(_) if top => const_path(recv).ok_or_else(|| self.unsupported(recv, st))?,
             Node::Send(_) | Node::CSend(_) => self.chain(recv, false, st)?,
             _ => return Err(self.unsupported(recv, st)),
         };
-        Ok(format!("{base}.{name}{suffix}"))
+        Ok(format!("{base}{sep}{name}{suffix}"))
     }
 
     /// Inline `def name`, found from the declaring class upward.
@@ -612,12 +641,12 @@ impl Lowerer<'_> {
                 "inline depth limit {MAX_INLINE_DEPTH} reached at `{name}`"
             ));
         }
-        let Some(found) = self.find_def(&st.class, name) else {
-            let (_, unresolved) = self.ancestors(&st.class);
-            let missing = if unresolved.is_empty() {
+        let Some(found) = self.find_def(&st.class, name)? else {
+            let missing = self.unresolved_names(&st.class);
+            let missing = if missing.is_empty() {
                 String::new()
             } else {
-                format!("; unresolved: {}", unresolved.join(", "))
+                format!("; unresolved: {}", missing.join(", "))
             };
             return Err(format!(
                 "no `def {name}` in `{}`, its scanned included modules or its scanned superclasses{missing}",
@@ -646,7 +675,15 @@ impl Lowerer<'_> {
             for param in &args.args {
                 match param {
                     Node::Optarg(opt) => {
-                        let bound = self.lower(&opt.default, st);
+                        // Every call here omits its arguments, so the default
+                        // is always evaluated: a default that cannot be lowered
+                        // makes the call unsound whether or not it is read.
+                        let bound = self.lower(&opt.default, st).map_err(|reason| {
+                            format!(
+                                "default of parameter `{}` of `{name}` cannot be lowered: {reason}",
+                                opt.name
+                            )
+                        })?;
                         st.bindings.insert(opt.name.clone(), bound);
                     }
                     Node::Arg(arg) => {
@@ -670,32 +707,58 @@ impl Lowerer<'_> {
         }
     }
 
-    /// First `def name` in Ruby's ancestor order.
-    fn find_def(&self, class: &str, name: &str) -> Option<DefRef<'_>> {
-        let (order, _) = self.ancestors(class);
-        order
-            .iter()
-            .find_map(|ancestor| self.classes.get(ancestor)?.defs.get(name).copied())
+    /// First `def name` in Ruby's ancestor order. `Ok(None)` when nothing
+    /// scanned defines it. When a mixin or superclass that was written but not
+    /// scanned sits *before* the defining ancestor, the unscanned module could
+    /// define the name itself and win the lookup, so the answer is an error
+    /// instead of a guess.
+    fn find_def(&self, class: &str, name: &str) -> Result<Option<DefRef<'_>>, String> {
+        let mut shadow: Option<&str> = None;
+        let order = self.ancestors(class);
+        for ancestor in &order {
+            match ancestor {
+                Ancestor::Unresolved(what) => {
+                    shadow.get_or_insert(what.as_str());
+                }
+                Ancestor::Scanned(scanned) => {
+                    let Some(found) = self.classes.get(scanned).and_then(|e| e.defs.get(name))
+                    else {
+                        continue;
+                    };
+                    if let Some(what) = shadow {
+                        return Err(format!(
+                            "ambiguous lookup of `{name}` in `{class}`: {what} is not scanned and precedes `{scanned}`, which defines it"
+                        ));
+                    }
+                    return Ok(Some(*found));
+                }
+            }
+        }
+        Ok(None)
     }
 
-    /// Ancestor names of `class` in method-lookup order, plus the names that
-    /// were written (`include`, `prepend`, superclass) but resolve to nothing
-    /// scanned.
-    fn ancestors(&self, class: &str) -> (Vec<String>, Vec<String>) {
+    /// Names that were written (`include`, `prepend`, superclass) but resolve
+    /// to nothing scanned.
+    fn unresolved_names(&self, class: &str) -> Vec<String> {
+        self.ancestors(class)
+            .into_iter()
+            .filter_map(|a| match a {
+                Ancestor::Unresolved(what) => Some(what),
+                Ancestor::Scanned(_) => None,
+            })
+            .collect()
+    }
+
+    /// Ancestors of `class` in method-lookup order. A name written but not
+    /// scanned keeps its place in the order as [`Ancestor::Unresolved`].
+    fn ancestors(&self, class: &str) -> Vec<Ancestor> {
         let mut order = Vec::new();
-        let mut unresolved = Vec::new();
         let mut seen = HashSet::new();
-        self.collect_ancestors(class, &mut order, &mut unresolved, &mut seen);
-        (order, unresolved)
+        self.collect_ancestors(class, &mut order, &mut seen);
+        order
     }
 
-    fn collect_ancestors(
-        &self,
-        name: &str,
-        order: &mut Vec<String>,
-        unresolved: &mut Vec<String>,
-        seen: &mut HashSet<String>,
-    ) {
+    fn collect_ancestors(&self, name: &str, order: &mut Vec<Ancestor>, seen: &mut HashSet<String>) {
         if !seen.insert(name.to_string()) {
             return;
         }
@@ -704,43 +767,37 @@ impl Lowerer<'_> {
         };
         // Later calls sit closer to the class, so they are visited first.
         for mixin in entry.mixins.iter().rev().filter(|m| m.prepend) {
-            self.collect_mixin(mixin, order, unresolved, seen);
+            self.collect_mixin(mixin, order, seen);
         }
-        order.push(name.to_string());
+        order.push(Ancestor::Scanned(name.to_string()));
         for mixin in entry.mixins.iter().rev().filter(|m| !m.prepend) {
-            self.collect_mixin(mixin, order, unresolved, seen);
+            self.collect_mixin(mixin, order, seen);
         }
         if let Some((ns, sup)) = &entry.superclass {
             match self.resolve(ns, sup) {
-                Some(found) => self.collect_ancestors(&found, order, unresolved, seen),
-                None => note_unresolved(unresolved, format!("superclass `{sup}`")),
+                Some(found) => self.collect_ancestors(&found, order, seen),
+                None => note_unresolved(order, format!("superclass `{sup}`")),
             }
         }
     }
 
-    fn collect_mixin(
-        &self,
-        mixin: &Mixin,
-        order: &mut Vec<String>,
-        unresolved: &mut Vec<String>,
-        seen: &mut HashSet<String>,
-    ) {
+    fn collect_mixin(&self, mixin: &Mixin, order: &mut Vec<Ancestor>, seen: &mut HashSet<String>) {
         for module in &mixin.names {
             match self.resolve(&mixin.ns, module) {
-                Some(found) => self.collect_ancestors(&found, order, unresolved, seen),
-                None => note_unresolved(unresolved, format!("module `{module}`")),
+                Some(found) => self.collect_ancestors(&found, order, seen),
+                None => note_unresolved(order, format!("module `{module}`")),
             }
         }
     }
 
-    /// Resolve a superclass name against the module nesting it was written in,
-    /// innermost scope first.
+    /// Resolve a constant name against the lexical nesting it was written in
+    /// (one qualified name per enclosing scope), innermost scope first.
     fn resolve(&self, ns: &[String], sup: &str) -> Option<String> {
         (0..=ns.len()).rev().find_map(|depth| {
             let candidate = if depth == 0 {
                 sup.to_string()
             } else {
-                format!("{}::{sup}", ns[..depth].join("::"))
+                format!("{}::{sup}", ns[depth - 1])
             };
             self.classes.contains_key(&candidate).then_some(candidate)
         })
@@ -878,7 +935,7 @@ end
             Or(
                 Box::new(fact("model.status_id_change")),
                 Box::new(Not(Box::new(And(
-                    Box::new(fact("model.status.closed?")),
+                    Box::new(fact("model.status&.closed?")),
                     Box::new(fact("model.effective_target_versions.any?(&:closed?)")),
                 )))),
             )
@@ -1050,7 +1107,7 @@ end
         assert!(unlowered(&guards, "C", "a").contains("2 statements"));
         assert!(unlowered(&guards, "C", "b").starts_with("unsupported sym:"));
         assert!(unlowered(&guards, "C", "c").contains("no `def missing?`"));
-        assert_eq!(lowered(&guards, "C", "d"), fact("model.owner.admin?"));
+        assert_eq!(lowered(&guards, "C", "d"), fact("model&.owner&.admin?"));
         assert_eq!(
             lowered(&guards, "C", "e"),
             Not(Box::new(fact("model.leaf?")))
@@ -1134,5 +1191,101 @@ end
         let (guards, report) = scan("mod_attr", &[("m.rb", m)]);
         assert!(guards.is_empty());
         assert_eq!(report.attribute_calls, 0);
+    }
+
+    #[test]
+    fn safe_navigation_stays_in_the_fact_name() {
+        let src = "class C\n  attribute :a, writable: -> { model.owner.nil? && !model.owner&.nil? }\n  attribute :b, writable: -> { model&.owner.nil? }\nend\n";
+        let (guards, _) = scan("safe_nav", &[("c.rb", src)]);
+        // Stripping `&.` to `.` makes the first `F && !F`.
+        assert_eq!(
+            lowered(&guards, "C", "a"),
+            And(
+                Box::new(fact("model.owner.nil?")),
+                Box::new(Not(Box::new(fact("model.owner&.nil?")))),
+            )
+        );
+        assert_eq!(lowered(&guards, "C", "b"), fact("model&.owner.nil?"));
+    }
+
+    #[test]
+    fn unscanned_mixin_before_the_defining_ancestor_is_ambiguous() {
+        let base = "class Base\n  def ok?\n    model.base?\n  end\nend\n";
+        let child = "class Child < Base\n  include Elsewhere::Mixin\n  attribute :a, writable: -> { ok? }\nend\n";
+        let (guards, _) = scan("shadow", &[("b.rb", base), ("c.rb", child)]);
+        let reason = unlowered(&guards, "Child", "a");
+        assert!(
+            reason.contains("ambiguous") && reason.contains("module `Elsewhere::Mixin`"),
+            "{reason}"
+        );
+
+        // An unscanned prepend precedes the class's own `def`.
+        let own = "class C\n  prepend Elsewhere::Wrap\n  attribute :a, writable: -> { ok? }\n  def ok?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("shadow_prepend", &[("c.rb", own)]);
+        assert!(unlowered(&guards, "C", "a").contains("module `Elsewhere::Wrap`"));
+    }
+
+    #[test]
+    fn unscanned_mixin_after_the_defining_ancestor_is_harmless() {
+        // The class's own def beats every include, scanned or not.
+        let own = "class C\n  include Elsewhere::Mixin\n  attribute :a, writable: -> { ok? }\n  def ok?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("noshadow_own", &[("c.rb", own)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.own?"));
+
+        // A scanned mixin that defines it wins before the unscanned one is reached.
+        let mods = "module One\n  def p?\n    model.one?\n  end\nend\n";
+        let class = "class C\n  include Elsewhere::Mixin\n  include One\n  attribute :a, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("noshadow_scanned", &[("m.rb", mods), ("c.rb", class)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.one?"));
+
+        // An include in the superclass sits after the child's own def.
+        let base = "class Base\n  include Elsewhere::Mixin\nend\n";
+        let child = "class Child < Base\n  attribute :a, writable: -> { ok? }\n  def ok?\n    model.child?\n  end\nend\n";
+        let (guards, _) = scan("noshadow_super", &[("b.rb", base), ("c.rb", child)]);
+        assert_eq!(lowered(&guards, "Child", "a"), fact("model.child?"));
+    }
+
+    #[test]
+    fn nesting_is_lexical_not_derived_from_the_qualified_name() {
+        let defs = "class Base\n  def ok?\n    model.top?\n  end\nend\n\
+                    module A\n  class Base\n    def ok?\n      model.a?\n    end\n  end\nend\n";
+        // `class A::B` at top level opens one scope, `A::B`; `A` is not in it.
+        let flat =
+            "class A::B\n  class C < Base\n    attribute :x, writable: -> { ok? }\n  end\nend\n";
+        let (guards, _) = scan("nest_flat", &[("d.rb", defs), ("c.rb", flat)]);
+        assert_eq!(lowered(&guards, "A::B::C", "x"), fact("model.top?"));
+
+        let nested = "module A\n  class B\n    class C < Base\n      attribute :x, writable: -> { ok? }\n    end\n  end\nend\n";
+        let (guards, _) = scan("nest_deep", &[("d.rb", defs), ("c.rb", nested)]);
+        assert_eq!(lowered(&guards, "A::B::C", "x"), fact("model.a?"));
+
+        // The scope written as `A::B` itself is searched.
+        let own = "class A::B\n  class Base\n    def ok?\n      model.ab?\n    end\n  end\n  class C < Base\n    attribute :x, writable: -> { ok? }\n  end\nend\n";
+        let (guards, _) = scan("nest_own", &[("d.rb", defs), ("c.rb", own)]);
+        assert_eq!(lowered(&guards, "A::B::C", "x"), fact("model.ab?"));
+    }
+
+    #[test]
+    fn trailing_splat_after_writable_is_unlowered() {
+        let src = "class C\n  attribute :after, writable: true, **opts\n  attribute :before, **opts, writable: true\n  attribute :twice, writable: false, **opts, writable: true\n  attribute :twice_after, writable: false, writable: true, **opts\nend\n";
+        let (guards, report) = scan("splat", &[("c.rb", src)]);
+        let reason = unlowered(&guards, "C", "after");
+        assert!(reason.contains("`**` splat after `writable:`"), "{reason}");
+        assert_eq!(lowered(&guards, "C", "before"), Const(true));
+        // The last `writable:` is the one in force.
+        assert_eq!(lowered(&guards, "C", "twice"), Const(true));
+        assert!(unlowered(&guards, "C", "twice_after").contains("splat"));
+        assert_eq!((report.lowered, report.unlowered), (2, 2));
+    }
+
+    #[test]
+    fn unlowerable_default_fails_even_when_the_parameter_is_unread() {
+        let src = "class C\n  attribute :a, writable: -> { allowed? }\n  attribute :b, writable: -> { read? }\n  def allowed?(unused = raise(\"stop\"))\n    true\n  end\n  def read?(x = model.ok?, y = x)\n    y\n  end\nend\n";
+        let (guards, _) = scan("default", &[("c.rb", src)]);
+        // Storing the failed default and skipping it when unread lowers this to `true`.
+        let reason = unlowered(&guards, "C", "a");
+        assert!(reason.contains("default of parameter `unused`"), "{reason}");
+        // Supported defaults still bind in order, a later one reading an earlier.
+        assert_eq!(lowered(&guards, "C", "b"), fact("model.ok?"));
     }
 }
