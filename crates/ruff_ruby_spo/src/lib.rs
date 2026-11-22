@@ -40,6 +40,7 @@ mod class_functions;
 mod class_macros;
 pub mod events;
 mod functions;
+mod guards;
 mod menu;
 mod menu_regions;
 mod navigation;
@@ -62,6 +63,10 @@ pub use class_functions::{
     extract_class_functions,
 };
 pub use class_macros::{ClassMacroReport, ClassMacroRow, extract_class_macros};
+pub use guards::{
+    ContractGuard, GuardExpr, GuardOutcome, GuardScanReport, extract_contract_guards,
+    extract_contract_guards_with_report,
+};
 pub use menu::{MenuScanReport, extract_menu_edges, extract_menu_edges_with_report};
 pub use menu_regions::{
     Position, RegionEntry, RegionScanReport, extract_menu_guards, extract_menu_quads,
