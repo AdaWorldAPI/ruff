@@ -32,6 +32,14 @@
 //!   the class that declares the attribute, as Ruby's dispatch does). Optional
 //!   parameters are bound to their default expression; a required parameter,
 //!   recursion, or depth beyond [`MAX_INLINE_DEPTH`] is unlowered.
+//! - A receiver-less call rooted at `user` (`user.admin?`) is a fact too, named
+//!   the same way as `model` facts.
+//! - Predicate lookup follows Ruby's ancestor order: `prepend`ed modules (later
+//!   first), the class, `include`d modules (later first; within one
+//!   `include A, B` call `A` wins), then the superclass, recursively. Modules
+//!   resolve like superclasses, against the nesting the `include` was written
+//!   in. Names that resolve to nothing scanned are listed in the unlowered
+//!   reason.
 //! - Everything else is unlowered with a reason naming the node kind and a
 //!   source snippet. Nothing is guessed.
 //!
@@ -208,10 +216,35 @@ struct DefRef<'a> {
     def: &'a DefNode,
 }
 
+/// One `include A, B` / `prepend A, B` call as written.
+struct Mixin {
+    prepend: bool,
+    /// Module nesting the call was written in.
+    ns: Vec<String>,
+    names: Vec<String>,
+}
+
+/// A scanned class or module.
 struct ClassEntry<'a> {
     /// Superclass as written, with the module nesting it was written in.
     superclass: Option<(Vec<String>, String)>,
     defs: HashMap<String, DefRef<'a>>,
+    /// In declaration order.
+    mixins: Vec<Mixin>,
+    /// Modules carry predicates but their `attribute` calls are not guards of
+    /// a contract, so they are not counted.
+    is_module: bool,
+}
+
+impl ClassEntry<'_> {
+    fn new(is_module: bool) -> Self {
+        Self {
+            superclass: None,
+            defs: HashMap::new(),
+            mixins: Vec::new(),
+            is_module,
+        }
+    }
 }
 
 struct Pending<'a> {
@@ -240,13 +273,20 @@ impl<'a> Scan<'a> {
                 }
             }
             Node::Module(m) => {
-                let Some(name) = const_path(&m.name) else {
+                let Some(local) = const_path(&m.name) else {
                     return;
                 };
-                let mut nested = ns.to_vec();
-                nested.push(name);
+                let qualified = if ns.is_empty() {
+                    local
+                } else {
+                    format!("{}::{local}", ns.join("::"))
+                };
+                self.classes
+                    .entry(qualified.clone())
+                    .or_insert_with(|| ClassEntry::new(true));
+                let nested: Vec<String> = qualified.split("::").map(str::to_string).collect();
                 if let Some(body) = m.body.as_deref() {
-                    self.walk(file, src, body, &nested);
+                    self.body(file, src, &qualified, &nested, body);
                 }
             }
             Node::Class(c) => {
@@ -266,26 +306,31 @@ impl<'a> Scan<'a> {
                 let entry = self
                     .classes
                     .entry(qualified.clone())
-                    .or_insert_with(|| ClassEntry {
-                        superclass: None,
-                        defs: HashMap::new(),
-                    });
+                    .or_insert_with(|| ClassEntry::new(false));
                 if entry.superclass.is_none() {
                     entry.superclass = superclass;
                 }
                 let nested: Vec<String> = qualified.split("::").map(str::to_string).collect();
                 if let Some(body) = c.body.as_deref() {
-                    let stmts: Vec<&'a Node> = match body {
-                        Node::Begin(b) => b.statements.iter().collect(),
-                        other => vec![other],
-                    };
-                    for stmt in stmts {
-                        self.statement(file, src, &qualified, &nested, stmt);
-                    }
+                    self.body(file, src, &qualified, &nested, body);
                 }
             }
             _ => {}
         }
+    }
+
+    fn body(&mut self, file: usize, src: &str, class: &str, ns: &[String], body: &'a Node) {
+        let stmts: Vec<&'a Node> = match body {
+            Node::Begin(b) => b.statements.iter().collect(),
+            other => vec![other],
+        };
+        for stmt in stmts {
+            self.statement(file, src, class, ns, stmt);
+        }
+    }
+
+    fn is_module(&self, class: &str) -> bool {
+        self.classes.get(class).is_some_and(|e| e.is_module)
     }
 
     fn statement(&mut self, file: usize, src: &str, class: &str, ns: &[String], stmt: &'a Node) {
@@ -296,7 +341,19 @@ impl<'a> Scan<'a> {
                 // `private def foo` registers `foo` all the same.
                 if let [Node::Def(def)] = send.args.as_slice() {
                     self.add_def(file, class, def);
-                } else if send.method_name == "attribute" {
+                } else if matches!(send.method_name.as_str(), "include" | "prepend") {
+                    let names: Option<Vec<String>> = send.args.iter().map(const_path).collect();
+                    if let Some(names) = names
+                        && !names.is_empty()
+                        && let Some(entry) = self.classes.get_mut(class)
+                    {
+                        entry.mixins.push(Mixin {
+                            prepend: send.method_name == "prepend",
+                            ns: ns.to_vec(),
+                            names,
+                        });
+                    }
+                } else if send.method_name == "attribute" && !self.is_module(class) {
                     self.attribute_call(file, src, class, send);
                 }
             }
@@ -304,6 +361,7 @@ impl<'a> Scan<'a> {
                 if let Node::Send(send) = &**call
                     && send.recv.is_none()
                     && send.method_name == "attribute"
+                    && !self.is_module(class)
                 {
                     self.attribute_call(file, src, class, send);
                 }
@@ -343,6 +401,12 @@ impl<'a> Scan<'a> {
                 value,
             });
         }
+    }
+}
+
+fn note_unresolved(list: &mut Vec<String>, what: String) {
+    if !list.contains(&what) {
+        list.push(what);
     }
 }
 
@@ -454,8 +518,8 @@ impl Lowerer<'_> {
         if !send.args.is_empty() {
             return Err(format!("call with arguments: {}", self.snippet(node, st)));
         }
-        if send.method_name == "model" {
-            return Err("bare `model` is not a fact".to_string());
+        if matches!(send.method_name.as_str(), "model" | "user") {
+            return Err(format!("bare `{}` is not a fact", send.method_name));
         }
         self.inline(&send.method_name, st)
     }
@@ -469,11 +533,11 @@ impl Lowerer<'_> {
             _ => return Err(self.unsupported(node, st)),
         };
         let Some(recv) = recv else {
-            if name == "model" && args.is_empty() {
-                return Ok("model".to_string());
+            if matches!(name, "model" | "user") && args.is_empty() {
+                return Ok(name.to_string());
             }
             return Err(format!(
-                "call not rooted at `model`: {}",
+                "call not rooted at `model` or `user`: {}",
                 self.snippet(node, st)
             ));
         };
@@ -522,8 +586,14 @@ impl Lowerer<'_> {
             ));
         }
         let Some(found) = self.find_def(&st.class, name) else {
+            let (_, unresolved) = self.ancestors(&st.class);
+            let missing = if unresolved.is_empty() {
+                String::new()
+            } else {
+                format!("; unresolved: {}", unresolved.join(", "))
+            };
             return Err(format!(
-                "no `def {name}` in `{}` or its scanned superclasses",
+                "no `def {name}` in `{}`, its scanned included modules or its scanned superclasses{missing}",
                 st.class
             ));
         };
@@ -573,19 +643,66 @@ impl Lowerer<'_> {
         }
     }
 
+    /// First `def name` in Ruby's ancestor order.
     fn find_def(&self, class: &str, name: &str) -> Option<DefRef<'_>> {
-        let mut current = class.to_string();
+        let (order, _) = self.ancestors(class);
+        order
+            .iter()
+            .find_map(|ancestor| self.classes.get(ancestor)?.defs.get(name).copied())
+    }
+
+    /// Ancestor names of `class` in method-lookup order, plus the names that
+    /// were written (`include`, `prepend`, superclass) but resolve to nothing
+    /// scanned.
+    fn ancestors(&self, class: &str) -> (Vec<String>, Vec<String>) {
+        let mut order = Vec::new();
+        let mut unresolved = Vec::new();
         let mut seen = HashSet::new();
-        loop {
-            if !seen.insert(current.clone()) {
-                return None;
+        self.collect_ancestors(class, &mut order, &mut unresolved, &mut seen);
+        (order, unresolved)
+    }
+
+    fn collect_ancestors(
+        &self,
+        name: &str,
+        order: &mut Vec<String>,
+        unresolved: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        let Some(entry) = self.classes.get(name) else {
+            return;
+        };
+        // Later calls sit closer to the class, so they are visited first.
+        for mixin in entry.mixins.iter().rev().filter(|m| m.prepend) {
+            self.collect_mixin(mixin, order, unresolved, seen);
+        }
+        order.push(name.to_string());
+        for mixin in entry.mixins.iter().rev().filter(|m| !m.prepend) {
+            self.collect_mixin(mixin, order, unresolved, seen);
+        }
+        if let Some((ns, sup)) = &entry.superclass {
+            match self.resolve(ns, sup) {
+                Some(found) => self.collect_ancestors(&found, order, unresolved, seen),
+                None => note_unresolved(unresolved, format!("superclass `{sup}`")),
             }
-            let entry = self.classes.get(&current)?;
-            if let Some(found) = entry.defs.get(name) {
-                return Some(*found);
+        }
+    }
+
+    fn collect_mixin(
+        &self,
+        mixin: &Mixin,
+        order: &mut Vec<String>,
+        unresolved: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        for module in &mixin.names {
+            match self.resolve(&mixin.ns, module) {
+                Some(found) => self.collect_ancestors(&found, order, unresolved, seen),
+                None => note_unresolved(unresolved, format!("module `{module}`")),
             }
-            let (ns, sup) = entry.superclass.as_ref()?;
-            current = self.resolve(ns, sup)?;
         }
     }
 
@@ -886,5 +1003,84 @@ end
             lowered(&guards, "C", "e"),
             Not(Box::new(fact("model.leaf?")))
         );
+    }
+
+    const ADMIN_MODULE: &str = r"
+module AdminWritable
+  private
+
+  def admin_ok?
+    user.admin? && Setting.write_readonly?
+  end
+end
+";
+
+    fn admin_expr() -> GuardExpr {
+        And(
+            Box::new(fact("user.admin?")),
+            Box::new(fact("Setting.write_readonly?")),
+        )
+    }
+
+    #[test]
+    fn predicate_from_an_included_module_is_inlined() {
+        let class = "module W\n  class C\n    include AdminWritable\n    attribute :a, writable: -> { admin_ok? }\n  end\nend\n";
+        let (guards, _) = scan("mod_include", &[("m.rb", ADMIN_MODULE), ("c.rb", class)]);
+        // Removing the mixin collection in `statement` makes this unlowered.
+        assert_eq!(lowered(&guards, "W::C", "a"), admin_expr());
+    }
+
+    #[test]
+    fn without_the_include_the_predicate_is_unlowered_and_named() {
+        let class = "class C\n  attribute :a, writable: -> { admin_ok? }\nend\n";
+        let (guards, _) = scan("mod_missing", &[("m.rb", ADMIN_MODULE), ("c.rb", class)]);
+        let reason = unlowered(&guards, "C", "a");
+        assert!(reason.contains("no `def admin_ok?`"), "{reason}");
+        // An include of something that was not scanned is named.
+        let class = "class C\n  include Elsewhere::Mixin\n  attribute :a, writable: -> { admin_ok? }\nend\n";
+        let (guards, _) = scan("mod_unresolved", &[("c.rb", class)]);
+        let reason = unlowered(&guards, "C", "a");
+        assert!(reason.contains("module `Elsewhere::Mixin`"), "{reason}");
+    }
+
+    #[test]
+    fn module_included_in_a_superclass_is_found() {
+        let base = "class Base\n  include AdminWritable\nend\n";
+        let child = "class Child < Base\n  attribute :a, writable: -> { admin_ok? }\nend\n";
+        let (guards, _) = scan(
+            "mod_super",
+            &[("m.rb", ADMIN_MODULE), ("b.rb", base), ("c.rb", child)],
+        );
+        assert_eq!(lowered(&guards, "Child", "a"), admin_expr());
+    }
+
+    #[test]
+    fn later_include_wins_and_class_beats_its_modules() {
+        let mods = "module One\n  def p?\n    model.one?\n  end\nend\nmodule Two\n  def p?\n    model.two?\n  end\nend\n";
+        let later =
+            "class C\n  include One\n  include Two\n  attribute :a, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("mro_later", &[("m.rb", mods), ("c.rb", later)]);
+        // Reversing the `.rev()` over mixins in `collect_ancestors` flips this to one?.
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.two?"));
+
+        let one_call = "class C\n  include One, Two\n  attribute :a, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("mro_one_call", &[("m.rb", mods), ("c.rb", one_call)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.one?"));
+
+        let own = "class C\n  include One\n  attribute :a, writable: -> { p? }\n  def p?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("mro_own", &[("m.rb", mods), ("c.rb", own)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.own?"));
+
+        let pre = "class C\n  prepend One\n  attribute :a, writable: -> { p? }\n  def p?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("mro_prepend", &[("m.rb", mods), ("c.rb", pre)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.one?"));
+    }
+
+    #[test]
+    fn module_attribute_calls_are_not_counted() {
+        let m = "module M\n  attribute :a, writable: true\nend\n";
+        let (guards, report) = scan("mod_attr", &[("m.rb", m)]);
+        assert!(guards.is_empty());
+        assert_eq!(report.attribute_calls, 0);
     }
 }
