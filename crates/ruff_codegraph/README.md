@@ -171,8 +171,10 @@ ruff_codegraph` rewrites the expected files.
 - No spans and no per-row file. Every `file`, `start` and `end` cell is `-`.
 - Fields come only from `attribute` declarations and from `Model::fields`, which
   the Rails model walk leaves empty. Database columns are not read.
-- Concern modules (`module X; extend ActiveSupport::Concern`) are not walked: the
-  frontend collects classes only, so a concern appears only as the object of an
+- Concern modules (`module X; extend ActiveSupport::Concern`) appear in the
+  order lane only: their body and `included do` declarations and their `def`s
+  are `DECL`/`BODY` rows under the scope `ns::module:X`. The structural lane
+  still collects classes only, so a concern is there only the object of an
   `INCLUDES` row and in the file table.
 - The event lane drops the `control` tag of a body event, and body events are
   not tied to the structural rows by anything but the scope name.

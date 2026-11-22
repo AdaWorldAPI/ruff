@@ -2,7 +2,7 @@
   "cardinality": {
     "events": {
       "BODY": 42,
-      "DECL": 19
+      "DECL": 22
     },
     "residuals": {
       "CALLEE_NOT_NAMED": 2,

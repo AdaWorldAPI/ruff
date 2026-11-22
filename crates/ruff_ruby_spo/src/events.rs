@@ -455,6 +455,36 @@ pub struct RailsEvent {
     pub decl: Declaration,
     /// Source byte offset of the macro call.
     pub anchor: u32,
+    /// Where in the unit the declaration was written.
+    pub origin: DeclOrigin,
+}
+
+/// Where a [`RailsEvent`] was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclOrigin {
+    /// Directly in the class or module body.
+    Body,
+    /// Inside the module's `included do ... end` block. `line` is the
+    /// 1-based line of that `included` call in the file the ore came from.
+    Included { line: u32 },
+}
+
+/// Whether a [`ClassOre`] came from a `class` or a `module` body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OreKind {
+    Class,
+    Module,
+}
+
+/// A module's own `include` / `extend` / `prepend` of another module, so a
+/// consumer can follow concerns of concerns.
+#[derive(Debug, Clone)]
+pub struct ModuleInclude {
+    pub kind: ruff_spo_triplet::ConcernKind,
+    /// The constant as written (`Foo::Bar`, `::Baz`).
+    pub module: String,
+    /// Body statement, or inside `included do`.
+    pub origin: DeclOrigin,
 }
 
 /// One method's ordered ore, plus the shipped arm's view of the same body.
@@ -489,6 +519,21 @@ pub struct ClassOre {
     pub declarations: Vec<RailsEvent>,
     /// The Ruby arm: one entry per `def`, in declaration order.
     pub methods: Vec<MethodOre>,
+    /// Class or module.
+    pub kind: OreKind,
+    /// The file label the ore was parsed from (`<events>` for [`source_ore`]).
+    pub file: String,
+    /// `include` / `extend` / `prepend` of other modules, in source order.
+    /// Empty for a class (its own are in `declarations` as
+    /// `Declaration::Concern`).
+    pub includes: Vec<ModuleInclude>,
+    /// The superclass constant path as written (`B`, `::X::Y`), keeping a
+    /// leading `::`. `None` for a module, for a class without a superclass,
+    /// and for a non-constant superclass expression (`Struct.new(:a)`,
+    /// `foo.bar`). Filled by [`source_ore`]/[`source_ore_from`], which see
+    /// the class node; [`class_ore`] receives only the body, so it always
+    /// leaves this `None`.
+    pub superclass: Option<String>,
 }
 
 /// The canonical identity table — the ONLY place dedup happens.
@@ -1336,6 +1381,13 @@ fn rails_kind(decl: &Declaration) -> RailsKind {
 /// yields two declarations yields two events sharing an anchor.
 fn rails_arm(body: &Node) -> Vec<RailsEvent> {
     let mut out = Vec::new();
+    rails_arm_into(body, &DeclOrigin::Body, &mut out);
+    out
+}
+
+/// Walk `body`'s statements, appending to `out` with `seq` continuing from
+/// its length.
+fn rails_arm_into(body: &Node, origin: &DeclOrigin, out: &mut Vec<RailsEvent>) {
     let stmts: Vec<&Node> = match body {
         Node::Begin(b) => b.statements.iter().collect(),
         single => vec![single],
@@ -1351,7 +1403,47 @@ fn rails_arm(body: &Node) -> Vec<RailsEvent> {
                 kind: rails_kind(&decl),
                 decl,
                 anchor: at,
+                origin: origin.clone(),
             });
+        }
+    }
+}
+
+/// The body of `included do ... end` when `stmt` is exactly that block.
+fn included_block(stmt: &Node) -> Option<&Node> {
+    let Node::Block(blk) = stmt else { return None };
+    let Node::Send(call) = &*blk.call else {
+        return None;
+    };
+    if call.recv.is_none() && call.method_name == "included" {
+        blk.body.as_deref()
+    } else {
+        None
+    }
+}
+
+/// 1-based line of a byte offset.
+fn line_at(src: &str, offset: u32) -> u32 {
+    let end = (offset as usize).min(src.len());
+    let lines = src.as_bytes()[..end].split(|b| *b == b'\n').count();
+    u32::try_from(lines).unwrap_or(u32::MAX)
+}
+
+/// The module arm: body declarations in source order, with each direct
+/// `included do ... end` body walked right after its `Concern` marker.
+fn module_rails_arm(body: &Node, src: &str) -> Vec<RailsEvent> {
+    let mut out = Vec::new();
+    let stmts: Vec<&Node> = match body {
+        Node::Begin(b) => b.statements.iter().collect(),
+        single => vec![single],
+    };
+    for stmt in stmts {
+        rails_arm_into(stmt, &DeclOrigin::Body, &mut out);
+        if let Some(inner) = included_block(stmt) {
+            let origin = DeclOrigin::Included {
+                line: line_at(src, anchor(stmt)),
+            };
+            rails_arm_into(inner, &origin, &mut out);
         }
     }
     out
@@ -1406,7 +1498,37 @@ fn defs_of(body: &Node, out: &mut Vec<Node>) {
 /// preserved, never an artefact of having looked twice.
 #[must_use]
 pub fn class_ore(iri: &str, name: &str, body: &Node, syms: &mut Symbols) -> ClassOre {
-    let declarations = rails_arm(body);
+    ore_with(iri, name, body, syms, rails_arm(body), OreKind::Class, "")
+}
+
+/// Walk one `module` body. Like [`class_ore`], plus: the body of every direct
+/// `included do ... end` is walked as class-body declarations (options
+/// preserved), each tagged [`DeclOrigin::Included`]; `include` / `extend` /
+/// `prepend` are listed in [`ClassOre::includes`]. `class_methods do` bodies
+/// are NOT walked (their declarations apply to the singleton, a documented
+/// gap); the `Declaration::Concern` markers are kept.
+#[must_use]
+pub fn module_ore(
+    iri: &str,
+    name: &str,
+    body: &Node,
+    src: &str,
+    file: &str,
+    syms: &mut Symbols,
+) -> ClassOre {
+    let declarations = module_rails_arm(body, src);
+    ore_with(iri, name, body, syms, declarations, OreKind::Module, file)
+}
+
+fn ore_with(
+    iri: &str,
+    name: &str,
+    body: &Node,
+    syms: &mut Symbols,
+    declarations: Vec<RailsEvent>,
+    kind: OreKind,
+    file: &str,
+) -> ClassOre {
     let decls: Vec<Declaration> = declarations.iter().map(|e| e.decl.clone()).collect();
     let known: Vec<String> = decls
         .iter()
@@ -1474,11 +1596,39 @@ pub fn class_ore(iri: &str, name: &str, body: &Node, syms: &mut Symbols) -> Clas
         });
     }
 
+    let includes = if kind == OreKind::Module {
+        declarations
+            .iter()
+            .filter_map(|e| match &e.decl {
+                Declaration::Concern(c)
+                    if matches!(
+                        c.kind,
+                        ruff_spo_triplet::ConcernKind::Include
+                            | ruff_spo_triplet::ConcernKind::Extend
+                            | ruff_spo_triplet::ConcernKind::Prepend
+                    ) =>
+                {
+                    Some(ModuleInclude {
+                        kind: c.kind,
+                        module: c.module.clone(),
+                        origin: e.origin.clone(),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     ClassOre {
         iri: iri.to_string(),
         name: name.to_string(),
         declarations,
         methods,
+        kind,
+        file: file.to_string(),
+        includes,
+        superclass: None,
     }
 }
 
@@ -1489,8 +1639,23 @@ pub fn class_ore(iri: &str, name: &str, body: &Node, syms: &mut Symbols) -> Clas
 /// parser's own silent-skip behaviour rather than inventing a second policy.
 #[must_use]
 pub fn source_ore(src: &str, namespace: &str, syms: &mut Symbols) -> Vec<ClassOre> {
+    source_ore_from("<events>", src, namespace, syms)
+}
+
+/// [`source_ore`] with a file label, recorded on every module's
+/// [`ClassOre::file`] for provenance. Yields one record per `class` AND per
+/// `module` (see [`module_ore`]), in source order, outer before inner. A
+/// body-less `class A < B; end` or `module X; end` yields an empty record
+/// (no declarations or methods; `superclass` still set).
+#[must_use]
+pub fn source_ore_from(
+    file: &str,
+    src: &str,
+    namespace: &str,
+    syms: &mut Symbols,
+) -> Vec<ClassOre> {
     let options = lib_ruby_parser::ParserOptions {
-        buffer_name: "<events>".to_string(),
+        buffer_name: file.to_string(),
         ..Default::default()
     };
     let parser = lib_ruby_parser::Parser::new(src.as_bytes().to_vec(), options);
@@ -1498,24 +1663,37 @@ pub fn source_ore(src: &str, namespace: &str, syms: &mut Symbols) -> Vec<ClassOr
         return Vec::new();
     };
     let mut out = Vec::new();
-    collect(&ast, &[], namespace, syms, &mut out);
+    let ctx = Ctx { src, file };
+    collect(&ast, &[], namespace, &ctx, syms, &mut out);
     out
 }
 
-/// Recurse into `module`/`class`/`begin` wrappers, threading the module
-/// namespace exactly as `parse::collect_classes_with_namespace` does, so a
-/// class IRI from this arm joins the shipped one.
+/// Source and its label, threaded through [`collect`].
+struct Ctx<'a> {
+    src: &'a str,
+    file: &'a str,
+}
+
+/// Recurse into `module`/`class`/`begin` wrappers, threading the lexical
+/// namespace. For top-level classes and classes nested in modules, the class
+/// IRI matches `parse::collect_classes_with_namespace`, so it joins the
+/// shipped arm. A unit nested in a class body is qualified by that class here
+/// (`class Host; module Hooks` gives `Host::Hooks`). The shipped arm does not
+/// do this yet: it names a class nested in a class by the module namespace
+/// alone. For that one shape the two arms' IRIs differ until
+/// `parse::collect_nested_classes` gets the same qualification.
 fn collect(
     node: &Node,
     ns: &[String],
     namespace: &str,
+    ctx: &Ctx<'_>,
     syms: &mut Symbols,
     out: &mut Vec<ClassOre>,
 ) {
     match node {
         Node::Begin(b) => {
             for stmt in &b.statements {
-                collect(stmt, ns, namespace, syms, out);
+                collect(stmt, ns, namespace, ctx, syms, out);
             }
         }
         Node::Module(m) => {
@@ -1524,23 +1702,77 @@ fn collect(
                 nested.push(name);
             }
             if let Some(body) = m.body.as_deref() {
-                collect(body, &nested, namespace, syms, out);
+                let qualified = nested.join("::");
+                let iri = format!("{namespace}:{qualified}");
+                out.push(module_ore(&iri, &qualified, body, ctx.src, ctx.file, syms));
+                collect(body, &nested, namespace, ctx, syms, out);
+            } else {
+                let qualified = nested.join("::");
+                let iri = format!("{namespace}:{qualified}");
+                out.push(empty_ore(iri, qualified, OreKind::Module, ctx.file, None));
             }
         }
         Node::Class(c) => {
-            let local = const_name(&c.name).unwrap_or_default();
+            let local_name = const_name(&c.name).unwrap_or_default();
             let qualified = if ns.is_empty() {
-                local
+                local_name.clone()
             } else {
-                format!("{}::{local}", ns.join("::"))
+                format!("{}::{local_name}", ns.join("::"))
             };
             if let Some(body) = c.body.as_deref() {
                 let iri = format!("{namespace}:{qualified}");
-                out.push(class_ore(&iri, &qualified, body, syms));
-                collect(body, ns, namespace, syms, out);
+                let mut ore = class_ore(&iri, &qualified, body, syms);
+                ore.superclass = c.superclass.as_deref().and_then(superclass_path);
+                out.push(ore);
+                // Units nested in a class body are qualified by the class too:
+                // `class Host; module Hooks` is `Host::Hooks`.
+                let mut nested = ns.to_vec();
+                nested.push(local_name);
+                collect(body, &nested, namespace, ctx, syms, out);
+            } else {
+                let iri = format!("{namespace}:{qualified}");
+                let superclass = c.superclass.as_deref().and_then(superclass_path);
+                out.push(empty_ore(
+                    iri,
+                    qualified,
+                    OreKind::Class,
+                    ctx.file,
+                    superclass,
+                ));
             }
         }
         _ => {}
+    }
+}
+
+/// The record for a `class`/`module` with no body (`class A < B; end`): no
+/// declarations and no methods, but the unit and its superclass link exist.
+fn empty_ore(
+    iri: String,
+    name: String,
+    kind: OreKind,
+    file: &str,
+    superclass: Option<String>,
+) -> ClassOre {
+    ClassOre {
+        iri,
+        name,
+        declarations: Vec::new(),
+        methods: Vec::new(),
+        kind,
+        file: file.to_string(),
+        includes: Vec::new(),
+        superclass,
+    }
+}
+
+/// A superclass constant path as written, keeping a leading `::`.
+fn superclass_path(node: &Node) -> Option<String> {
+    let Node::Const(c) = node else { return None };
+    match c.scope.as_deref() {
+        None => Some(c.name.clone()),
+        Some(Node::Cbase(_)) => Some(format!("::{}", c.name)),
+        Some(scope) => Some(format!("{}::{}", superclass_path(scope)?, c.name)),
     }
 }
 
@@ -1563,6 +1795,182 @@ mod tests {
         let mut syms = Symbols::default();
         let classes = source_ore(src, "op", &mut syms);
         (classes, syms)
+    }
+
+    #[test]
+    fn superclass_is_the_constant_path_as_written() {
+        let (cs, _) = ore(
+            "class A < B\n  def x; end\nend\nclass C < ::X::Y\n  def x; end\nend\nclass D < P::Q\n  def x; end\nend\nclass E\n  def x; end\nend\nclass F < Struct.new(:a)\n  def x; end\nend\nmodule M\n  included do\n    before_save :z\n  end\nend\n",
+        );
+        assert_eq!(by_name(&cs, "A").superclass.as_deref(), Some("B"));
+        assert_eq!(by_name(&cs, "C").superclass.as_deref(), Some("::X::Y"));
+        assert_eq!(by_name(&cs, "D").superclass.as_deref(), Some("P::Q"));
+        assert_eq!(by_name(&cs, "E").superclass, None);
+        assert_eq!(by_name(&cs, "F").superclass, None);
+        assert_eq!(by_name(&cs, "M").superclass, None);
+    }
+
+    #[test]
+    fn bodyless_class_and_module_yield_empty_records() {
+        let (cs, _) = ore("class A < B; end\n");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].name, "A");
+        assert_eq!(cs[0].kind, OreKind::Class);
+        assert_eq!(cs[0].superclass.as_deref(), Some("B"));
+        assert!(cs[0].declarations.is_empty() && cs[0].methods.is_empty());
+        let (cs, _) = ore("module X; end\n");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].name, "X");
+        assert_eq!(cs[0].kind, OreKind::Module);
+        assert_eq!(cs[0].superclass, None);
+        assert!(cs[0].declarations.is_empty() && cs[0].methods.is_empty());
+        let (cs, _) = ore("module O\n  class P < ::Q; end\nend\n");
+        assert_eq!(by_name(&cs, "O::P").superclass.as_deref(), Some("::Q"));
+    }
+
+    #[test]
+    fn units_nested_in_a_class_are_qualified_by_it() {
+        let (cs, _) = ore(
+            "class Host\n  module Hooks\n    before_save :sync\n  end\n  class Inner\n    def x; end\n  end\nend\nclass Other\n  module Hooks\n    after_save :z\n  end\nend\nmodule A\n  class B\n    module C\n      before_save :c\n    end\n  end\nend\n",
+        );
+        let names: Vec<&str> = cs.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Host",
+                "Host::Hooks",
+                "Host::Inner",
+                "Other",
+                "Other::Hooks",
+                "A",
+                "A::B",
+                "A::B::C"
+            ]
+        );
+        assert_eq!(by_name(&cs, "Host::Hooks").iri, "op:Host::Hooks");
+        assert!(
+            by_name(&cs, "Host::Hooks")
+                .declarations
+                .iter()
+                .any(|e| matches!(&e.decl,
+            Declaration::Callback(c) if c.target == "sync"))
+        );
+        assert!(
+            by_name(&cs, "Other::Hooks")
+                .declarations
+                .iter()
+                .any(|e| matches!(&e.decl,
+            Declaration::Callback(c) if c.target == "z"))
+        );
+    }
+
+    #[test]
+    fn class_new_expression_is_not_a_class_node() {
+        let (cs, _) = ore("A = Class.new(Base) do\n  before_save :a\nend\n");
+        assert!(cs.is_empty());
+    }
+
+    fn by_name<'a>(cs: &'a [ClassOre], name: &str) -> &'a ClassOre {
+        cs.iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no unit `{name}`"))
+    }
+
+    const CONCERN: &str = "module Mod\n  extend ActiveSupport::Concern\n  include Other::Thing\n\n  included do\n    before_save :a, if: :ready?\n    validates :b, presence: true\n    has_many :c, dependent: :destroy\n  end\nend\n";
+
+    #[test]
+    fn module_included_block_declarations_are_walked_in_order() {
+        let (cs, _) = ore(CONCERN);
+        let m = by_name(&cs, "Mod");
+        assert_eq!(m.kind, OreKind::Module);
+        let in_block: Vec<&RailsEvent> = m
+            .declarations
+            .iter()
+            .filter(|e| matches!(e.origin, DeclOrigin::Included { .. }))
+            .collect();
+        assert_eq!(in_block.len(), 3);
+        assert!(matches!(&in_block[0].decl, Declaration::Callback(c)
+            if c.phase == "before_save" && c.target == "a"
+                && c.options == vec![("if".to_string(), ":ready?".to_string())]));
+        assert!(matches!(&in_block[1].decl, Declaration::Validation(v)
+            if v.target == "b" && v.options == vec![("presence".to_string(), "true".to_string())]));
+        assert!(matches!(&in_block[2].decl, Declaration::Association(a)
+            if a.name == "c" && a.options == vec![("dependent".to_string(), ":destroy".to_string())]));
+        assert_eq!(in_block[0].origin, DeclOrigin::Included { line: 5 });
+        // seq is contiguous across body and included declarations.
+        let seqs: Vec<u32> = m.declarations.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            (0..u32::try_from(seqs.len()).unwrap()).collect::<Vec<_>>()
+        );
+        // The legacy marker is kept, directly before its block's contents.
+        let marker = m
+            .declarations
+            .iter()
+            .position(|e| {
+                matches!(&e.decl, Declaration::Concern(c)
+                if c.kind == ruff_spo_triplet::ConcernKind::IncludedBlock)
+            })
+            .expect("marker kept");
+        assert_eq!(
+            m.declarations[marker + 1].origin,
+            DeclOrigin::Included { line: 5 }
+        );
+    }
+
+    #[test]
+    fn module_lists_its_own_include_extend_prepend() {
+        let (cs, _) = ore(CONCERN);
+        let m = by_name(&cs, "Mod");
+        let got: Vec<(ruff_spo_triplet::ConcernKind, &str)> = m
+            .includes
+            .iter()
+            .map(|i| (i.kind, i.module.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    ruff_spo_triplet::ConcernKind::Extend,
+                    "ActiveSupport::Concern"
+                ),
+                (ruff_spo_triplet::ConcernKind::Include, "Other::Thing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn module_without_included_has_empty_declaration_stream() {
+        let (cs, _) = ore("module Plain\n  def x; end\nend\n");
+        let m = by_name(&cs, "Plain");
+        assert_eq!(m.kind, OreKind::Module);
+        assert!(m.declarations.is_empty());
+        assert_eq!(m.methods.len(), 1);
+    }
+
+    #[test]
+    fn nested_module_names_are_qualified() {
+        let (cs, _) = ore(
+            "module A\n  module B\n    included do\n      after_save :z\n    end\n  end\nend\n",
+        );
+        let b = by_name(&cs, "A::B");
+        assert_eq!(b.iri, "op:A::B");
+        assert!(b.declarations.iter().any(|e| matches!(&e.decl,
+            Declaration::Callback(c) if c.target == "z")));
+        assert!(by_name(&cs, "A").declarations.is_empty());
+    }
+
+    #[test]
+    fn class_body_is_unchanged_by_module_support() {
+        let (cs, _) = ore(
+            "class K < ApplicationRecord\n  before_save :a\n  included do\n    after_save :ignored\n  end\nend\n",
+        );
+        let k = by_name(&cs, "K");
+        assert_eq!(k.kind, OreKind::Class);
+        assert!(k.includes.is_empty());
+        assert!(k.declarations.iter().all(|e| e.origin == DeclOrigin::Body));
+        assert!(!k.declarations.iter().any(|e| matches!(&e.decl,
+            Declaration::Callback(c) if c.target == "ignored")));
     }
 
     fn method<'a>(c: &'a ClassOre, name: &str) -> &'a MethodOre {
