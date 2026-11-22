@@ -116,11 +116,18 @@ pub fn extract_menu_edges_with_report(
         };
         let rel = relative_path(app_root, path);
         let before = edges.len();
-        for line in content.lines() {
-            let Some(args_start) = menu_push_call(line) else {
+        let lines: Vec<&str> = content.lines().collect();
+        for (i, first) in lines.iter().enumerate() {
+            let Some(args_start) = menu_push_call(first) else {
                 continue;
             };
             report.raw_menu_pushes += 1;
+            // A real registration spans several lines
+            // (`menu.push :projects,` / `{ controller: "/projects", … },` / …);
+            // the continuation lines are the ones indented deeper than the
+            // `push` line.
+            let owned = join_continuation(&lines, i);
+            let line = owned.as_str();
             let args = &line[args_start..];
             // Require a `:label` symbol argument — the shape marker that
             // this `.push` call is the `menu.push :label, target, …` DSL,
@@ -128,8 +135,14 @@ pub fn extract_menu_edges_with_report(
             if first_symbol(args).is_none() {
                 continue;
             }
-            let Some(stem) = controller_kwarg(args).or_else(|| {
-                route_helpers(line)
+            // Only the URL argument names the target. The options after it
+            // (`if: ->(p) { … allowed_to?({ controller: 'x' }, p) }`,
+            // `caption:`, `html:`) can mention other controllers and routes.
+            let Some(url) = url_argument(args) else {
+                continue;
+            };
+            let Some(stem) = controller_kwarg(&url).or_else(|| {
+                route_helpers(&url)
                     .into_iter()
                     .map(|h| resource_stem(&h))
                     .next()
@@ -159,6 +172,68 @@ pub fn extract_menu_edges_with_report(
     });
     edges.dedup_by(|a, b| a.target == b.target && a.file == b.file && a.helper == b.helper);
     (edges, report)
+}
+
+/// The `push` line at `lines[i]` joined with the lines that follow it and are
+/// indented deeper than it, separated by single spaces. The first line's byte
+/// offsets are unchanged, so an offset from [`menu_push_call`] stays valid.
+fn join_continuation(lines: &[&str], i: usize) -> String {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let base = indent(lines[i]);
+    let mut out = lines[i].to_string();
+    for next in &lines[i + 1..] {
+        if next.trim().is_empty() || indent(next) <= base {
+            break;
+        }
+        out.push(' ');
+        out.push_str(next.trim());
+    }
+    out
+}
+
+/// The URL argument of `menu.push :label, <url>, <options…>`: the second
+/// top-level positional argument (a route-helper symbol or a
+/// `{ controller:, action: }` hash). Commas inside `()`, `[]`, `{}` or string
+/// literals do not split arguments. `None` when there is no second argument.
+fn url_argument(args: &str) -> Option<String> {
+    let args = args.trim_start();
+    let args = args.strip_prefix('(').unwrap_or(args);
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut seg_start = 0;
+    let mut index = 0;
+    for (b, c) in args.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => {
+                if index == 1 {
+                    return Some(args[seg_start..b].to_string());
+                }
+                index += 1;
+                seg_start = b + 1;
+            }
+            _ => {}
+        }
+    }
+    (index == 1).then(|| args[seg_start..].to_string())
 }
 
 /// The byte offset right after a `.push` call on a menu-DSL receiver, or
@@ -220,7 +295,10 @@ fn controller_kwarg(s: &str) -> Option<String> {
                             end += 1;
                         }
                         if end < chars.len() {
-                            return Some(chars[start..end].iter().collect());
+                            // `controller: "/projects"` (a root-relative
+                            // controller path) names the same controller.
+                            let value: String = chars[start..end].iter().collect();
+                            return Some(value.trim_start_matches('/').to_string());
                         }
                     }
                 }
@@ -384,6 +462,106 @@ mod tests {
         let (edges, report) = extract_menu_edges_with_report(&root, &vocab());
         assert!(edges.is_empty(), "{edges:?}");
         assert_eq!(report.raw_menu_pushes, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `OpenProject`'s real shape: arguments on continuation lines and a
+    /// root-relative `controller: "/projects"`. The first version of this arm
+    /// only passed single-line fixtures and resolved 0 of 142 pushes on the
+    /// real tree.
+    #[test]
+    fn multi_line_push_with_root_relative_controller_resolves() {
+        let root = scratch_dir("multi_line");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :projects,\n\
+             \x20           { controller: \"/projects\", project_id: nil, action: \"index\" },\n\
+             \x20           context: :modules,\n\
+             \x20           icon: \"project\"\n\
+             \n\
+             \x20 menu.push :work_packages,\n\
+             \x20           { controller: \"/work_packages\", action: \"index\" }\n\
+             end\n",
+        );
+
+        let (edges, report) = extract_menu_edges_with_report(&root, &vocab());
+        let targets: Vec<&str> = edges.iter().map(|e| e.target.as_str()).collect();
+        assert_eq!(targets, ["projects", "work_packages"], "{edges:?}");
+        assert_eq!(report.raw_menu_pushes, 2);
+
+        // The continuation join must stop at the next statement: a second
+        // push's controller is not attributed to the first.
+        assert_eq!(edges.len(), 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `controller:` inside the permission guard on a continuation line must
+    /// not override the route-helper target.
+    #[test]
+    fn guard_controller_does_not_override_route_helper_target() {
+        let root = scratch_dir("guard_vs_helper");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :project_menu do |menu|\n\
+             \x20 menu.push :overview, :project_path,\n\
+             \x20           if: ->(p) { User.current.allowed_to?({ controller: 'work_packages', action: 'index' }, p) }\n\
+             end\n",
+        );
+
+        let edges = extract_menu_edges(&root, &vocab());
+        let targets: Vec<&str> = edges.iter().map(|e| e.target.as_str()).collect();
+        assert_eq!(targets, ["projects"], "{edges:?}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A URL hash spanning lines still resolves (the join is kept), including
+    /// the root-relative controller form.
+    #[test]
+    fn multi_line_url_hash_resolves_root_relative_controller() {
+        let root = scratch_dir("multi_line_hash");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :wp,\n\
+             \x20           {\n\
+             \x20             controller: \"/work_packages\",\n\
+             \x20             action: \"index\"\n\
+             \x20           },\n\
+             \x20           caption: :label_wp\n\
+             end\n",
+        );
+
+        let edges = extract_menu_edges(&root, &vocab());
+        let targets: Vec<&str> = edges.iter().map(|e| e.target.as_str()).collect();
+        assert_eq!(targets, ["work_packages"], "{edges:?}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The target hash wins over a guard naming a different controller.
+    #[test]
+    fn target_hash_wins_over_guard_naming_another_controller() {
+        let root = scratch_dir("hash_vs_guard");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :projects,\n\
+             \x20           { controller: \"/projects\", action: \"index\" },\n\
+             \x20           if: ->(p) { User.current.allowed_to?({ controller: 'work_packages', action: 'index' }, p) }\n\
+             end\n",
+        );
+
+        let edges = extract_menu_edges(&root, &vocab());
+        let targets: Vec<&str> = edges.iter().map(|e| e.target.as_str()).collect();
+        assert_eq!(targets, ["projects"], "{edges:?}");
 
         let _ = fs::remove_dir_all(&root);
     }
