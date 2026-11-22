@@ -45,6 +45,7 @@ mod menu;
 mod menu_regions;
 mod navigation;
 mod parse;
+pub mod rails_generated;
 mod representers;
 mod routes;
 mod schema;
