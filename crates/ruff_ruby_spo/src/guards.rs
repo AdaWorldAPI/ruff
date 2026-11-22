@@ -228,7 +228,17 @@ struct Mixin {
     prepend: bool,
     /// Lexical nesting the call was written in.
     ns: Vec<String>,
-    names: Vec<String>,
+    names: Vec<MixinArg>,
+}
+
+/// One argument of an `include` / `prepend` call.
+enum MixinArg {
+    /// A constant path such as `A::B`.
+    Const(String),
+    /// Anything else (`Object.const_get(:M)`, `*mods`, a local variable): the
+    /// module is only known at run time, so it may define anything. Holds a
+    /// short source snippet for the report.
+    Dynamic(String),
 }
 
 /// A scanned class or module.
@@ -353,9 +363,21 @@ impl<'a> Scan<'a> {
                 if let [Node::Def(def)] = send.args.as_slice() {
                     self.add_def(file, class, def);
                 } else if matches!(send.method_name.as_str(), "include" | "prepend") {
-                    let names: Option<Vec<String>> = send.args.iter().map(const_path).collect();
-                    if let Some(names) = names
-                        && !names.is_empty()
+                    // A non-constant argument keeps its place in the call as an
+                    // unresolved ancestor instead of dropping the whole call.
+                    let names: Vec<MixinArg> = send
+                        .args
+                        .iter()
+                        .map(|arg| match const_path(arg) {
+                            Some(path) => MixinArg::Const(path),
+                            None => MixinArg::Dynamic(format!(
+                                "dynamic `{}` argument `{}`",
+                                send.method_name,
+                                snippet_of(src, arg)
+                            )),
+                        })
+                        .collect();
+                    if !names.is_empty()
                         && let Some(entry) = self.classes.get_mut(class)
                     {
                         entry.mixins.push(Mixin {
@@ -782,10 +804,13 @@ impl Lowerer<'_> {
     }
 
     fn collect_mixin(&self, mixin: &Mixin, order: &mut Vec<Ancestor>, seen: &mut HashSet<String>) {
-        for module in &mixin.names {
-            match self.resolve(&mixin.ns, module) {
-                Some(found) => self.collect_ancestors(&found, order, seen),
-                None => note_unresolved(order, format!("module `{module}`")),
+        for arg in &mixin.names {
+            match arg {
+                MixinArg::Const(module) => match self.resolve(&mixin.ns, module) {
+                    Some(found) => self.collect_ancestors(&found, order, seen),
+                    None => note_unresolved(order, format!("module `{module}`")),
+                },
+                MixinArg::Dynamic(what) => note_unresolved(order, what.clone()),
             }
         }
     }
@@ -812,20 +837,24 @@ impl Lowerer<'_> {
     }
 
     fn snippet(&self, node: &Node, st: &Frame) -> String {
-        let loc = node.expression();
-        let raw = self.files[st.file]
-            .src
-            .as_bytes()
-            .get(loc.begin..loc.end)
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_default();
-        let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        if flat.chars().count() > SNIPPET_MAX_CHARS {
-            let head: String = flat.chars().take(SNIPPET_MAX_CHARS).collect();
-            format!("{head}…")
-        } else {
-            flat
-        }
+        snippet_of(&self.files[st.file].src, node)
+    }
+}
+
+/// Source text of `node`, whitespace-flattened and cut to [`SNIPPET_MAX_CHARS`].
+fn snippet_of(src: &str, node: &Node) -> String {
+    let loc = node.expression();
+    let raw = src
+        .as_bytes()
+        .get(loc.begin..loc.end)
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > SNIPPET_MAX_CHARS {
+        let head: String = flat.chars().take(SNIPPET_MAX_CHARS).collect();
+        format!("{head}…")
+    } else {
+        flat
     }
 }
 
@@ -1243,6 +1272,57 @@ end
         let child = "class Child < Base\n  attribute :a, writable: -> { ok? }\n  def ok?\n    model.child?\n  end\nend\n";
         let (guards, _) = scan("noshadow_super", &[("b.rb", base), ("c.rb", child)]);
         assert_eq!(lowered(&guards, "Child", "a"), fact("model.child?"));
+    }
+
+    #[test]
+    fn non_constant_include_before_a_superclass_def_is_ambiguous() {
+        let base = "class Base\n  def allowed?\n    model.base?\n  end\nend\n";
+        let child = "class Child < Base\n  include Object.const_get(:M)\n  attribute :x, writable: -> { allowed? }\nend\n";
+        let (guards, _) = scan("dyn_include", &[("b.rb", base), ("c.rb", child)]);
+        let reason = unlowered(&guards, "Child", "x");
+        assert!(
+            reason.contains("ambiguous") && reason.contains("Object.const_get(:M)"),
+            "{reason}"
+        );
+
+        // A splat is just as unknown.
+        let child =
+            "class Child < Base\n  include *mods\n  attribute :x, writable: -> { allowed? }\nend\n";
+        let (guards, _) = scan("dyn_splat", &[("b.rb", base), ("c.rb", child)]);
+        assert!(unlowered(&guards, "Child", "x").contains("*mods"));
+    }
+
+    #[test]
+    fn non_constant_prepend_over_the_classes_own_def_is_unlowered() {
+        let own = "class C\n  prepend Object.const_get(:W)\n  attribute :x, writable: -> { ok? }\n  def ok?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("dyn_prepend", &[("c.rb", own)]);
+        let reason = unlowered(&guards, "C", "x");
+        assert!(reason.contains("dynamic `prepend` argument"), "{reason}");
+    }
+
+    #[test]
+    fn non_constant_include_after_the_defining_ancestor_is_harmless() {
+        let own = "class C\n  include Object.const_get(:M)\n  attribute :x, writable: -> { ok? }\n  def ok?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("dyn_after", &[("c.rb", own)]);
+        assert_eq!(lowered(&guards, "C", "x"), fact("model.own?"));
+    }
+
+    #[test]
+    fn mixed_include_keeps_constants_resolved_and_dynamic_ones_in_order() {
+        let mods = "module A\n  def p?\n    model.a?\n  end\nend\n";
+        // `A` comes first in the call and defines it: still lowered.
+        let first = "class C\n  include A, Object.const_get(:M)\n  attribute :x, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("dyn_mixed_a", &[("m.rb", mods), ("c.rb", first)]);
+        assert_eq!(lowered(&guards, "C", "x"), fact("model.a?"));
+
+        // The dynamic module comes before `A`: ambiguous.
+        let second = "class C\n  include Object.const_get(:M), A\n  attribute :x, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("dyn_mixed_b", &[("m.rb", mods), ("c.rb", second)]);
+        let reason = unlowered(&guards, "C", "x");
+        assert!(
+            reason.contains("ambiguous") && reason.contains("const_get"),
+            "{reason}"
+        );
     }
 
     #[test]
