@@ -6,14 +6,16 @@
 //! in the order the walk produced it. It is never sorted by value and never
 //! de-duplicated: the same event twice is two rows.
 //!
-//! `DECL` rows are the declarations of a class body, with the class as scope.
+//! `DECL` rows are the declarations of a class body, with the class as scope
+//! (`ns::Name`), or of a module body and its `included do` block, with the
+//! module as scope (`ns::module:Name`).
 //! `BODY` rows are the events of a method body, with the method as scope.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use ruff_ruby_spo::Declaration;
-use ruff_ruby_spo::events::{ClassOre, Symbols, source_ore};
+use ruff_ruby_spo::events::{ClassOre, OreKind, Symbols, source_ore};
 
 use crate::cell;
 use crate::error::Error;
@@ -79,7 +81,15 @@ impl Events {
         class: &ClassOre,
         names: &BTreeMap<String, String>,
     ) -> Result<(), Error> {
-        let scope = format!("{namespace}::{}", cell::name("class", &class.name)?);
+        // A class keeps `ns::Name`. A module is `ns::module:Name`, the same
+        // shape as the structural lane's `ns::file:<path>`, so a module never
+        // shares a scope string with a class of the same name.
+        let scope = match class.kind {
+            OreKind::Class => format!("{namespace}::{}", cell::name("class", &class.name)?),
+            OreKind::Module => {
+                format!("{namespace}::module:{}", cell::name("module", &class.name)?)
+            }
+        };
         let resolve = |id: Option<&String>| -> String {
             id.map_or_else(
                 || "-".to_owned(),

@@ -60,3 +60,6 @@ shop::Ticket::touch	0	BODY	ScopeEnter	Method	-	585
 shop::Ticket::touch	1	BODY	Write	touched_at	-	599
 shop::Ticket::touch	2	BODY	Const	Time	-	617
 shop::Ticket::touch	3	BODY	ScopeExit	Method	-	585
+shop::module:Trackable	0	DECL	Concern	extend	ActiveSupport::Concern	19
+shop::module:Trackable	1	DECL	Concern	included	-	52
+shop::module:Trackable	2	DECL	Callback	before_save	track_change	68

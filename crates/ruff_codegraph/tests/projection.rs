@@ -818,7 +818,7 @@ fn the_receipt_is_deterministic_and_accounts_for_the_store() {
     assert_eq!(receipt.conservation["calls"].seen, 3);
     assert_eq!(receipt.cardinality.rows["CALLBACK"], 5);
     assert_eq!(receipt.cardinality.rows["IMPORTS"], 4);
-    assert_eq!(receipt.cardinality.events["DECL"], 19);
+    assert_eq!(receipt.cardinality.events["DECL"], 22);
     assert_eq!(receipt.cardinality.residuals["CALLEE_NOT_NAMED"], 2);
     assert_eq!(receipt.cardinality.residuals["REFERENCE_NOT_NAMED"], 2);
     let rows = read(out.path(), "shop.rows.tsv");
