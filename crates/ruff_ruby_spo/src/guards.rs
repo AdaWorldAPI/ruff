@@ -1,0 +1,1371 @@
+//! Contract **writability guards** — `attribute :x, writable: <value>`.
+//!
+//! `OpenProject` contracts declare whether an attribute may be written as a
+//! lambda over the contract's model:
+//!
+//! ```ruby
+//! attribute :start_date,
+//!           writable: ->(*) { leaf_or_manually_scheduled? }
+//!
+//! def leaf_or_manually_scheduled?
+//!   model.leaf? || model.schedule_manually?
+//! end
+//! ```
+//!
+//! This arm lowers each `writable:` value into a small boolean IR
+//! ([`GuardExpr`]) over named facts, or records why it cannot
+//! ([`GuardOutcome::Unlowered`]). It is extraction only: nothing is executed
+//! and no fact is evaluated.
+//!
+//! # Lowering
+//!
+//! - `true` / `false` → [`GuardExpr::Const`]; `||`/`or`, `&&`/`and`, `!`/`not`
+//!   → `Or` / `And` / `Not`.
+//! - A lambda / `lambda {}` / `proc {}` lowers its body, which must be one
+//!   expression.
+//! - A call chain rooted at `model` (plain or `&.`, no arguments except one
+//!   `&:sym` block-pass) becomes a [`GuardExpr::Fact`] with canonical text
+//!   (`model.effective_target_versions.any?(&:closed?)`). Each step keeps its
+//!   own `.` or `&.`: `model.owner` and `model&.owner` are different facts, so
+//!   `model.owner.nil? && !model.owner&.nil?` never collapses to `F && !F`. A no-argument call
+//!   directly on a constant (`WorkPackage.work_based_mode?`) is a fact too.
+//! - A receiver-less, argument-less call is inlined from the `def` found in the
+//!   guard's own class, else its scanned superclasses (lookup always starts at
+//!   the class that declares the attribute, as Ruby's dispatch does). Optional
+//!   parameters are bound to their default expression; a required parameter,
+//!   recursion, or depth beyond [`MAX_INLINE_DEPTH`] is unlowered.
+//! - A receiver-less call rooted at `user` (`user.admin?`) is a fact too, named
+//!   the same way as `model` facts.
+//! - Predicate lookup follows Ruby's ancestor order: `prepend`ed modules (later
+//!   first), the class, `include`d modules (later first; within one
+//!   `include A, B` call `A` wins), then the superclass, recursively. Modules
+//!   resolve like superclasses, against the nesting the `include` was written
+//!   in. Names that resolve to nothing scanned are listed in the unlowered
+//!   reason.
+//! - Everything else is unlowered with a reason naming the node kind and a
+//!   source snippet. Nothing is guessed.
+//!
+//! Only attribute calls that are direct statements of a class body are seen
+//! (optionally with a trailing `do … end` block).
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use lib_ruby_parser::nodes::{Block, Def as DefNode, Send as SendNode};
+use lib_ruby_parser::{Node, Parser, ParserOptions};
+
+/// Deepest chain of inlined `def`s; a fifth nested call is unlowered.
+const MAX_INLINE_DEPTH: usize = 4;
+/// Longest source snippet quoted in an unlowered reason.
+const SNIPPET_MAX_CHARS: usize = 60;
+
+/// A boolean expression over named facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardExpr {
+    Const(bool),
+    /// A named fact, in canonical text (`model.leaf?`).
+    Fact(String),
+    Not(Box<GuardExpr>),
+    And(Box<GuardExpr>, Box<GuardExpr>),
+    Or(Box<GuardExpr>, Box<GuardExpr>),
+}
+
+/// The result of lowering one `writable:` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardOutcome {
+    Lowered(GuardExpr),
+    Unlowered { reason: String },
+}
+
+/// One `attribute :name, writable: …` declaration and its lowering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractGuard {
+    /// Namespaced name of the enclosing class, e.g. `WorkPackages::BaseContract`.
+    pub class: String,
+    pub attribute: String,
+    /// Path relative to the scan root, `/`-separated.
+    pub file: String,
+    /// 1-based line of the `attribute` call.
+    pub line: usize,
+    pub outcome: GuardOutcome,
+}
+
+/// Conservation ledger of a guard scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuardScanReport {
+    /// Every `*.rb` file found under the root.
+    pub rb_files: usize,
+    /// Receiver-less `attribute :sym, …` calls in class bodies.
+    pub attribute_calls: usize,
+    /// Of those, the ones carrying a `writable:` keyword.
+    pub writable_guards: usize,
+    pub lowered: usize,
+    pub unlowered: usize,
+}
+
+/// Lower every `writable:` guard under `root`. Thin wrapper over
+/// [`extract_contract_guards_with_report`].
+#[must_use]
+pub fn extract_contract_guards(root: &Path) -> Vec<ContractGuard> {
+    extract_contract_guards_with_report(root).0
+}
+
+/// Like [`extract_contract_guards`] but also returns the [`GuardScanReport`].
+/// Guards come in sorted file order, then declaration order.
+#[must_use]
+pub fn extract_contract_guards_with_report(root: &Path) -> (Vec<ContractGuard>, GuardScanReport) {
+    let mut paths = Vec::new();
+    collect_rb(root, &mut paths);
+    paths.sort();
+    let files: Vec<Parsed> = paths.iter().map(|p| parse(root, p)).collect();
+
+    let mut report = GuardScanReport {
+        rb_files: files.len(),
+        ..GuardScanReport::default()
+    };
+    let mut scan = Scan::default();
+    for (index, file) in files.iter().enumerate() {
+        if let Some(ast) = &file.ast {
+            scan.walk(index, &file.src, ast, &[]);
+        }
+    }
+    report.attribute_calls = scan.attribute_calls;
+    report.writable_guards = scan.pending.len();
+
+    let lowerer = Lowerer {
+        files: &files,
+        classes: &scan.classes,
+    };
+    let mut guards = Vec::with_capacity(scan.pending.len());
+    for pending in &scan.pending {
+        let mut frame = Frame {
+            file: pending.file,
+            class: pending.class.clone(),
+            stack: Vec::new(),
+            bindings: HashMap::new(),
+        };
+        let lowered = if pending.overridden_by_splat {
+            Err("a `**` splat after `writable:` can override it".to_string())
+        } else {
+            lowerer.lower_writable(pending.value, &mut frame)
+        };
+        let outcome = match lowered {
+            Ok(expr) => {
+                report.lowered += 1;
+                GuardOutcome::Lowered(expr)
+            }
+            Err(reason) => {
+                report.unlowered += 1;
+                GuardOutcome::Unlowered { reason }
+            }
+        };
+        guards.push(ContractGuard {
+            class: pending.class.clone(),
+            attribute: pending.attribute.clone(),
+            file: files[pending.file].rel.clone(),
+            line: pending.line,
+            outcome,
+        });
+    }
+    (guards, report)
+}
+
+struct Parsed {
+    rel: String,
+    src: String,
+    ast: Option<Node>,
+}
+
+fn collect_rb(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rb(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rb") {
+            out.push(path);
+        }
+    }
+}
+
+fn parse(root: &Path, path: &Path) -> Parsed {
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let Ok(src) = fs::read_to_string(path) else {
+        return Parsed {
+            rel,
+            src: String::new(),
+            ast: None,
+        };
+    };
+    let options = ParserOptions {
+        buffer_name: path.display().to_string(),
+        ..Default::default()
+    };
+    let ast = Parser::new(src.as_bytes().to_vec(), options)
+        .do_parse()
+        .ast
+        .map(|boxed| *boxed);
+    Parsed { rel, src, ast }
+}
+
+#[derive(Clone, Copy)]
+struct DefRef<'a> {
+    file: usize,
+    def: &'a DefNode,
+}
+
+/// One `include A, B` / `prepend A, B` call as written.
+struct Mixin {
+    prepend: bool,
+    /// Lexical nesting the call was written in.
+    ns: Vec<String>,
+    names: Vec<MixinArg>,
+}
+
+/// One argument of an `include` / `prepend` call.
+enum MixinArg {
+    /// A constant path such as `A::B`.
+    Const(String),
+    /// Anything else (`Object.const_get(:M)`, `*mods`, a local variable): the
+    /// module is only known at run time, so it may define anything. Holds a
+    /// short source snippet for the report.
+    Dynamic(String),
+}
+
+/// A scanned class or module.
+struct ClassEntry<'a> {
+    /// Superclass as written, with the module nesting it was written in.
+    superclass: Option<(Vec<String>, String)>,
+    defs: HashMap<String, DefRef<'a>>,
+    /// In declaration order.
+    mixins: Vec<Mixin>,
+    /// Modules carry predicates but their `attribute` calls are not guards of
+    /// a contract, so they are not counted.
+    is_module: bool,
+}
+
+impl ClassEntry<'_> {
+    fn new(is_module: bool) -> Self {
+        Self {
+            superclass: None,
+            defs: HashMap::new(),
+            mixins: Vec::new(),
+            is_module,
+        }
+    }
+}
+
+struct Pending<'a> {
+    class: String,
+    file: usize,
+    line: usize,
+    attribute: String,
+    value: &'a Node,
+    /// A `**opts` splat written after the `writable:` pair can override it.
+    overridden_by_splat: bool,
+}
+
+#[derive(Default)]
+struct Scan<'a> {
+    classes: HashMap<String, ClassEntry<'a>>,
+    pending: Vec<Pending<'a>>,
+    attribute_calls: usize,
+}
+
+impl<'a> Scan<'a> {
+    /// Recurse through `module` / `class` / `begin` wrappers. `ns` is the
+    /// lexical nesting, innermost last: one fully qualified name per enclosing
+    /// `module` / `class` keyword (Ruby's `Module.nesting`), so `class A::B` at
+    /// top level contributes the single scope `A::B`, never `A`.
+    fn walk(&mut self, file: usize, src: &str, node: &'a Node, ns: &[String]) {
+        match node {
+            Node::Begin(b) => {
+                for stmt in &b.statements {
+                    self.walk(file, src, stmt, ns);
+                }
+            }
+            Node::Module(m) => {
+                let Some(local) = const_path(&m.name) else {
+                    return;
+                };
+                let qualified = qualify(ns, local);
+                self.classes
+                    .entry(qualified.clone())
+                    .or_insert_with(|| ClassEntry::new(true));
+                let mut nested = ns.to_vec();
+                nested.push(qualified.clone());
+                if let Some(body) = m.body.as_deref() {
+                    self.body(file, src, &qualified, &nested, body);
+                }
+            }
+            Node::Class(c) => {
+                let Some(local) = const_path(&c.name) else {
+                    return;
+                };
+                let qualified = qualify(ns, local);
+                // An absolute path (`::Base`) is recorded with an empty nesting
+                // so `resolve` bypasses lexical lookup.
+                let superclass = c.superclass.as_deref().and_then(|sup| {
+                    let path = const_path(sup)?;
+                    let nesting = if is_absolute(sup) {
+                        Vec::new()
+                    } else {
+                        ns.to_vec()
+                    };
+                    Some((nesting, path))
+                });
+                let entry = self
+                    .classes
+                    .entry(qualified.clone())
+                    .or_insert_with(|| ClassEntry::new(false));
+                if entry.superclass.is_none() {
+                    entry.superclass = superclass;
+                }
+                let mut nested = ns.to_vec();
+                nested.push(qualified.clone());
+                if let Some(body) = c.body.as_deref() {
+                    self.body(file, src, &qualified, &nested, body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn body(&mut self, file: usize, src: &str, class: &str, ns: &[String], body: &'a Node) {
+        let stmts: Vec<&'a Node> = match body {
+            Node::Begin(b) => b.statements.iter().collect(),
+            other => vec![other],
+        };
+        for stmt in stmts {
+            self.statement(file, src, class, ns, stmt);
+        }
+    }
+
+    fn is_module(&self, class: &str) -> bool {
+        self.classes.get(class).is_some_and(|e| e.is_module)
+    }
+
+    fn statement(&mut self, file: usize, src: &str, class: &str, ns: &[String], stmt: &'a Node) {
+        match stmt {
+            Node::Def(def) => self.add_def(file, class, def),
+            Node::Class(_) | Node::Module(_) => self.walk(file, src, stmt, ns),
+            Node::Send(send) if send.recv.is_none() => {
+                // `private def foo` registers `foo` all the same.
+                if let [Node::Def(def)] = send.args.as_slice() {
+                    self.add_def(file, class, def);
+                } else if matches!(send.method_name.as_str(), "include" | "prepend") {
+                    // A non-constant argument keeps its place in the call as an
+                    // unresolved ancestor instead of dropping the whole call.
+                    let names: Vec<MixinArg> = send
+                        .args
+                        .iter()
+                        .map(|arg| match const_path(arg) {
+                            Some(path) => MixinArg::Const(path),
+                            None => MixinArg::Dynamic(format!(
+                                "dynamic `{}` argument `{}`",
+                                send.method_name,
+                                snippet_of(src, arg)
+                            )),
+                        })
+                        .collect();
+                    if !names.is_empty()
+                        && let Some(entry) = self.classes.get_mut(class)
+                    {
+                        entry.mixins.push(Mixin {
+                            prepend: send.method_name == "prepend",
+                            ns: ns.to_vec(),
+                            names,
+                        });
+                    }
+                } else if send.method_name == "attribute" && !self.is_module(class) {
+                    self.attribute_call(file, src, class, send);
+                }
+            }
+            Node::Block(Block { call, .. }) => {
+                if let Node::Send(send) = &**call
+                    && send.recv.is_none()
+                    && send.method_name == "attribute"
+                    && !self.is_module(class)
+                {
+                    self.attribute_call(file, src, class, send);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn add_def(&mut self, file: usize, class: &str, def: &'a DefNode) {
+        if let Some(entry) = self.classes.get_mut(class) {
+            entry.defs.insert(def.name.clone(), DefRef { file, def });
+        }
+    }
+
+    fn attribute_call(&mut self, file: usize, src: &str, class: &str, send: &'a SendNode) {
+        let Some(Node::Sym(sym)) = send.args.first() else {
+            return;
+        };
+        self.attribute_calls += 1;
+        let pairs = match send.args.last() {
+            Some(Node::Kwargs(k)) => &k.pairs,
+            Some(Node::Hash(h)) => &h.pairs,
+            _ => return,
+        };
+        // The last `writable:` wins, as in Ruby; a splat after it can replace it.
+        let writable = pairs.iter().enumerate().rev().find_map(|(index, pair)| match pair {
+            Node::Pair(p) if matches!(&*p.key, Node::Sym(k) if k.name.to_string_lossy() == "writable") => {
+                Some((index, &*p.value))
+            }
+            _ => None,
+        });
+        if let Some((index, value)) = writable {
+            let overridden_by_splat = pairs[index + 1..]
+                .iter()
+                .any(|pair| matches!(pair, Node::Kwsplat(_)));
+            self.pending.push(Pending {
+                class: class.to_string(),
+                file,
+                line: line_of(src, send.expression_l.begin),
+                attribute: sym.name.to_string_lossy(),
+                value,
+                overridden_by_splat,
+            });
+        }
+    }
+}
+
+/// Name of a class declared as `local` inside the innermost scope of `ns`.
+fn qualify(ns: &[String], local: String) -> String {
+    match ns.last() {
+        Some(scope) => format!("{scope}::{local}"),
+        None => local,
+    }
+}
+
+/// One step of a method-lookup order.
+enum Ancestor {
+    /// A scanned class or module, by qualified name.
+    Scanned(String),
+    /// A written name (`module X`, `superclass Y`) that resolves to nothing
+    /// scanned; it may define anything.
+    Unresolved(String),
+}
+
+fn note_unresolved(order: &mut Vec<Ancestor>, what: String) {
+    let known = order
+        .iter()
+        .any(|a| matches!(a, Ancestor::Unresolved(w) if *w == what));
+    if !known {
+        order.push(Ancestor::Unresolved(what));
+    }
+}
+
+fn line_of(src: &str, offset: usize) -> usize {
+    1 + src
+        .as_bytes()
+        .iter()
+        .take(offset)
+        .filter(|b| **b == b'\n')
+        .count()
+}
+
+/// `A::B` for a constant path made only of constants (a leading `::` is
+/// dropped; see [`is_absolute`]).
+fn const_path(node: &Node) -> Option<String> {
+    let Node::Const(c) = node else {
+        return None;
+    };
+    match c.scope.as_deref() {
+        None | Some(Node::Cbase(_)) => Some(c.name.clone()),
+        Some(scope) => const_path(scope).map(|base| format!("{base}::{}", c.name)),
+    }
+}
+
+/// True when the constant path is rooted at `::`.
+fn is_absolute(node: &Node) -> bool {
+    match node {
+        Node::Const(c) => match c.scope.as_deref() {
+            Some(Node::Cbase(_)) => true,
+            Some(scope) => is_absolute(scope),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// `lambda {}`, `proc {}` or `->`: the call a block hangs off.
+fn is_lambda_like(b: &Block) -> bool {
+    match &*b.call {
+        Node::Lambda(_) => true,
+        Node::Send(s) => {
+            s.recv.is_none()
+                && s.args.is_empty()
+                && matches!(s.method_name.as_str(), "lambda" | "proc")
+        }
+        _ => false,
+    }
+}
+
+/// Lowering state: which file the node being lowered lives in, the class
+/// lookups start from, the inline stack, and bound parameters.
+struct Frame {
+    file: usize,
+    class: String,
+    stack: Vec<String>,
+    /// Parameter name → the fact or expression its default stands for.
+    bindings: HashMap<String, GuardExpr>,
+}
+
+struct Lowerer<'a> {
+    files: &'a [Parsed],
+    classes: &'a HashMap<String, ClassEntry<'a>>,
+}
+
+impl Lowerer<'_> {
+    /// The `writable:` value itself is a literal or a lambda; a bare call
+    /// there would run at class-definition time, not as a predicate. Only this
+    /// outer callable is unwrapped: its body is the guard.
+    fn lower_writable(&self, value: &Node, st: &mut Frame) -> Result<GuardExpr, String> {
+        match value {
+            Node::True(_) | Node::False(_) => self.lower(value, st),
+            Node::Block(b) if is_lambda_like(b) => match b.body.as_deref() {
+                Some(body) => self.lower(body, st),
+                None => Err("lambda with an empty body".to_string()),
+            },
+            _ => Err(self.unsupported(value, st)),
+        }
+    }
+
+    fn lower(&self, node: &Node, st: &mut Frame) -> Result<GuardExpr, String> {
+        match node {
+            Node::True(_) => Ok(GuardExpr::Const(true)),
+            Node::False(_) => Ok(GuardExpr::Const(false)),
+            Node::Or(o) => Ok(GuardExpr::Or(
+                Box::new(self.lower(&o.lhs, st)?),
+                Box::new(self.lower(&o.rhs, st)?),
+            )),
+            Node::And(a) => Ok(GuardExpr::And(
+                Box::new(self.lower(&a.lhs, st)?),
+                Box::new(self.lower(&a.rhs, st)?),
+            )),
+            Node::Begin(b) => match b.statements.as_slice() {
+                [one] => self.lower(one, st),
+                many => Err(format!(
+                    "{} statements where one expression is required",
+                    many.len()
+                )),
+            },
+            // A callable inside a guard body is a returned value (a Proc is
+            // truthy), not the predicate.
+            Node::Block(b) if is_lambda_like(b) => Err(format!(
+                "guard returns a callable: {}",
+                self.snippet(node, st)
+            )),
+            Node::Lvar(l) => match st.bindings.get(&l.name) {
+                Some(bound) => Ok(bound.clone()),
+                None => Err(format!("unbound local `{}`", l.name)),
+            },
+            Node::Send(s) => self.lower_send(node, s, st),
+            Node::CSend(_) => self.chain(node, true, st).map(GuardExpr::Fact),
+            _ => Err(self.unsupported(node, st)),
+        }
+    }
+
+    fn lower_send(
+        &self,
+        node: &Node,
+        send: &SendNode,
+        st: &mut Frame,
+    ) -> Result<GuardExpr, String> {
+        if send.method_name == "!"
+            && send.args.is_empty()
+            && let Some(recv) = send.recv.as_deref()
+        {
+            return Ok(GuardExpr::Not(Box::new(self.lower(recv, st)?)));
+        }
+        if send.recv.is_some() {
+            return self.chain(node, true, st).map(GuardExpr::Fact);
+        }
+        if !send.args.is_empty() {
+            return Err(format!("call with arguments: {}", self.snippet(node, st)));
+        }
+        if matches!(send.method_name.as_str(), "model" | "user") {
+            return Err(format!("bare `{}` is not a fact", send.method_name));
+        }
+        self.inline(&send.method_name, st)
+    }
+
+    /// Canonical text of a call chain. `top` is true only for the outermost
+    /// call, the one place a constant receiver is accepted.
+    fn chain(&self, node: &Node, top: bool, st: &Frame) -> Result<String, String> {
+        let (recv, name, args, sep) = match node {
+            Node::Send(s) => (s.recv.as_deref(), s.method_name.as_str(), &s.args, "."),
+            Node::CSend(c) => (Some(&*c.recv), c.method_name.as_str(), &c.args, "&."),
+            _ => return Err(self.unsupported(node, st)),
+        };
+        let Some(recv) = recv else {
+            if matches!(name, "model" | "user") && args.is_empty() {
+                return Ok(name.to_string());
+            }
+            return Err(format!(
+                "call not rooted at `model` or `user`: {}",
+                self.snippet(node, st)
+            ));
+        };
+        let suffix = match args.as_slice() {
+            [] => String::new(),
+            [Node::BlockPass(bp)] => match bp.value.as_deref() {
+                Some(Node::Sym(sym)) => format!("(&:{})", sym.name.to_string_lossy()),
+                _ => {
+                    return Err(format!(
+                        "block-pass that is not a symbol: {}",
+                        self.snippet(node, st)
+                    ));
+                }
+            },
+            _ => {
+                return Err(format!("call with arguments: {}", self.snippet(node, st)));
+            }
+        };
+        let base = match recv {
+            Node::Lvar(l) => match st.bindings.get(&l.name) {
+                Some(GuardExpr::Fact(text)) => text.clone(),
+                Some(_) => {
+                    return Err(format!("local `{}` is not bound to a fact", l.name));
+                }
+                None => return Err(format!("unbound local `{}`", l.name)),
+            },
+            Node::Const(_) if top => const_path(recv).ok_or_else(|| self.unsupported(recv, st))?,
+            Node::Send(_) | Node::CSend(_) => self.chain(recv, false, st)?,
+            _ => return Err(self.unsupported(recv, st)),
+        };
+        Ok(format!("{base}{sep}{name}{suffix}"))
+    }
+
+    /// Inline `def name`, found from the declaring class upward.
+    fn inline(&self, name: &str, st: &mut Frame) -> Result<GuardExpr, String> {
+        if st.stack.iter().any(|n| n == name) {
+            return Err(format!(
+                "recursive inline of `{name}` ({} -> {name})",
+                st.stack.join(" -> ")
+            ));
+        }
+        if st.stack.len() >= MAX_INLINE_DEPTH {
+            return Err(format!(
+                "inline depth limit {MAX_INLINE_DEPTH} reached at `{name}`"
+            ));
+        }
+        let Some(found) = self.find_def(&st.class, name)? else {
+            let missing = self.unresolved_names(&st.class);
+            let missing = if missing.is_empty() {
+                String::new()
+            } else {
+                format!("; unresolved: {}", missing.join(", "))
+            };
+            return Err(format!(
+                "no `def {name}` in `{}`, its scanned included modules or its scanned superclasses{missing}",
+                st.class
+            ));
+        };
+
+        let saved_file = st.file;
+        let saved_bindings = std::mem::take(&mut st.bindings);
+        st.file = found.file;
+        st.stack.push(name.to_string());
+        let result = self.lower_def_body(name, found.def, st);
+        st.stack.pop();
+        st.file = saved_file;
+        st.bindings = saved_bindings;
+        result
+    }
+
+    fn lower_def_body(
+        &self,
+        name: &str,
+        def: &DefNode,
+        st: &mut Frame,
+    ) -> Result<GuardExpr, String> {
+        if let Some(Node::Args(args)) = def.args.as_deref() {
+            for param in &args.args {
+                match param {
+                    Node::Optarg(opt) => {
+                        // Every call here omits its arguments, so the default
+                        // is always evaluated: a default that cannot be lowered
+                        // makes the call unsound whether or not it is read.
+                        let bound = self.lower(&opt.default, st).map_err(|reason| {
+                            format!(
+                                "default of parameter `{}` of `{name}` cannot be lowered: {reason}",
+                                opt.name
+                            )
+                        })?;
+                        st.bindings.insert(opt.name.clone(), bound);
+                    }
+                    Node::Arg(arg) => {
+                        return Err(format!(
+                            "required parameter `{}` of `{name}` has no default",
+                            arg.name
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported parameter in `{name}`: {}",
+                            self.snippet(other, st)
+                        ));
+                    }
+                }
+            }
+        }
+        match def.body.as_deref() {
+            Some(body) => self.lower(body, st),
+            None => Err(format!("`def {name}` has an empty body")),
+        }
+    }
+
+    /// First `def name` in Ruby's ancestor order. `Ok(None)` when nothing
+    /// scanned defines it. When a mixin or superclass that was written but not
+    /// scanned sits *before* the defining ancestor, the unscanned module could
+    /// define the name itself and win the lookup, so the answer is an error
+    /// instead of a guess.
+    fn find_def(&self, class: &str, name: &str) -> Result<Option<DefRef<'_>>, String> {
+        let mut shadow: Option<&str> = None;
+        let order = self.ancestors(class);
+        for ancestor in &order {
+            match ancestor {
+                Ancestor::Unresolved(what) => {
+                    shadow.get_or_insert(what.as_str());
+                }
+                Ancestor::Scanned(scanned) => {
+                    let Some(found) = self.classes.get(scanned).and_then(|e| e.defs.get(name))
+                    else {
+                        continue;
+                    };
+                    if let Some(what) = shadow {
+                        return Err(format!(
+                            "ambiguous lookup of `{name}` in `{class}`: {what} is not scanned and precedes `{scanned}`, which defines it"
+                        ));
+                    }
+                    return Ok(Some(*found));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Names that were written (`include`, `prepend`, superclass) but resolve
+    /// to nothing scanned.
+    fn unresolved_names(&self, class: &str) -> Vec<String> {
+        self.ancestors(class)
+            .into_iter()
+            .filter_map(|a| match a {
+                Ancestor::Unresolved(what) => Some(what),
+                Ancestor::Scanned(_) => None,
+            })
+            .collect()
+    }
+
+    /// Ancestors of `class` in method-lookup order. A name written but not
+    /// scanned keeps its place in the order as [`Ancestor::Unresolved`].
+    fn ancestors(&self, class: &str) -> Vec<Ancestor> {
+        let mut order = Vec::new();
+        let mut seen = HashSet::new();
+        self.collect_ancestors(class, &mut order, &mut seen);
+        order
+    }
+
+    fn collect_ancestors(&self, name: &str, order: &mut Vec<Ancestor>, seen: &mut HashSet<String>) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        let Some(entry) = self.classes.get(name) else {
+            return;
+        };
+        // Later calls sit closer to the class, so they are visited first.
+        for mixin in entry.mixins.iter().rev().filter(|m| m.prepend) {
+            self.collect_mixin(mixin, order, seen);
+        }
+        order.push(Ancestor::Scanned(name.to_string()));
+        for mixin in entry.mixins.iter().rev().filter(|m| !m.prepend) {
+            self.collect_mixin(mixin, order, seen);
+        }
+        if let Some((ns, sup)) = &entry.superclass {
+            match self.resolve(ns, sup) {
+                Some(found) => self.collect_ancestors(&found, order, seen),
+                None => note_unresolved(order, format!("superclass `{sup}`")),
+            }
+        }
+    }
+
+    fn collect_mixin(&self, mixin: &Mixin, order: &mut Vec<Ancestor>, seen: &mut HashSet<String>) {
+        for arg in &mixin.names {
+            match arg {
+                MixinArg::Const(module) => match self.resolve(&mixin.ns, module) {
+                    Some(found) => self.collect_ancestors(&found, order, seen),
+                    None => note_unresolved(order, format!("module `{module}`")),
+                },
+                MixinArg::Dynamic(what) => note_unresolved(order, what.clone()),
+            }
+        }
+    }
+
+    /// Resolve a constant name against the lexical nesting it was written in
+    /// (one qualified name per enclosing scope), innermost scope first.
+    fn resolve(&self, ns: &[String], sup: &str) -> Option<String> {
+        (0..=ns.len()).rev().find_map(|depth| {
+            let candidate = if depth == 0 {
+                sup.to_string()
+            } else {
+                format!("{}::{sup}", ns[depth - 1])
+            };
+            self.classes.contains_key(&candidate).then_some(candidate)
+        })
+    }
+
+    fn unsupported(&self, node: &Node, st: &Frame) -> String {
+        format!(
+            "unsupported {}: {}",
+            node.str_type(),
+            self.snippet(node, st)
+        )
+    }
+
+    fn snippet(&self, node: &Node, st: &Frame) -> String {
+        snippet_of(&self.files[st.file].src, node)
+    }
+}
+
+/// Source text of `node`, whitespace-flattened and cut to [`SNIPPET_MAX_CHARS`].
+fn snippet_of(src: &str, node: &Node) -> String {
+    let loc = node.expression();
+    let raw = src
+        .as_bytes()
+        .get(loc.begin..loc.end)
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
+    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > SNIPPET_MAX_CHARS {
+        let head: String = flat.chars().take(SNIPPET_MAX_CHARS).collect();
+        format!("{head}…")
+    } else {
+        flat
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use GuardExpr::{And, Const, Fact, Not, Or};
+    use std::fmt::Write as _;
+
+    fn fact(text: &str) -> GuardExpr {
+        Fact(text.to_string())
+    }
+
+    fn scan(case: &str, files: &[(&str, &str)]) -> (Vec<ContractGuard>, GuardScanReport) {
+        let root = std::env::temp_dir().join(format!(
+            "ruff_ruby_spo_guards_{}_{case}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for (rel, content) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, content).unwrap();
+        }
+        let out = extract_contract_guards_with_report(&root);
+        let _ = fs::remove_dir_all(&root);
+        out
+    }
+
+    fn outcome<'a>(guards: &'a [ContractGuard], class: &str, attr: &str) -> &'a GuardOutcome {
+        &guards
+            .iter()
+            .find(|g| g.class == class && g.attribute == attr)
+            .unwrap_or_else(|| panic!("no guard {class}#{attr}: {guards:?}"))
+            .outcome
+    }
+
+    fn lowered(guards: &[ContractGuard], class: &str, attr: &str) -> GuardExpr {
+        match outcome(guards, class, attr) {
+            GuardOutcome::Lowered(e) => e.clone(),
+            GuardOutcome::Unlowered { reason } => panic!("{attr} unlowered: {reason}"),
+        }
+    }
+
+    fn unlowered(guards: &[ContractGuard], class: &str, attr: &str) -> String {
+        match outcome(guards, class, attr) {
+            GuardOutcome::Unlowered { reason } => reason.clone(),
+            GuardOutcome::Lowered(e) => panic!("{attr} unexpectedly lowered: {e:?}"),
+        }
+    }
+
+    const BASE: &str = r"
+module WorkPackages
+  # namespace holder
+end
+
+class WorkPackages::BaseContract < ModelContract
+    attribute :status_id,
+              permission: %i[edit_work_packages change_work_package_status],
+              writable: ->(*) {
+                # If we did not change into the status,
+                # mark unwritable if status and version is closed
+                model.status_id_change || !closed_version_and_status?
+              }
+    attribute :done_ratio,
+              writable: ->(*) {
+                          WorkPackage.work_based_mode?
+                        } do
+      next
+    end
+    attribute :derived_done_ratio,
+              writable: false
+    attribute :start_date,
+              writable: ->(*) {
+                leaf_or_manually_scheduled?
+              } do
+      validate_after_soonest_start(:start_date)
+    end
+    attribute :subject
+
+    def closed_version_and_status?(status = model.status)
+      status&.closed? && model.effective_target_versions.any?(&:closed?)
+    end
+
+    def leaf_or_manually_scheduled?
+      model.leaf? || model.schedule_manually?
+    end
+end
+";
+
+    const CHILD: &str = r"
+class WorkPackages::CreateContract < WorkPackages::BaseContract
+  attribute :scheduled, writable: ->(*) { leaf_or_manually_scheduled? }
+end
+";
+
+    #[test]
+    fn openproject_snippet_lowers_to_exact_expressions() {
+        let (guards, _) = scan("snippet", &[("base.rb", BASE), ("child.rb", CHILD)]);
+        let base = "WorkPackages::BaseContract";
+
+        // Disabling parameter-default substitution turns this into `unbound local`.
+        assert_eq!(
+            lowered(&guards, base, "status_id"),
+            Or(
+                Box::new(fact("model.status_id_change")),
+                Box::new(Not(Box::new(And(
+                    Box::new(fact("model.status&.closed?")),
+                    Box::new(fact("model.effective_target_versions.any?(&:closed?)")),
+                )))),
+            )
+        );
+        assert_eq!(
+            lowered(&guards, base, "start_date"),
+            Or(
+                Box::new(fact("model.leaf?")),
+                Box::new(fact("model.schedule_manually?")),
+            )
+        );
+        assert_eq!(
+            lowered(&guards, base, "done_ratio"),
+            fact("WorkPackage.work_based_mode?")
+        );
+        assert_eq!(lowered(&guards, base, "derived_done_ratio"), Const(false));
+    }
+
+    #[test]
+    fn location_and_order_are_reported() {
+        let (guards, _) = scan("location", &[("base.rb", BASE), ("child.rb", CHILD)]);
+        let names: Vec<_> = guards.iter().map(|g| g.attribute.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "status_id",
+                "done_ratio",
+                "derived_done_ratio",
+                "start_date",
+                "scheduled"
+            ]
+        );
+        assert_eq!(guards[0].file, "base.rb");
+        // BASE starts with a newline, so `attribute :status_id` is on line 7.
+        assert_eq!(guards[0].line, 7);
+        assert_eq!(guards[4].file, "child.rb");
+        assert_eq!(guards[4].line, 3);
+    }
+
+    #[test]
+    fn predicate_inherited_from_the_superclass_is_inlined() {
+        let (guards, _) = scan("inherit", &[("base.rb", BASE), ("child.rb", CHILD)]);
+        assert_eq!(
+            lowered(&guards, "WorkPackages::CreateContract", "scheduled"),
+            Or(
+                Box::new(fact("model.leaf?")),
+                Box::new(fact("model.schedule_manually?")),
+            )
+        );
+    }
+
+    #[test]
+    fn report_counts_the_ledger() {
+        let (_, report) = scan("report", &[("base.rb", BASE), ("child.rb", CHILD)]);
+        assert_eq!(
+            report,
+            GuardScanReport {
+                rb_files: 2,
+                attribute_calls: 6,
+                writable_guards: 5,
+                lowered: 5,
+                unlowered: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn call_with_arguments_is_unlowered() {
+        let (guards, report) = scan(
+            "args",
+            &[(
+                "c.rb",
+                "class C\n  attribute :a, writable: ->(*) { can?(1) }\n  attribute :b, writable: ->(*) { model.foo(1) }\nend\n",
+            )],
+        );
+        assert_eq!(unlowered(&guards, "C", "a"), "call with arguments: can?(1)");
+        assert_eq!(
+            unlowered(&guards, "C", "b"),
+            "call with arguments: model.foo(1)"
+        );
+        assert_eq!((report.lowered, report.unlowered), (0, 2));
+    }
+
+    #[test]
+    fn required_parameter_is_unlowered() {
+        let (guards, _) = scan(
+            "required",
+            &[(
+                "c.rb",
+                "class C\n  attribute :a, writable: ->(*) { needs?  }\n  def needs?(x)\n    model.a?\n  end\nend\n",
+            )],
+        );
+        let reason = unlowered(&guards, "C", "a");
+        assert!(reason.contains("required parameter `x`"), "{reason}");
+    }
+
+    #[test]
+    fn mutual_recursion_terminates_unlowered() {
+        let (guards, _) = scan(
+            "recursion",
+            &[(
+                "c.rb",
+                "class C\n  attribute :a, writable: ->(*) { ping? }\n  def ping?\n    pong?\n  end\n  def pong?\n    ping?\n  end\nend\n",
+            )],
+        );
+        let reason = unlowered(&guards, "C", "a");
+        assert!(
+            reason.contains("recursive") && reason.contains("`ping?`"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn inline_depth_is_limited_to_four() {
+        let chain = |len: usize| {
+            let mut src = String::from("class C\n  attribute :a, writable: ->(*) { d1? }\n");
+            for i in 1..=len {
+                let body = if i == len {
+                    "model.leaf?".to_string()
+                } else {
+                    format!("d{}?", i + 1)
+                };
+                let _ = write!(src, "  def d{i}?\n    {body}\n  end\n");
+            }
+            src.push_str("end\n");
+            src
+        };
+        let (ok, _) = scan("depth4", &[("c.rb", &chain(4))]);
+        assert_eq!(lowered(&ok, "C", "a"), fact("model.leaf?"));
+        let (too_deep, _) = scan("depth5", &[("c.rb", &chain(5))]);
+        let reason = unlowered(&too_deep, "C", "a");
+        assert!(reason.contains("depth limit"), "{reason}");
+    }
+
+    #[test]
+    fn absolute_superclass_bypasses_lexical_lookup() {
+        let src = "class Base\n  def ok?\n    model.top?\n  end\nend\n\
+                   module N\n  class Base\n    def ok?\n      model.nested?\n    end\n  end\n\
+                   class Abs < ::Base\n    attribute :a, writable: ->(*) { ok? }\n  end\n\
+                   class Lex < Base\n    attribute :a, writable: ->(*) { ok? }\n  end\nend\n";
+        let (guards, _) = scan("abs_super", &[("c.rb", src)]);
+        assert_eq!(lowered(&guards, "N::Abs", "a"), fact("model.top?"));
+        assert_eq!(lowered(&guards, "N::Lex", "a"), fact("model.nested?"));
+    }
+
+    #[test]
+    fn only_the_outer_writable_callable_is_unwrapped() {
+        let src = "class C\n  attribute :plain, writable: ->(*) { false }\n\
+                   attribute :direct, writable: ->(*) { -> { false } }\n\
+                   attribute :helper, writable: ->(*) { maker }\n\
+                   def maker\n    proc { model.leaf? }\n  end\nend\n";
+        let (guards, _) = scan("callable", &[("c.rb", src)]);
+        assert_eq!(lowered(&guards, "C", "plain"), Const(false));
+        let direct = unlowered(&guards, "C", "direct");
+        assert!(direct.contains("guard returns a callable"), "{direct}");
+        let helper = unlowered(&guards, "C", "helper");
+        assert!(helper.contains("guard returns a callable"), "{helper}");
+    }
+
+    #[test]
+    fn multiple_statements_and_unknown_shapes_are_unlowered() {
+        let (guards, _) = scan(
+            "shapes",
+            &[(
+                "c.rb",
+                "class C\n  attribute :a, writable: ->(*) { x = 1; model.leaf? }\n  attribute :b, writable: :sym\n  attribute :c, writable: ->(*) { missing? }\n  attribute :d, writable: proc { model&.owner&.admin? }\n  attribute :e, writable: lambda { not model.leaf? }\nend\n",
+            )],
+        );
+        assert!(unlowered(&guards, "C", "a").contains("2 statements"));
+        assert!(unlowered(&guards, "C", "b").starts_with("unsupported sym:"));
+        assert!(unlowered(&guards, "C", "c").contains("no `def missing?`"));
+        assert_eq!(lowered(&guards, "C", "d"), fact("model&.owner&.admin?"));
+        assert_eq!(
+            lowered(&guards, "C", "e"),
+            Not(Box::new(fact("model.leaf?")))
+        );
+    }
+
+    const ADMIN_MODULE: &str = r"
+module AdminWritable
+  private
+
+  def admin_ok?
+    user.admin? && Setting.write_readonly?
+  end
+end
+";
+
+    fn admin_expr() -> GuardExpr {
+        And(
+            Box::new(fact("user.admin?")),
+            Box::new(fact("Setting.write_readonly?")),
+        )
+    }
+
+    #[test]
+    fn predicate_from_an_included_module_is_inlined() {
+        let class = "module W\n  class C\n    include AdminWritable\n    attribute :a, writable: -> { admin_ok? }\n  end\nend\n";
+        let (guards, _) = scan("mod_include", &[("m.rb", ADMIN_MODULE), ("c.rb", class)]);
+        // Removing the mixin collection in `statement` makes this unlowered.
+        assert_eq!(lowered(&guards, "W::C", "a"), admin_expr());
+    }
+
+    #[test]
+    fn without_the_include_the_predicate_is_unlowered_and_named() {
+        let class = "class C\n  attribute :a, writable: -> { admin_ok? }\nend\n";
+        let (guards, _) = scan("mod_missing", &[("m.rb", ADMIN_MODULE), ("c.rb", class)]);
+        let reason = unlowered(&guards, "C", "a");
+        assert!(reason.contains("no `def admin_ok?`"), "{reason}");
+        // An include of something that was not scanned is named.
+        let class = "class C\n  include Elsewhere::Mixin\n  attribute :a, writable: -> { admin_ok? }\nend\n";
+        let (guards, _) = scan("mod_unresolved", &[("c.rb", class)]);
+        let reason = unlowered(&guards, "C", "a");
+        assert!(reason.contains("module `Elsewhere::Mixin`"), "{reason}");
+    }
+
+    #[test]
+    fn module_included_in_a_superclass_is_found() {
+        let base = "class Base\n  include AdminWritable\nend\n";
+        let child = "class Child < Base\n  attribute :a, writable: -> { admin_ok? }\nend\n";
+        let (guards, _) = scan(
+            "mod_super",
+            &[("m.rb", ADMIN_MODULE), ("b.rb", base), ("c.rb", child)],
+        );
+        assert_eq!(lowered(&guards, "Child", "a"), admin_expr());
+    }
+
+    #[test]
+    fn later_include_wins_and_class_beats_its_modules() {
+        let mods = "module One\n  def p?\n    model.one?\n  end\nend\nmodule Two\n  def p?\n    model.two?\n  end\nend\n";
+        let later =
+            "class C\n  include One\n  include Two\n  attribute :a, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("mro_later", &[("m.rb", mods), ("c.rb", later)]);
+        // Reversing the `.rev()` over mixins in `collect_ancestors` flips this to one?.
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.two?"));
+
+        let one_call = "class C\n  include One, Two\n  attribute :a, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("mro_one_call", &[("m.rb", mods), ("c.rb", one_call)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.one?"));
+
+        let own = "class C\n  include One\n  attribute :a, writable: -> { p? }\n  def p?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("mro_own", &[("m.rb", mods), ("c.rb", own)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.own?"));
+
+        let pre = "class C\n  prepend One\n  attribute :a, writable: -> { p? }\n  def p?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("mro_prepend", &[("m.rb", mods), ("c.rb", pre)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.one?"));
+    }
+
+    #[test]
+    fn module_attribute_calls_are_not_counted() {
+        let m = "module M\n  attribute :a, writable: true\nend\n";
+        let (guards, report) = scan("mod_attr", &[("m.rb", m)]);
+        assert!(guards.is_empty());
+        assert_eq!(report.attribute_calls, 0);
+    }
+
+    #[test]
+    fn safe_navigation_stays_in_the_fact_name() {
+        let src = "class C\n  attribute :a, writable: -> { model.owner.nil? && !model.owner&.nil? }\n  attribute :b, writable: -> { model&.owner.nil? }\nend\n";
+        let (guards, _) = scan("safe_nav", &[("c.rb", src)]);
+        // Stripping `&.` to `.` makes the first `F && !F`.
+        assert_eq!(
+            lowered(&guards, "C", "a"),
+            And(
+                Box::new(fact("model.owner.nil?")),
+                Box::new(Not(Box::new(fact("model.owner&.nil?")))),
+            )
+        );
+        assert_eq!(lowered(&guards, "C", "b"), fact("model&.owner.nil?"));
+    }
+
+    #[test]
+    fn unscanned_mixin_before_the_defining_ancestor_is_ambiguous() {
+        let base = "class Base\n  def ok?\n    model.base?\n  end\nend\n";
+        let child = "class Child < Base\n  include Elsewhere::Mixin\n  attribute :a, writable: -> { ok? }\nend\n";
+        let (guards, _) = scan("shadow", &[("b.rb", base), ("c.rb", child)]);
+        let reason = unlowered(&guards, "Child", "a");
+        assert!(
+            reason.contains("ambiguous") && reason.contains("module `Elsewhere::Mixin`"),
+            "{reason}"
+        );
+
+        // An unscanned prepend precedes the class's own `def`.
+        let own = "class C\n  prepend Elsewhere::Wrap\n  attribute :a, writable: -> { ok? }\n  def ok?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("shadow_prepend", &[("c.rb", own)]);
+        assert!(unlowered(&guards, "C", "a").contains("module `Elsewhere::Wrap`"));
+    }
+
+    #[test]
+    fn unscanned_mixin_after_the_defining_ancestor_is_harmless() {
+        // The class's own def beats every include, scanned or not.
+        let own = "class C\n  include Elsewhere::Mixin\n  attribute :a, writable: -> { ok? }\n  def ok?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("noshadow_own", &[("c.rb", own)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.own?"));
+
+        // A scanned mixin that defines it wins before the unscanned one is reached.
+        let mods = "module One\n  def p?\n    model.one?\n  end\nend\n";
+        let class = "class C\n  include Elsewhere::Mixin\n  include One\n  attribute :a, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("noshadow_scanned", &[("m.rb", mods), ("c.rb", class)]);
+        assert_eq!(lowered(&guards, "C", "a"), fact("model.one?"));
+
+        // An include in the superclass sits after the child's own def.
+        let base = "class Base\n  include Elsewhere::Mixin\nend\n";
+        let child = "class Child < Base\n  attribute :a, writable: -> { ok? }\n  def ok?\n    model.child?\n  end\nend\n";
+        let (guards, _) = scan("noshadow_super", &[("b.rb", base), ("c.rb", child)]);
+        assert_eq!(lowered(&guards, "Child", "a"), fact("model.child?"));
+    }
+
+    #[test]
+    fn non_constant_include_before_a_superclass_def_is_ambiguous() {
+        let base = "class Base\n  def allowed?\n    model.base?\n  end\nend\n";
+        let child = "class Child < Base\n  include Object.const_get(:M)\n  attribute :x, writable: -> { allowed? }\nend\n";
+        let (guards, _) = scan("dyn_include", &[("b.rb", base), ("c.rb", child)]);
+        let reason = unlowered(&guards, "Child", "x");
+        assert!(
+            reason.contains("ambiguous") && reason.contains("Object.const_get(:M)"),
+            "{reason}"
+        );
+
+        // A splat is just as unknown.
+        let child =
+            "class Child < Base\n  include *mods\n  attribute :x, writable: -> { allowed? }\nend\n";
+        let (guards, _) = scan("dyn_splat", &[("b.rb", base), ("c.rb", child)]);
+        assert!(unlowered(&guards, "Child", "x").contains("*mods"));
+    }
+
+    #[test]
+    fn non_constant_prepend_over_the_classes_own_def_is_unlowered() {
+        let own = "class C\n  prepend Object.const_get(:W)\n  attribute :x, writable: -> { ok? }\n  def ok?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("dyn_prepend", &[("c.rb", own)]);
+        let reason = unlowered(&guards, "C", "x");
+        assert!(reason.contains("dynamic `prepend` argument"), "{reason}");
+    }
+
+    #[test]
+    fn non_constant_include_after_the_defining_ancestor_is_harmless() {
+        let own = "class C\n  include Object.const_get(:M)\n  attribute :x, writable: -> { ok? }\n  def ok?\n    model.own?\n  end\nend\n";
+        let (guards, _) = scan("dyn_after", &[("c.rb", own)]);
+        assert_eq!(lowered(&guards, "C", "x"), fact("model.own?"));
+    }
+
+    #[test]
+    fn mixed_include_keeps_constants_resolved_and_dynamic_ones_in_order() {
+        let mods = "module A\n  def p?\n    model.a?\n  end\nend\n";
+        // `A` comes first in the call and defines it: still lowered.
+        let first = "class C\n  include A, Object.const_get(:M)\n  attribute :x, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("dyn_mixed_a", &[("m.rb", mods), ("c.rb", first)]);
+        assert_eq!(lowered(&guards, "C", "x"), fact("model.a?"));
+
+        // The dynamic module comes before `A`: ambiguous.
+        let second = "class C\n  include Object.const_get(:M), A\n  attribute :x, writable: -> { p? }\nend\n";
+        let (guards, _) = scan("dyn_mixed_b", &[("m.rb", mods), ("c.rb", second)]);
+        let reason = unlowered(&guards, "C", "x");
+        assert!(
+            reason.contains("ambiguous") && reason.contains("const_get"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn nesting_is_lexical_not_derived_from_the_qualified_name() {
+        let defs = "class Base\n  def ok?\n    model.top?\n  end\nend\n\
+                    module A\n  class Base\n    def ok?\n      model.a?\n    end\n  end\nend\n";
+        // `class A::B` at top level opens one scope, `A::B`; `A` is not in it.
+        let flat =
+            "class A::B\n  class C < Base\n    attribute :x, writable: -> { ok? }\n  end\nend\n";
+        let (guards, _) = scan("nest_flat", &[("d.rb", defs), ("c.rb", flat)]);
+        assert_eq!(lowered(&guards, "A::B::C", "x"), fact("model.top?"));
+
+        let nested = "module A\n  class B\n    class C < Base\n      attribute :x, writable: -> { ok? }\n    end\n  end\nend\n";
+        let (guards, _) = scan("nest_deep", &[("d.rb", defs), ("c.rb", nested)]);
+        assert_eq!(lowered(&guards, "A::B::C", "x"), fact("model.a?"));
+
+        // The scope written as `A::B` itself is searched.
+        let own = "class A::B\n  class Base\n    def ok?\n      model.ab?\n    end\n  end\n  class C < Base\n    attribute :x, writable: -> { ok? }\n  end\nend\n";
+        let (guards, _) = scan("nest_own", &[("d.rb", defs), ("c.rb", own)]);
+        assert_eq!(lowered(&guards, "A::B::C", "x"), fact("model.ab?"));
+    }
+
+    #[test]
+    fn trailing_splat_after_writable_is_unlowered() {
+        let src = "class C\n  attribute :after, writable: true, **opts\n  attribute :before, **opts, writable: true\n  attribute :twice, writable: false, **opts, writable: true\n  attribute :twice_after, writable: false, writable: true, **opts\nend\n";
+        let (guards, report) = scan("splat", &[("c.rb", src)]);
+        let reason = unlowered(&guards, "C", "after");
+        assert!(reason.contains("`**` splat after `writable:`"), "{reason}");
+        assert_eq!(lowered(&guards, "C", "before"), Const(true));
+        // The last `writable:` is the one in force.
+        assert_eq!(lowered(&guards, "C", "twice"), Const(true));
+        assert!(unlowered(&guards, "C", "twice_after").contains("splat"));
+        assert_eq!((report.lowered, report.unlowered), (2, 2));
+    }
+
+    #[test]
+    fn unlowerable_default_fails_even_when_the_parameter_is_unread() {
+        let src = "class C\n  attribute :a, writable: -> { allowed? }\n  attribute :b, writable: -> { read? }\n  def allowed?(unused = raise(\"stop\"))\n    true\n  end\n  def read?(x = model.ok?, y = x)\n    y\n  end\nend\n";
+        let (guards, _) = scan("default", &[("c.rb", src)]);
+        // Storing the failed default and skipping it when unread lowers this to `true`.
+        let reason = unlowered(&guards, "C", "a");
+        assert!(reason.contains("default of parameter `unused`"), "{reason}");
+        // Supported defaults still bind in order, a later one reading an earlier.
+        assert_eq!(lowered(&guards, "C", "b"), fact("model.ok?"));
+    }
+}
