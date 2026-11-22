@@ -33,7 +33,7 @@
 //! | `has_one` | `after_create` / `after_update` the same save method | `:209-210` |
 //! | `belongs_to` | `before_save :autosave_associated_records_for_<name>` | `:213` |
 //! | any of the three | `validate :validate_associated_records_for_<name>` and `after_validation :_ensure_no_duplicate_errors`, only when `validate?` holds and the validation method is not yet defined | `:219-233` |
-//! | `belongs_to` | presence validator on `<name>` (`message: :required`) when required | `builder/belongs_to.rb:207-241` |
+//! | `belongs_to` | presence validator on `<name>` (`message: :required`) when required | `builder/belongs_to.rb:131-166` |
 //! | `has_one` with `required:` | presence validator on `<name>` | `builder/has_one.rb:30-35` |
 //! | `accepts_nested_attributes_for` | sets `autosave = true` on the named association and runs the validation step again | `nested_attributes.rb:361-362` |
 //!
@@ -49,12 +49,12 @@
 //! configuration, so it comes from [`RailsDefaults`]; unset, the outcome is
 //! [`Generated::Undecided`] rather than a guess. The same holds for
 //! `belongs_to_required_validates_foreign_key`, which decides whether the
-//! presence validator carries an `if:` condition (`belongs_to.rb:220-240`).
+//! presence validator carries an `if:` condition (`belongs_to.rb:144-165`).
 //!
 //! `has_and_belongs_to_many` also registers the collection callbacks of an
 //! internal middle `has_many` first (`associations.rb:2020`), whose name is
 //! `[<class>.downcase.pluralize, <assoc>].sort.join("_")`
-//! (`builder/has_and_belongs_to_many.rb:228-230`). That needs `ActiveSupport`'s
+//! (`builder/has_and_belongs_to_many.rb:59-61`). That needs `ActiveSupport`'s
 //! inflector, so the middle association's callbacks are [`Generated::Undecided`]
 //! and the visible `has_many` follows with `autosave:` and `validate:`
 //! forwarded as Rails does (`associations.rb:2038-2042`).
@@ -65,20 +65,34 @@
 //! renders every other value as `<expr>`, a symbol as `:x`, …) and that a rule
 //! needs yields [`Generated::Undecided`] naming the rule and the reason.
 //!
+//! # Keyword splats
+//!
+//! `has_many :x, **opts` may carry any option, so a splat is never read as "no
+//! options". The harvest records it in
+//! [`ruff_spo_triplet::AssocDecl::option_splats`], with the number of explicit
+//! options before it. An option is known only when an explicit key for it
+//! appears AFTER the last splat (a later key wins in a Ruby hash literal); an
+//! explicit key before a splat, or none, is unknown. Per rule:
+//!
+//! | rule | reads | with a splat |
+//! |---|---|---|
+//! | save callbacks (`autosave_association.rb:193-213`) | nothing | derived |
+//! | `validate?` step (`reflection.rb:717-719`, `autosave_association.rb:219-233`) | `validate`, and `autosave` for a singular association | `Undecided` unless decided after the splat |
+//! | `belongs_to` presence (`builder/belongs_to.rb:131-166`) | `required`, `optional` | `Undecided` unless decided after the splat |
+//! | `has_one` presence (`builder/has_one.rb:32-34`) | `required` | `Undecided` unless decided after the splat |
+//! | `accepts_nested_attributes_for` (`nested_attributes.rb:361-362`) | `validate` of the named association | `Undecided` unless decided after the splat |
+//! | `has_and_belongs_to_many` middle association (`associations.rb:2020`) | nothing | `Undecided` as before |
+//!
 //! # Not covered
 //!
 //! - `dependent:` (`builder/association.rb:144-154`), `touch:`
-//!   (`belongs_to.rb:165-187`, `has_one.rb:46-56`), `counter_cache:`
-//!   (`belongs_to.rb:104-119`) and `default:` register anonymous lambdas, so
+//!   (`belongs_to.rb:89-110`, `has_one.rb:46-56`), `counter_cache:`
+//!   (`belongs_to.rb:28-43`) and `default:` (`belongs_to.rb:113-117`) register anonymous lambdas, so
 //!   there is no filter name to report, and their callback sets depend on
 //!   further options (`through:`, `counter_cache_column`).
 //! - The `before_add`/`after_add`/`before_remove`/`after_remove` hooks of
-//!   collections (`collection_association.rb:114-139`) are class attributes,
+//!   collections (`builder/collection_association.rb:12-18`, `:30-54`) are class attributes,
 //!   not chain callbacks.
-//! - `**opts` splats: the declaration harvest drops a keyword splat from
-//!   [`ruff_spo_triplet::AssocDecl::options`] (`walk::hash_pairs` keeps only
-//!   `Pair` nodes), so an association built with a splat looks the same as one
-//!   without. Options hidden that way are invisible here.
 //! - A name declared twice. Rails de-duplicates a repeated symbol filter in a
 //!   chain (the later registration replaces the earlier one), which moves it
 //!   in the order; only the validation step's own
@@ -86,12 +100,12 @@
 //! - Associations inherited from a superclass or a concern: an
 //!   `accepts_nested_attributes_for` naming one is [`Generated::Undecided`].
 //! - The associations Rails builds on the join model of a
-//!   `has_and_belongs_to_many` (`has_and_belongs_to_many.rb:202-211`), which
+//!   `has_and_belongs_to_many` (`builder/has_and_belongs_to_many.rb:34-43`), which
 //!   live on another class.
 
 use std::collections::{HashMap, HashSet};
 
-use ruff_spo_triplet::{AssocDecl, AssocKind};
+use ruff_spo_triplet::{AssocDecl, AssocKind, OptionSplat};
 
 use crate::Declaration;
 use crate::events::RailsEvent;
@@ -184,7 +198,7 @@ pub struct RailsDefaults {
     /// `ActiveRecord::Base.belongs_to_required_by_default` (`core.rb:88`).
     pub belongs_to_required_by_default: Option<bool>,
     /// `ActiveRecord.belongs_to_required_validates_foreign_key`
-    /// (`builder/belongs_to.rb:221`).
+    /// (`builder/belongs_to.rb:145`).
     pub belongs_to_required_validates_foreign_key: Option<bool>,
 }
 
@@ -222,18 +236,40 @@ enum Lit {
     Other(String),
 }
 
-/// The value of `key`, last occurrence winning as in a Ruby hash.
-fn option(options: &[(String, String)], key: &str) -> Option<Lit> {
-    options
+/// The value of `key` on `decl`, last occurrence winning as in a Ruby hash.
+///
+/// `Ok(None)` is "absent". With a `**splat` in the hash, an occurrence only
+/// counts when it comes after the last splat; otherwise the splat may supply
+/// or override the key and the result is `Err` naming the splat.
+fn option(decl: &AssocDecl, key: &str) -> Result<Option<Lit>, String> {
+    let last = decl
+        .options
         .iter()
+        .enumerate()
         .rev()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| match v.as_str() {
+        .find(|(_, (k, _))| k == key);
+    let after_splats = decl.option_splats.iter().map(|s| s.before).max();
+    match (last, after_splats) {
+        (Some((i, (_, v))), tail) if tail.is_none_or(|t| i >= t) => Ok(Some(match v.as_str() {
             "true" => Lit::True,
             "false" => Lit::False,
             "nil" => Lit::Nil,
             other => Lit::Other(other.to_string()),
-        })
+        })),
+        (None, None) => Ok(None),
+        _ => {
+            let splats: Vec<&str> = decl
+                .option_splats
+                .iter()
+                .map(|s| s.source.as_str())
+                .collect();
+            Err(format!(
+                "`{key}:` may be supplied by the keyword splat `{}`, which cannot be read \
+                 (an explicit `{key}:` after the splat would decide it)",
+                splats.join("`, `")
+            ))
+        }
+    }
 }
 
 fn not_literal(key: &str, value: &str) -> String {
@@ -248,15 +284,14 @@ struct Derive {
     validated: HashSet<String>,
     /// The latest declaration per association name, for
     /// `accepts_nested_attributes_for`.
-    seen: HashMap<String, (AssocKind, Vec<(String, String)>)>,
+    seen: HashMap<String, AssocDecl>,
 }
 
 impl Derive {
     fn declaration(&mut self, event: &RailsEvent, decl: &AssocDecl) {
         match decl.kind {
             AssocKind::BelongsTo | AssocKind::HasOne | AssocKind::HasMany => {
-                self.seen
-                    .insert(decl.name.clone(), (decl.kind, decl.options.clone()));
+                self.seen.insert(decl.name.clone(), decl.clone());
                 self.association(event, decl, decl.kind);
             }
             AssocKind::HasAndBelongsToMany => {
@@ -276,13 +311,26 @@ impl Derive {
                     .filter(|(k, _)| k == "autosave" || k == "validate")
                     .cloned()
                     .collect();
-                self.seen
-                    .insert(decl.name.clone(), (decl.kind, forwarded.clone()));
+                // A splat is kept: it may carry either forwarded key. Its
+                // position moves with the options that were filtered out.
+                let option_splats = decl
+                    .option_splats
+                    .iter()
+                    .map(|splat| OptionSplat {
+                        source: splat.source.clone(),
+                        before: decl.options[..splat.before]
+                            .iter()
+                            .filter(|(k, _)| k == "autosave" || k == "validate")
+                            .count(),
+                    })
+                    .collect();
                 let forwarded = AssocDecl {
                     kind: AssocKind::HasMany,
                     name: decl.name.clone(),
                     options: forwarded,
+                    option_splats,
                 };
+                self.seen.insert(decl.name.clone(), forwarded.clone());
                 self.association(event, &forwarded, AssocKind::HasMany);
             }
             AssocKind::AcceptsNestedAttributesFor => self.nested(event, decl),
@@ -349,7 +397,7 @@ impl Derive {
             }
         }
 
-        match validate_predicate(kind == AssocKind::HasMany, &decl.options) {
+        match validate_predicate(kind == AssocKind::HasMany, decl) {
             Ok(true) => self.validation_step(event, name),
             Ok(false) => {}
             Err(reason) => self.undecided(event, name, format!("{REFLECTION}:717-719"), reason),
@@ -387,34 +435,14 @@ impl Derive {
 
     fn belongs_to_presence(&mut self, event: &RailsEvent, decl: &AssocDecl) {
         let name = &decl.name;
-        let rule = format!("{BELONGS_TO}:207-223");
-        let required = if let Some(required) = option(&decl.options, "required") {
-            // `required:` is rewritten to `optional: !required` (`:208-210`).
-            match required {
-                Lit::True => Ok(true),
-                Lit::False | Lit::Nil => Ok(false),
-                Lit::Other(v) => Err(not_literal("required", &v)),
-            }
-        } else {
-            match option(&decl.options, "optional") {
-                Some(Lit::True) => Ok(false),
-                Some(Lit::False) => Ok(true),
-                Some(Lit::Other(v)) => Err(not_literal("optional", &v)),
-                Some(Lit::Nil) | None => {
-                    self.defaults.belongs_to_required_by_default.ok_or_else(|| {
-                        "neither `optional:` nor `required:` given, and \
-                         `belongs_to_required_by_default` is application configuration"
-                            .to_string()
-                    })
-                }
-            }
-        };
+        let rule = format!("{BELONGS_TO}:132-140");
+        let required = self.belongs_to_required(decl);
         match required {
             Err(reason) => self.undecided(event, name, rule, reason),
             Ok(false) => {}
             Ok(true) => match self.defaults.belongs_to_required_validates_foreign_key {
                 Some(true) => {
-                    self.presence(event, name, Vec::new(), format!("{BELONGS_TO}:221-222"));
+                    self.presence(event, name, Vec::new(), format!("{BELONGS_TO}:145-146"));
                 }
                 Some(false) => self.presence(
                     event,
@@ -423,12 +451,12 @@ impl Derive {
                         "if".to_string(),
                         "foreign key (or polymorphic type) is nil or changed".to_string(),
                     )],
-                    format!("{BELONGS_TO}:224-239"),
+                    format!("{BELONGS_TO}:147-163"),
                 ),
                 None => self.undecided(
                     event,
                     name,
-                    format!("{BELONGS_TO}:220-240"),
+                    format!("{BELONGS_TO}:144-165"),
                     "`belongs_to_required_validates_foreign_key` decides whether the presence \
                      validator is conditional and is application configuration"
                         .to_string(),
@@ -437,8 +465,41 @@ impl Derive {
         }
     }
 
+    /// Whether `belongs_to` is required (`builder/belongs_to.rb:132-140`).
+    /// `required:` is rewritten to `optional: !required` and wins over a
+    /// given `optional:`, so a splat that may supply `required:` hides
+    /// `optional:` too.
+    fn belongs_to_required(&self, decl: &AssocDecl) -> Result<bool, String> {
+        if let Some(required) = option(decl, "required")? {
+            return match required {
+                Lit::True => Ok(true),
+                Lit::False | Lit::Nil => Ok(false),
+                Lit::Other(v) => Err(not_literal("required", &v)),
+            };
+        }
+        match option(decl, "optional")? {
+            Some(Lit::True) => Ok(false),
+            Some(Lit::False) => Ok(true),
+            Some(Lit::Other(v)) => Err(not_literal("optional", &v)),
+            Some(Lit::Nil) | None => {
+                self.defaults.belongs_to_required_by_default.ok_or_else(|| {
+                    "neither `optional:` nor `required:` given, and \
+                 `belongs_to_required_by_default` is application configuration"
+                        .to_string()
+                })
+            }
+        }
+    }
+
     fn has_one_presence(&mut self, event: &RailsEvent, decl: &AssocDecl) {
-        match option(&decl.options, "required") {
+        let required = match option(decl, "required") {
+            Ok(required) => required,
+            Err(reason) => {
+                self.undecided(event, &decl.name, format!("{HAS_ONE}:32"), reason);
+                return;
+            }
+        };
+        match required {
             Some(Lit::True) => {
                 self.presence(event, &decl.name, Vec::new(), format!("{HAS_ONE}:32-34"));
             }
@@ -455,7 +516,7 @@ impl Derive {
     fn nested(&mut self, event: &RailsEvent, decl: &AssocDecl) {
         let name = &decl.name;
         let rule = format!("{NESTED}:361-362");
-        let Some((_, options)) = self.seen.get(name) else {
+        let Some(target) = self.seen.get(name) else {
             self.undecided(
                 event,
                 name,
@@ -468,10 +529,11 @@ impl Derive {
         };
         // `reflection.autosave = true` makes `validate?` true unless an
         // explicit `validate:` says otherwise.
-        let holds = match option(options, "validate") {
-            Some(Lit::False) => Ok(false),
-            Some(Lit::True | Lit::Nil) | None => Ok(true),
-            Some(Lit::Other(v)) => Err(not_literal("validate", &v)),
+        let holds = match option(target, "validate") {
+            Ok(Some(Lit::False)) => Ok(false),
+            Ok(Some(Lit::True | Lit::Nil) | None) => Ok(true),
+            Ok(Some(Lit::Other(v))) => Err(not_literal("validate", &v)),
+            Err(reason) => Err(reason),
         };
         match holds {
             Ok(true) => self.validation_step(event, name),
@@ -559,8 +621,8 @@ impl Derive {
 }
 
 /// `reflection.validate?` (`reflection.rb:717-719`).
-fn validate_predicate(collection: bool, options: &[(String, String)]) -> Result<bool, String> {
-    match option(options, "validate") {
+fn validate_predicate(collection: bool, decl: &AssocDecl) -> Result<bool, String> {
+    match option(decl, "validate")? {
         Some(Lit::True) => return Ok(true),
         Some(Lit::False) => return Ok(false),
         Some(Lit::Other(v)) => return Err(not_literal("validate", &v)),
@@ -569,7 +631,7 @@ fn validate_predicate(collection: bool, options: &[(String, String)]) -> Result<
     if collection {
         return Ok(true);
     }
-    match option(options, "autosave") {
+    match option(decl, "autosave")? {
         Some(Lit::True) => Ok(true),
         Some(Lit::False | Lit::Nil) | None => Ok(false),
         Some(Lit::Other(v)) => Err(not_literal("autosave", &v)),
@@ -761,7 +823,7 @@ mod tests {
             panic!("expected the presence validator, got {got:?}");
         };
         assert!(c.options.iter().any(|(k, _)| k == "if"));
-        assert!(c.origin.rule.ends_with("belongs_to.rb:224-239"));
+        assert!(c.origin.rule.ends_with("belongs_to.rb:147-163"));
         let got = run("belongs_to :project");
         let Generated::Callback(c) = &got[1] else {
             panic!("expected the presence validator, got {got:?}");
@@ -862,6 +924,123 @@ mod tests {
         };
         assert_eq!(later.origin.declaration_seq, 1);
         assert!(later.origin.declaration_anchor > first.origin.declaration_anchor);
+    }
+
+    fn undecided_for(got: &[String], what: &str) -> bool {
+        got.iter()
+            .any(|l| l.starts_with("undecided(") && l.contains("**opts") && l.contains(what))
+    }
+
+    #[test]
+    fn the_harvest_records_a_keyword_splat_apart_from_the_options() {
+        let assoc = |body: &str| {
+            let src = format!("class M < ApplicationRecord\n{body}\nend\n");
+            let mut syms = Symbols::default();
+            let classes = source_ore(&src, "op", &mut syms);
+            let Some(Declaration::Association(decl)) = classes[0]
+                .declarations
+                .iter()
+                .map(|e| &e.decl)
+                .find(|d| matches!(d, Declaration::Association(_)))
+            else {
+                panic!("no association in {body}");
+            };
+            decl.clone()
+        };
+        let plain = assoc("has_many :x, autosave: true");
+        assert!(plain.option_splats.is_empty());
+        let splat = assoc("has_many :x, autosave: true, **opts, validate: false");
+        // The splat is not a fake option pair.
+        assert_eq!(splat.options.len(), 2, "{:?}", splat.options);
+        assert!(splat.options.iter().all(|(k, _)| k != "**"));
+        assert_eq!(splat.option_splats.len(), 1);
+        assert_eq!(splat.option_splats[0].source, "**opts");
+        assert_eq!(splat.option_splats[0].before, 1);
+    }
+
+    #[test]
+    fn a_keyword_splat_is_never_read_as_absent_options() {
+        // Negative control: without the splat these admit a validation / presence callback.
+        let got = lines(&run("has_many :x, **opts"));
+        assert!(undecided_for(&got, "`validate:`"), "{got:?}");
+        assert!(
+            !got.iter().any(|l| l.contains("validate_associated")),
+            "{got:?}"
+        );
+
+        let got = lines(&run("has_one :x, **opts"));
+        assert!(undecided_for(&got, "`validate:`"), "{got:?}");
+        assert!(undecided_for(&got, "`required:`"), "{got:?}");
+        assert!(!got.iter().any(|l| l.contains("presence")), "{got:?}");
+        assert!(
+            !got.iter().any(|l| l.contains("validate_associated")),
+            "{got:?}"
+        );
+
+        // `belongs_to :x` is required by default; with a splat that may
+        // supply `optional:` the presence validator is not admitted.
+        let got = lines(&run("belongs_to :x, **opts"));
+        assert!(undecided_for(&got, "`required:`"), "{got:?}");
+        assert!(!got.iter().any(|l| l.contains("presence")), "{got:?}");
+        assert!(
+            !got.iter().any(|l| l.contains("validate_associated")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn the_unconditional_save_callbacks_survive_a_keyword_splat() {
+        let got = lines(&run("has_many :x, **opts"));
+        assert_eq!(got[..3], collection_set("x")[..3]);
+        let got = lines(&run("has_one :x, **opts"));
+        assert_eq!(
+            got[..2],
+            [
+                "Create/After autosave_associated_records_for_x".to_string(),
+                "Update/After autosave_associated_records_for_x".to_string(),
+            ]
+        );
+        let got = lines(&run("belongs_to :x, **opts"));
+        assert_eq!(got[0], "Save/Before autosave_associated_records_for_x");
+    }
+
+    #[test]
+    fn an_explicit_key_decides_only_after_the_splat() {
+        // `autosave` after the splat is known, but a splat may still supply
+        // `validate:`, which `validate?` prefers (`reflection.rb:717-719`).
+        let after = lines(&run("has_one :x, **opts, autosave: true"));
+        assert!(undecided_for(&after, "`validate:`"), "{after:?}");
+        assert!(!undecided_for(&after, "`autosave:`"), "{after:?}");
+        // Every option a rule reads is given after the splat: decided.
+        let both = lines(&run("has_one :x, **opts, validate: true, required: false"));
+        assert!(!both.iter().any(|l| l.starts_with("undecided")), "{both:?}");
+        assert!(both.iter().any(|l| l.contains("validate_associated")));
+        let off = lines(&run("has_one :x, **opts, validate: false, required: false"));
+        assert!(!off.iter().any(|l| l.starts_with("undecided")), "{off:?}");
+        assert!(!off.iter().any(|l| l.contains("validate_associated")));
+
+        let before = lines(&run("has_one :x, autosave: true, **opts"));
+        assert!(undecided_for(&before, "`validate:`"), "{before:?}");
+        assert!(!before.iter().any(|l| l.contains("validate_associated")));
+
+        // belongs_to: `required` after the splat decides, `optional` after the
+        // splat does not (a splat may still supply `required`).
+        let req = lines(&run(
+            "belongs_to :x, **opts, required: false, validate: false",
+        ));
+        assert!(!req.iter().any(|l| l.starts_with("undecided")), "{req:?}");
+        assert!(!req.iter().any(|l| l.contains("presence")));
+        let opt = lines(&run("belongs_to :x, **opts, optional: true"));
+        assert!(undecided_for(&opt, "`required:`"), "{opt:?}");
+    }
+
+    #[test]
+    fn a_keyword_splat_reaches_nested_attributes_and_habtm_forwarding() {
+        let got = lines(&run("has_one :x, **opts\naccepts_nested_attributes_for :x"));
+        assert!(got.last().is_some_and(|l| l.contains("**opts")), "{got:?}");
+        // habtm forwards `validate` / `autosave`, which a splat may carry.
+        let got = lines(&run("has_and_belongs_to_many :x, **opts"));
+        assert!(undecided_for(&got, "`validate:`"), "{got:?}");
     }
 
     #[test]

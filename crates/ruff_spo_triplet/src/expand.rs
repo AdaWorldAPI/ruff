@@ -1417,11 +1417,13 @@ mod tests {
             kind: AssocKind::BelongsTo,
             name: "project".to_string(),
             options: vec![("class_name".to_string(), "Project".to_string())],
+            option_splats: Vec::new(),
         });
         wp.associations.push(AssocDecl {
             kind: AssocKind::HasMany,
             name: "time_entries".to_string(),
             options: vec![],
+            option_splats: Vec::new(),
         });
         wp.validations.push(Validation {
             kind: ValidationKind::Validates,
@@ -1645,6 +1647,7 @@ mod tests {
                 kind,
                 name: format!("{kind:?}").to_lowercase(),
                 options: vec![],
+                option_splats: Vec::new(),
             });
         }
         g.models.push(m);
@@ -1684,6 +1687,7 @@ mod tests {
             kind: AssocKind::BelongsTo,
             name: "owner".to_string(),
             options: vec![("class_name".to_string(), "User".to_string())],
+            option_splats: Vec::new(),
         });
         // A second association WITHOUT class_name — the override must
         // be relation-scoped, not model-scoped.
@@ -1691,6 +1695,7 @@ mod tests {
             kind: AssocKind::BelongsTo,
             name: "project".to_string(),
             options: vec![],
+            option_splats: Vec::new(),
         });
         g.models.push(wp);
         let triples = expand(&g);
@@ -1735,21 +1740,25 @@ mod tests {
             kind: AssocKind::BelongsTo,
             name: "double_quoted".to_string(),
             options: vec![("class_name".to_string(), "\"User\"".to_string())],
+            option_splats: Vec::new(),
         });
         wp.associations.push(AssocDecl {
             kind: AssocKind::BelongsTo,
             name: "single_quoted".to_string(),
             options: vec![("class_name".to_string(), "'User'".to_string())],
+            option_splats: Vec::new(),
         });
         wp.associations.push(AssocDecl {
             kind: AssocKind::BelongsTo,
             name: "bare_const".to_string(),
             options: vec![("class_name".to_string(), "User".to_string())],
+            option_splats: Vec::new(),
         });
         wp.associations.push(AssocDecl {
             kind: AssocKind::BelongsTo,
             name: "symbol_form".to_string(),
             options: vec![("class_name".to_string(), ":User".to_string())],
+            option_splats: Vec::new(),
         });
         g.models.push(wp);
         let triples = expand(&g);

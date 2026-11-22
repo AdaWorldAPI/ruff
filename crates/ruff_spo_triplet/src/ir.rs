@@ -398,6 +398,23 @@ pub struct AssocDecl {
     /// Nested options, verbatim, in source order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<(String, String)>,
+    /// `**splat` entries of the option hash, which [`Self::options`] cannot
+    /// represent. Each may supply any option, so an option hash with a splat
+    /// is NOT the same as one without. Kept apart from `options` so
+    /// consumers that iterate options see no pseudo-key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub option_splats: Vec<OptionSplat>,
+}
+
+/// A `**expr` entry in an option hash (`has_many :x, **opts`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OptionSplat {
+    /// The splat as written (`**opts`), exact source text when available.
+    pub source: String,
+    /// How many explicit options precede the splat in the hash, i.e. the
+    /// splat sits between `options[..before]` and `options[before..]`. Ruby
+    /// lets a later key win, so only `options[before..]` override it.
+    pub before: usize,
 }
 
 /// The 5 Rails association macros.
@@ -1187,6 +1204,7 @@ mod dto_surface_tests {
                 kind: AssocKind::BelongsTo,
                 name: "owner".into(),
                 options: opts(),
+                option_splats: Vec::new(),
             }],
             validations: vec![Validation {
                 kind: ValidationKind::Validates,
