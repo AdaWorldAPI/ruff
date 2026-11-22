@@ -39,6 +39,60 @@ pub(crate) fn walk_class_body(body: &Node, src: Option<&str>, out: &mut Vec<Decl
     }
 }
 
+/// Walk one statement of a `def self.included(<param>)` hook body.
+///
+/// Only two shapes are read, both addressed to the hook's parameter:
+///
+/// - `<param>.class_eval do ... end` (also `class_exec`, and the brace
+///   form): the block body is a class body, walked as one.
+/// - `<param>.<macro> args` and `<param>.send(:<macro>, args)` (also
+///   `public_send` / `__send__`): routed like the bare class-body call, so
+///   `base.has_many :x`, `base.before_save :y`, `base.extend(M)`,
+///   `base.include(M)` and `base.send(:include, M)` are declarations.
+///
+/// Anything else (`def`, conditionals, calls on other receivers, `base.foo`
+/// for a `foo` that is not a recognised macro) produces nothing: an
+/// unrecognised call on the parameter is not guessed into a `DslCall`.
+pub(crate) fn walk_hook_statement(
+    param: &str,
+    node: &Node,
+    src: Option<&str>,
+    out: &mut Vec<Declaration>,
+) {
+    let on_param = |recv: &Option<Box<Node>>| matches!(recv.as_deref(), Some(Node::Lvar(v)) if v.name == param);
+    match node {
+        Node::Block(blk) => {
+            let Node::Send(s) = &*blk.call else { return };
+            if on_param(&s.recv)
+                && matches!(s.method_name.as_str(), "class_eval" | "class_exec")
+                && let Some(body) = blk.body.as_deref()
+            {
+                walk_class_body(body, src, out);
+            }
+        }
+        Node::Send(s) if on_param(&s.recv) => {
+            let (name, args): (String, &[Node]) =
+                match (s.method_name.as_str(), s.args.split_first()) {
+                    ("send" | "public_send" | "__send__", Some((first, rest))) => {
+                        match sym_string(first) {
+                            Some(inner) => (inner, rest),
+                            None => return,
+                        }
+                    }
+                    (name, _) => (name.to_string(), &s.args),
+                };
+            let mut found = Vec::new();
+            route_send(&name, args, src, &mut found);
+            out.extend(
+                found
+                    .into_iter()
+                    .filter(|d| !matches!(d, Declaration::DslCall(_))),
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Process one class-body statement.
 fn walk_statement(node: &Node, src: Option<&str>, out: &mut Vec<Declaration>) {
     match node {
@@ -205,6 +259,7 @@ fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declar
         "normalizes" => emit_validation(ValidationKind::Normalizes, args, out),
         "validates_associated" => emit_validation(ValidationKind::ValidatesAssociated, args, out),
         "validates_each" => emit_validation(ValidationKind::ValidatesEach, args, out),
+        n if validates_helper_kind(n).is_some() => emit_validates_helper(n, args, out),
         "validates_with" => emit_validates_with(args, out),
 
         // ───── Callbacks (13 phases) ─────
@@ -395,6 +450,91 @@ fn emit_validation(kind: ValidationKind, args: &[Node], out: &mut Vec<Declaratio
     for target in targets {
         out.push(Declaration::Validation(Validation {
             kind,
+            target,
+            options: options.clone(),
+        }));
+    }
+}
+
+/// The validator an `ActiveModel` `validates_<kind>_of` helper stands for, as
+/// the key `validates` takes (`validates_presence_of` is `presence:`).
+///
+/// `ActiveModel` 8.1.4.1: `absence.rb:28`, `acceptance.rb:108`,
+/// `comparison.rb:85`, `confirmation.rb:75`, `exclusion.rb:44`,
+/// `format.rb:107`, `inclusion.rb:42`, `length.rb:123` (`validates_size_of`
+/// is its alias, `length.rb:127`), `numericality.rb:217`, `presence.rb:34`;
+/// `ActiveRecord`: `uniqueness.rb:291`. `validates_associated`,
+/// `validates_with` and `validates_each` have their own
+/// [`ValidationKind`]s and are routed separately.
+fn validates_helper_kind(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "validates_presence_of" => "presence",
+        "validates_absence_of" => "absence",
+        "validates_acceptance_of" => "acceptance",
+        "validates_comparison_of" => "comparison",
+        "validates_confirmation_of" => "confirmation",
+        "validates_exclusion_of" => "exclusion",
+        "validates_format_of" => "format",
+        "validates_inclusion_of" => "inclusion",
+        "validates_length_of" | "validates_size_of" => "length",
+        "validates_numericality_of" => "numericality",
+        "validates_uniqueness_of" => "uniqueness",
+        _ => return None,
+    })
+}
+
+/// The option keys `validates` hands to every validator it builds rather
+/// than to one (`validates.rb:162-164`, `_validates_default_keys`).
+const VALIDATES_DEFAULT_KEYS: &[&str] = &[
+    "if",
+    "unless",
+    "on",
+    "allow_blank",
+    "allow_nil",
+    "strict",
+    "except_on",
+];
+
+/// `validates_numericality_of :a, :b, allow_nil: true, greater_than: 0` is
+/// `validates :a, :b, numericality: { greater_than: 0 }, allow_nil: true`:
+/// the helper builds one validator whose options are the whole trailing hash,
+/// and `validates` splits the shared keys off the same way. One `Validation`
+/// is emitted per attribute in the `validates` shape, so a consumer reads
+/// both spellings with one parser.
+fn emit_validates_helper(method: &str, args: &[Node], out: &mut Vec<Declaration>) {
+    let Some(validator) = validates_helper_kind(method) else {
+        return;
+    };
+    let pairs: &[Node] = args.iter().find_map(hash_pairs_of).unwrap_or_default();
+    let (shared, own): (Vec<&Node>, Vec<&Node>) = pairs
+        .iter()
+        .filter(|n| matches!(n, Node::Pair(_)))
+        .partition(|n| {
+            matches!(n, Node::Pair(p) if VALIDATES_DEFAULT_KEYS.contains(&pair_key(&p.key).as_str()))
+        });
+    let validator_value = if own.is_empty() {
+        "true".to_string()
+    } else {
+        let own: Vec<Node> = own.into_iter().cloned().collect();
+        format_pairs_inline(&own)
+    };
+    let mut options = vec![(validator.to_string(), validator_value)];
+    options.extend(shared.into_iter().filter_map(|n| match n {
+        Node::Pair(p) => Some((pair_key(&p.key), render_node(&p.value))),
+        _ => None,
+    }));
+    let targets: Vec<String> = args.iter().map_while(sym_string).collect();
+    if targets.is_empty() {
+        out.push(Declaration::Validation(Validation {
+            kind: ValidationKind::Validates,
+            target: if args.is_empty() { "<empty>" } else { "<expr>" }.to_string(),
+            options,
+        }));
+        return;
+    }
+    for target in targets {
+        out.push(Declaration::Validation(Validation {
+            kind: ValidationKind::Validates,
             target,
             options: options.clone(),
         }));
@@ -840,7 +980,10 @@ fn render_node(node: &Node) -> String {
                 .join(",");
             format!("[{elems}]")
         }
-        Node::Hash(h) => format_hash_inline(h),
+        Node::Hash(h) => format_pairs_inline(&h.pairs),
+        // Trailing keyword arguments (`include_module "X", into: "Y"`) render
+        // exactly like the braced literal, so one parser reads both.
+        Node::Kwargs(k) => format_pairs_inline(&k.pairs),
         _ => "<expr>".to_string(),
     }
 }
@@ -929,10 +1072,11 @@ fn pair_key(key: &Node) -> String {
     }
 }
 
-/// Render a Hash node inline as `{k: v, k2: v2}` for the args blob.
-fn format_hash_inline(h: &lib_ruby_parser::nodes::Hash) -> String {
+/// Render the pairs of a `Hash` / `Kwargs` node inline as `{k: v, k2: v2}`
+/// for the args blob.
+fn format_pairs_inline(pairs: &[Node]) -> String {
     let mut parts = Vec::new();
-    for pair_node in &h.pairs {
+    for pair_node in pairs {
         let Node::Pair(p) = pair_node else { continue };
         let key = render_node(&p.key);
         let value = render_node(&p.value);

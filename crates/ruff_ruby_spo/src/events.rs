@@ -464,8 +464,11 @@ pub struct RailsEvent {
 pub enum DeclOrigin {
     /// Directly in the class or module body.
     Body,
-    /// Inside the module's `included do ... end` block. `line` is the
-    /// 1-based line of that `included` call in the file the ore came from.
+    /// Inside the module's `included do ... end` block, or inside
+    /// `base.class_eval do ... end` (or a macro called on `base`) within
+    /// `def self.included(base)`. Both run in the including class at include
+    /// time. `line` is the 1-based line of the `included` call, or of the
+    /// `def self.included`, in the file the ore came from.
     Included { line: u32 },
 }
 
@@ -1396,16 +1399,56 @@ fn rails_arm_into(body: &Node, origin: &DeclOrigin, out: &mut Vec<RailsEvent>) {
         let at = anchor(stmt);
         let mut decls = Vec::new();
         crate::walk::walk_class_body(stmt, None, &mut decls);
-        for decl in decls {
-            let seq = u32::try_from(out.len()).unwrap_or(u32::MAX);
-            out.push(RailsEvent {
-                seq,
-                kind: rails_kind(&decl),
-                decl,
-                anchor: at,
-                origin: origin.clone(),
-            });
-        }
+        push_decls(decls, at, origin, out);
+    }
+}
+
+/// Append `decls` to `out` as events sharing one anchor, `seq` continuing
+/// from its length.
+fn push_decls(decls: Vec<Declaration>, at: u32, origin: &DeclOrigin, out: &mut Vec<RailsEvent>) {
+    for decl in decls {
+        let seq = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        out.push(RailsEvent {
+            seq,
+            kind: rails_kind(&decl),
+            decl,
+            anchor: at,
+            origin: origin.clone(),
+        });
+    }
+}
+
+/// `def self.included(<param>)`: the parameter name and the body.
+///
+/// The old-style concern hook. Returns `None` for any other `def`, for a
+/// hook without a plain parameter, and for a hook without a body.
+fn included_hook(stmt: &Node) -> Option<(String, &Node)> {
+    let Node::Defs(d) = stmt else { return None };
+    if d.name != "included" || !matches!(&*d.definee, Node::Self_(_)) {
+        return None;
+    }
+    let Some(Node::Args(a)) = d.args.as_deref() else {
+        return None;
+    };
+    let param = match a.args.first()? {
+        Node::Arg(x) => x.name.clone(),
+        Node::Optarg(x) => x.name.clone(),
+        _ => return None,
+    };
+    Some((param, d.body.as_deref()?))
+}
+
+/// The declarations of a `def self.included(base)` body, in source order.
+/// See [`crate::walk::walk_hook_statement`] for the shapes that count.
+fn included_hook_arm(param: &str, body: &Node, origin: &DeclOrigin, out: &mut Vec<RailsEvent>) {
+    let stmts: Vec<&Node> = match body {
+        Node::Begin(b) => b.statements.iter().collect(),
+        single => vec![single],
+    };
+    for stmt in stmts {
+        let mut decls = Vec::new();
+        crate::walk::walk_hook_statement(param, stmt, None, &mut decls);
+        push_decls(decls, anchor(stmt), origin, out);
     }
 }
 
@@ -1444,6 +1487,12 @@ fn module_rails_arm(body: &Node, src: &str) -> Vec<RailsEvent> {
                 line: line_at(src, anchor(stmt)),
             };
             rails_arm_into(inner, &origin, &mut out);
+        }
+        if let Some((param, inner)) = included_hook(stmt) {
+            let origin = DeclOrigin::Included {
+                line: line_at(src, u32::try_from(stmt.expression().begin).unwrap_or(0)),
+            };
+            included_hook_arm(&param, inner, &origin, &mut out);
         }
     }
     out
@@ -1504,7 +1553,14 @@ pub fn class_ore(iri: &str, name: &str, body: &Node, syms: &mut Symbols) -> Clas
 /// Walk one `module` body. Like [`class_ore`], plus: the body of every direct
 /// `included do ... end` is walked as class-body declarations (options
 /// preserved), each tagged [`DeclOrigin::Included`]; `include` / `extend` /
-/// `prepend` are listed in [`ClassOre::includes`]. `class_methods do` bodies
+/// `prepend` are listed in [`ClassOre::includes`]. The old-style
+/// `def self.included(base)` hook is read too, with [`DeclOrigin::Included`]:
+/// the body of `base.class_eval do ... end` (or `{ ... }`) is walked as a
+/// class body, and `base.<macro> ...` / `base.send(:<macro>, ...)` calls
+/// (`has_many`, `before_save`, `include`, `extend`, ...) are declarations,
+/// using the hook's actual parameter name. Nothing else in the hook is read:
+/// conditionals, `def`s, other receivers, and unrecognised `base.foo` calls
+/// are not guessed. `class_methods do` bodies
 /// are NOT walked (their declarations apply to the singleton, a documented
 /// gap); the `Declaration::Concern` markers are kept.
 #[must_use]
@@ -2639,5 +2695,74 @@ end");
             anchors[0] < anchors[1],
             "anchors increase with source position: {anchors:?}"
         );
+    }
+
+    const STORAGES_PATCH: &str = "module Patch\n  def self.included(base)\n    base.extend(ClassMethods)\n    base.include(InstanceMethods)\n\n    base.class_eval do\n      has_many :file_links, dependent: :delete_all, class_name: \"Storages::FileLink\", as: :container\n      has_many :storages, through: :project\n\n      attr_accessor :file_links_replacements\n    end\n  end\nend\n";
+
+    fn hook_events(m: &ClassOre) -> Vec<&RailsEvent> {
+        m.declarations
+            .iter()
+            .filter(|e| matches!(e.origin, DeclOrigin::Included { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn included_hook_class_eval_is_walked_like_the_storages_patch() {
+        let (cs, _) = ore(STORAGES_PATCH);
+        let m = by_name(&cs, "Patch");
+        let got = hook_events(m);
+        let kinds: Vec<String> = got
+            .iter()
+            .map(|e| match &e.decl {
+                Declaration::Concern(c) => format!("{:?}:{}", c.kind, c.module),
+                Declaration::Association(a) => format!("assoc:{}", a.name),
+                Declaration::Attribute(a) => format!("attr:{}", a.name),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "Extend:ClassMethods",
+                "Include:InstanceMethods",
+                "assoc:file_links",
+                "assoc:storages",
+                "attr:file_links_replacements",
+            ]
+        );
+        assert!(
+            got.iter()
+                .all(|e| e.origin == DeclOrigin::Included { line: 2 })
+        );
+        assert!(matches!(&got[2].decl, Declaration::Association(a)
+            if a.options.contains(&("dependent".to_string(), ":delete_all".to_string()))));
+    }
+
+    #[test]
+    fn included_hook_uses_the_actual_parameter_name_and_macros_on_it() {
+        let src = "module P\n  def self.included(receiver)\n    receiver.has_many :x\n    receiver.before_save :y\n    receiver.send(:include, Other)\n    receiver.class_eval { validates_presence_of :z }\n    base.has_many :not_mine\n    receiver.some_helper :nope\n    receiver.instance_variable_set(:@a, 1)\n    if cond\n      receiver.has_many :guarded\n    end\n    other.class_eval do\n      has_many :elsewhere\n    end\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let got = hook_events(by_name(&cs, "P"));
+        let kinds: Vec<String> = got
+            .iter()
+            .map(|e| match &e.decl {
+                Declaration::Association(a) => format!("assoc:{}", a.name),
+                Declaration::Callback(c) => format!("cb:{}", c.target),
+                Declaration::Concern(c) => format!("{:?}:{}", c.kind, c.module),
+                Declaration::Validation(v) => format!("val:{}", v.target),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        // Not invented: a call on a different receiver, an unrecognised
+        // macro on the parameter, a conditional's body.
+        assert_eq!(kinds, ["assoc:x", "cb:y", "Include:Other", "val:z"]);
+    }
+
+    #[test]
+    fn a_hook_without_a_class_eval_or_macro_yields_nothing() {
+        let (cs, _) = ore(
+            "module P\n  def self.included(base)\n    puts base\n  end\n  def self.other(base)\n    base.class_eval do\n      has_many :x\n    end\n  end\nend\n",
+        );
+        assert!(hook_events(by_name(&cs, "P")).is_empty());
     }
 }

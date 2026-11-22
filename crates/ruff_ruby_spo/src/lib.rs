@@ -1872,4 +1872,111 @@ end
             }]
         );
     }
+
+    fn dsl_args(src: &str, name: &str) -> Vec<String> {
+        extract_from_source(src)[0]
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::DslCall(c) if c.name == name => Some(c.args.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trailing_keyword_arguments_render_like_the_braced_hash() {
+        let kwargs = dsl_args(
+            "class E
+  include_module \"Costs::HasRates\", into: %w[User], at: 2
+end
+",
+            "include_module",
+        );
+        let braced = dsl_args(
+            "class E
+  include_module \"Costs::HasRates\", { into: %w[User], at: 2 }
+end
+",
+            "include_module",
+        );
+        assert_eq!(kwargs, ["\"Costs::HasRates\", {:into: [\"User\"], :at: 2}"]);
+        assert_eq!(kwargs, braced);
+        let plain = dsl_args(
+            "class E\n  include_module \"Projects::Costs\", into: \"Project\"\nend\n",
+            "include_module",
+        );
+        assert_eq!(plain, ["\"Projects::Costs\", {:into: \"Project\"}"]);
+    }
+
+    #[test]
+    fn validates_helper_emits_one_numericality_validation_per_attribute() {
+        let classes = extract_from_source(
+            "class M\n  validates_numericality_of :a, :b, allow_nil: true\nend\n",
+        );
+        let got: Vec<_> = classes[0]
+            .declarations
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::Validation(v) => Some((v.kind, v.target.as_str(), v.options.clone())),
+                _ => None,
+            })
+            .collect();
+        let opts = pairs(&[("numericality", "true"), ("allow_nil", "true")]);
+        assert_eq!(
+            got,
+            [
+                (ValidationKind::Validates, "a", opts.clone()),
+                (ValidationKind::Validates, "b", opts),
+            ]
+        );
+        // The same declaration, spelled with `validates`, reads identically.
+        let spelled = extract_from_source(
+            "class M\n  validates :a, :b, numericality: true, allow_nil: true\nend\n",
+        );
+        assert_eq!(
+            format!("{:?}", classes[0].declarations),
+            format!("{:?}", spelled[0].declarations)
+        );
+    }
+
+    #[test]
+    fn validates_helper_keeps_validator_options_inside_the_validator_hash() {
+        let classes = extract_from_source(
+            "class M\n  validates_length_of :n, maximum: 80, if: :x?\n  validates_size_of :m, is: 3\n  validates_presence_of :p, message: \"no\"\nend\n",
+        );
+        let spelled = extract_from_source(
+            "class M\n  validates :n, length: { maximum: 80 }, if: :x?\n  validates :m, length: { is: 3 }\n  validates :p, presence: { message: \"no\" }\nend\n",
+        );
+        assert_eq!(
+            format!("{:?}", classes[0].declarations),
+            format!("{:?}", spelled[0].declarations)
+        );
+        assert_eq!(classes[0].declarations.len(), 3);
+    }
+
+    #[test]
+    fn every_validates_helper_is_a_validation_not_a_dsl_call() {
+        for (helper, key) in [
+            ("validates_presence_of", "presence"),
+            ("validates_uniqueness_of", "uniqueness"),
+            ("validates_inclusion_of", "inclusion"),
+            ("validates_exclusion_of", "exclusion"),
+            ("validates_format_of", "format"),
+            ("validates_length_of", "length"),
+            ("validates_acceptance_of", "acceptance"),
+            ("validates_confirmation_of", "confirmation"),
+            ("validates_absence_of", "absence"),
+            ("validates_comparison_of", "comparison"),
+        ] {
+            let classes = extract_from_source(&format!("class M\n  {helper} :a\nend\n"));
+            assert_eq!(classes[0].declarations.len(), 1, "{helper}");
+            assert!(
+                matches!(&classes[0].declarations[0], Declaration::Validation(v)
+                    if v.target == "a" && v.options == pairs(&[(key, "true")])),
+                "{helper}: {:?}",
+                classes[0].declarations
+            );
+        }
+    }
 }
