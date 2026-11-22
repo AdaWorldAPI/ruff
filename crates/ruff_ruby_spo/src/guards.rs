@@ -258,11 +258,17 @@ impl<'a> Scan<'a> {
                 } else {
                     format!("{}::{local}", ns.join("::"))
                 };
-                let superclass = c
-                    .superclass
-                    .as_deref()
-                    .and_then(const_path)
-                    .map(|sup| (ns.to_vec(), sup));
+                // An absolute path (`::Base`) is recorded with an empty nesting
+                // so `resolve` bypasses lexical lookup.
+                let superclass = c.superclass.as_deref().and_then(|sup| {
+                    let path = const_path(sup)?;
+                    let nesting = if is_absolute(sup) {
+                        Vec::new()
+                    } else {
+                        ns.to_vec()
+                    };
+                    Some((nesting, path))
+                });
                 let entry = self
                     .classes
                     .entry(qualified.clone())
@@ -355,7 +361,8 @@ fn line_of(src: &str, offset: usize) -> usize {
         .count()
 }
 
-/// `A::B` for a constant path made only of constants (a leading `::` is dropped).
+/// `A::B` for a constant path made only of constants (a leading `::` is
+/// dropped; see [`is_absolute`]).
 fn const_path(node: &Node) -> Option<String> {
     let Node::Const(c) = node else {
         return None;
@@ -363,6 +370,31 @@ fn const_path(node: &Node) -> Option<String> {
     match c.scope.as_deref() {
         None | Some(Node::Cbase(_)) => Some(c.name.clone()),
         Some(scope) => const_path(scope).map(|base| format!("{base}::{}", c.name)),
+    }
+}
+
+/// True when the constant path is rooted at `::`.
+fn is_absolute(node: &Node) -> bool {
+    match node {
+        Node::Const(c) => match c.scope.as_deref() {
+            Some(Node::Cbase(_)) => true,
+            Some(scope) => is_absolute(scope),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// `lambda {}`, `proc {}` or `->`: the call a block hangs off.
+fn is_lambda_like(b: &Block) -> bool {
+    match &*b.call {
+        Node::Lambda(_) => true,
+        Node::Send(s) => {
+            s.recv.is_none()
+                && s.args.is_empty()
+                && matches!(s.method_name.as_str(), "lambda" | "proc")
+        }
+        _ => false,
     }
 }
 
@@ -383,10 +415,15 @@ struct Lowerer<'a> {
 
 impl Lowerer<'_> {
     /// The `writable:` value itself is a literal or a lambda; a bare call
-    /// there would run at class-definition time, not as a predicate.
+    /// there would run at class-definition time, not as a predicate. Only this
+    /// outer callable is unwrapped: its body is the guard.
     fn lower_writable(&self, value: &Node, st: &mut Frame) -> Result<GuardExpr, String> {
         match value {
-            Node::True(_) | Node::False(_) | Node::Block(_) => self.lower(value, st),
+            Node::True(_) | Node::False(_) => self.lower(value, st),
+            Node::Block(b) if is_lambda_like(b) => match b.body.as_deref() {
+                Some(body) => self.lower(body, st),
+                None => Err("lambda with an empty body".to_string()),
+            },
             _ => Err(self.unsupported(value, st)),
         }
     }
@@ -410,22 +447,12 @@ impl Lowerer<'_> {
                     many.len()
                 )),
             },
-            Node::Block(b) => {
-                let lambda_like = match &*b.call {
-                    Node::Lambda(_) => true,
-                    Node::Send(s) => {
-                        s.recv.is_none()
-                            && s.args.is_empty()
-                            && matches!(s.method_name.as_str(), "lambda" | "proc")
-                    }
-                    _ => false,
-                };
-                match (lambda_like, b.body.as_deref()) {
-                    (true, Some(body)) => self.lower(body, st),
-                    (true, None) => Err("lambda with an empty body".to_string()),
-                    (false, _) => Err(self.unsupported(node, st)),
-                }
-            }
+            // A callable inside a guard body is a returned value (a Proc is
+            // truthy), not the predicate.
+            Node::Block(b) if is_lambda_like(b) => Err(format!(
+                "guard returns a callable: {}",
+                self.snippet(node, st)
+            )),
             Node::Lvar(l) => match st.bindings.get(&l.name) {
                 Some(bound) => bound.clone(),
                 None => Err(format!("unbound local `{}`", l.name)),
@@ -867,6 +894,31 @@ end
         let (too_deep, _) = scan("depth5", &[("c.rb", &chain(5))]);
         let reason = unlowered(&too_deep, "C", "a");
         assert!(reason.contains("depth limit"), "{reason}");
+    }
+
+    #[test]
+    fn absolute_superclass_bypasses_lexical_lookup() {
+        let src = "class Base\n  def ok?\n    model.top?\n  end\nend\n\
+                   module N\n  class Base\n    def ok?\n      model.nested?\n    end\n  end\n\
+                   class Abs < ::Base\n    attribute :a, writable: ->(*) { ok? }\n  end\n\
+                   class Lex < Base\n    attribute :a, writable: ->(*) { ok? }\n  end\nend\n";
+        let (guards, _) = scan("abs_super", &[("c.rb", src)]);
+        assert_eq!(lowered(&guards, "N::Abs", "a"), fact("model.top?"));
+        assert_eq!(lowered(&guards, "N::Lex", "a"), fact("model.nested?"));
+    }
+
+    #[test]
+    fn only_the_outer_writable_callable_is_unwrapped() {
+        let src = "class C\n  attribute :plain, writable: ->(*) { false }\n\
+                   attribute :direct, writable: ->(*) { -> { false } }\n\
+                   attribute :helper, writable: ->(*) { maker }\n\
+                   def maker\n    proc { model.leaf? }\n  end\nend\n";
+        let (guards, _) = scan("callable", &[("c.rb", src)]);
+        assert_eq!(lowered(&guards, "C", "plain"), Const(false));
+        let direct = unlowered(&guards, "C", "direct");
+        assert!(direct.contains("guard returns a callable"), "{direct}");
+        let helper = unlowered(&guards, "C", "helper");
+        assert!(helper.contains("guard returns a callable"), "{helper}");
     }
 
     #[test]
