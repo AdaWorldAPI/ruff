@@ -116,11 +116,18 @@ pub fn extract_menu_edges_with_report(
         };
         let rel = relative_path(app_root, path);
         let before = edges.len();
-        for line in content.lines() {
-            let Some(args_start) = menu_push_call(line) else {
+        let lines: Vec<&str> = content.lines().collect();
+        for (i, first) in lines.iter().enumerate() {
+            let Some(args_start) = menu_push_call(first) else {
                 continue;
             };
             report.raw_menu_pushes += 1;
+            // A real registration spans several lines
+            // (`menu.push :projects,` / `{ controller: "/projects", … },` / …);
+            // the continuation lines are the ones indented deeper than the
+            // `push` line.
+            let owned = join_continuation(&lines, i);
+            let line = owned.as_str();
             let args = &line[args_start..];
             // Require a `:label` symbol argument — the shape marker that
             // this `.push` call is the `menu.push :label, target, …` DSL,
@@ -159,6 +166,23 @@ pub fn extract_menu_edges_with_report(
     });
     edges.dedup_by(|a, b| a.target == b.target && a.file == b.file && a.helper == b.helper);
     (edges, report)
+}
+
+/// The `push` line at `lines[i]` joined with the lines that follow it and are
+/// indented deeper than it, separated by single spaces. The first line's byte
+/// offsets are unchanged, so an offset from [`menu_push_call`] stays valid.
+fn join_continuation(lines: &[&str], i: usize) -> String {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let base = indent(lines[i]);
+    let mut out = lines[i].to_string();
+    for next in &lines[i + 1..] {
+        if next.trim().is_empty() || indent(next) <= base {
+            break;
+        }
+        out.push(' ');
+        out.push_str(next.trim());
+    }
+    out
 }
 
 /// The byte offset right after a `.push` call on a menu-DSL receiver, or
@@ -220,7 +244,10 @@ fn controller_kwarg(s: &str) -> Option<String> {
                             end += 1;
                         }
                         if end < chars.len() {
-                            return Some(chars[start..end].iter().collect());
+                            // `controller: "/projects"` (a root-relative
+                            // controller path) names the same controller.
+                            let value: String = chars[start..end].iter().collect();
+                            return Some(value.trim_start_matches('/').to_string());
                         }
                     }
                 }
@@ -384,6 +411,39 @@ mod tests {
         let (edges, report) = extract_menu_edges_with_report(&root, &vocab());
         assert!(edges.is_empty(), "{edges:?}");
         assert_eq!(report.raw_menu_pushes, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `OpenProject`'s real shape: arguments on continuation lines and a
+    /// root-relative `controller: "/projects"`. The first version of this arm
+    /// only passed single-line fixtures and resolved 0 of 142 pushes on the
+    /// real tree.
+    #[test]
+    fn multi_line_push_with_root_relative_controller_resolves() {
+        let root = scratch_dir("multi_line");
+        write_file(
+            &root,
+            "config/initializers/menus.rb",
+            "Redmine::MenuManager.map :top_menu do |menu|\n\
+             \x20 menu.push :projects,\n\
+             \x20           { controller: \"/projects\", project_id: nil, action: \"index\" },\n\
+             \x20           context: :modules,\n\
+             \x20           icon: \"project\"\n\
+             \n\
+             \x20 menu.push :work_packages,\n\
+             \x20           { controller: \"/work_packages\", action: \"index\" }\n\
+             end\n",
+        );
+
+        let (edges, report) = extract_menu_edges_with_report(&root, &vocab());
+        let targets: Vec<&str> = edges.iter().map(|e| e.target.as_str()).collect();
+        assert_eq!(targets, ["projects", "work_packages"], "{edges:?}");
+        assert_eq!(report.raw_menu_pushes, 2);
+
+        // The continuation join must stop at the next statement: a second
+        // push's controller is not attributed to the first.
+        assert_eq!(edges.len(), 2);
 
         let _ = fs::remove_dir_all(&root);
     }
