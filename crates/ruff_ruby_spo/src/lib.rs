@@ -500,6 +500,7 @@ mod tests {
                 kind: AssocKind::BelongsTo,
                 name: "project".to_string(),
                 options: vec![],
+                option_splats: Vec::new(),
             }),
             Declaration::Callback(Callback {
                 phase: "before_save".to_string(),
@@ -1241,6 +1242,7 @@ end
                     kind: AssocKind::BelongsTo,
                     name: "project".to_string(),
                     options: Vec::new(),
+                    option_splats: Vec::new(),
                 }),
                 Declaration::Concern(ConcernRef {
                     kind: ConcernKind::Include,
@@ -1281,6 +1283,7 @@ end
                 kind: AssocKind::BelongsTo,
                 name: "project".to_string(),
                 options: Vec::new(),
+                option_splats: Vec::new(),
             })],
             functions: Vec::new(),
             helpers: Vec::new(),
@@ -1297,6 +1300,7 @@ end
                 kind: AssocKind::BelongsTo,
                 name: "author".to_string(),
                 options: Vec::new(),
+                option_splats: Vec::new(),
             })],
             functions: Vec::new(),
             helpers: Vec::new(),

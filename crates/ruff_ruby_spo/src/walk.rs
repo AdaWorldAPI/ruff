@@ -16,8 +16,8 @@
 use lib_ruby_parser::Node;
 use ruff_spo_triplet::{
     ActsAs, AssocDecl, AssocKind, AttrDecl, AttrKind, Callback, ConcernKind, ConcernRef,
-    Delegation, DslCall, DynMethod, EnumForm, EnumVariants, GemDsl, GemKind, ScopeDecl, ScopeKind,
-    UsingRef, Validation, ValidationKind,
+    Delegation, DslCall, DynMethod, EnumForm, EnumVariants, GemDsl, GemKind, OptionSplat,
+    ScopeDecl, ScopeKind, UsingRef, Validation, ValidationKind,
 };
 
 use crate::Declaration;
@@ -191,12 +191,12 @@ fn lambda_loc(node: &Node) -> Option<String> {
 fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
     match name {
         // ───── Associations (5) ─────
-        "belongs_to" => emit_assoc(AssocKind::BelongsTo, args, out),
-        "has_many" => emit_assoc(AssocKind::HasMany, args, out),
-        "has_one" => emit_assoc(AssocKind::HasOne, args, out),
-        "has_and_belongs_to_many" => emit_assoc(AssocKind::HasAndBelongsToMany, args, out),
+        "belongs_to" => emit_assoc(AssocKind::BelongsTo, args, src, out),
+        "has_many" => emit_assoc(AssocKind::HasMany, args, src, out),
+        "has_one" => emit_assoc(AssocKind::HasOne, args, src, out),
+        "has_and_belongs_to_many" => emit_assoc(AssocKind::HasAndBelongsToMany, args, src, out),
         "accepts_nested_attributes_for" => {
-            emit_assoc(AssocKind::AcceptsNestedAttributesFor, args, out);
+            emit_assoc(AssocKind::AcceptsNestedAttributesFor, args, src, out);
         }
 
         // ───── Validations (5) ─────
@@ -352,7 +352,7 @@ fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declar
 // Per-category emitters
 // ─────────────────────────────────────────────────────────────────────────
 
-fn emit_assoc(kind: AssocKind, args: &[Node], out: &mut Vec<Declaration>) {
+fn emit_assoc(kind: AssocKind, args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
     let Some(name) = args.first().and_then(sym_string) else {
         return;
     };
@@ -361,15 +361,18 @@ fn emit_assoc(kind: AssocKind, args: &[Node], out: &mut Vec<Declaration>) {
     // `has_many :items, -> { active }, dependent: :destroy` puts the
     // options hash at args[2], not args[1] (the lambda sits between
     // the name and the options).
-    let options = args
+    // A `**splat` in that hash is not an option pair; it is recorded
+    // separately because it may supply any option.
+    let (options, option_splats) = args
         .iter()
         .skip(1)
-        .find_map(as_hash_options)
+        .find_map(|arg| hash_pairs_of(arg).map(|pairs| hash_pairs_and_splats(pairs, src)))
         .unwrap_or_default();
     out.push(Declaration::Association(AssocDecl {
         kind,
         name,
         options,
+        option_splats,
     }));
 }
 
@@ -848,12 +851,58 @@ fn render_node(node: &Node) -> String {
 /// (trailing `k: v, k2: v2` keyword arguments — common in Rails macro
 /// calls like `has_many :x, dependent: :destroy`).
 fn as_hash_options(node: &Node) -> Option<Vec<(String, String)>> {
-    let pairs = match node {
-        Node::Hash(h) => &h.pairs,
-        Node::Kwargs(k) => &k.pairs,
-        _ => return None,
+    hash_pairs_of(node).map(hash_pairs)
+}
+
+/// The element nodes of a `Hash` / `Kwargs` node.
+fn hash_pairs_of(node: &Node) -> Option<&[Node]> {
+    match node {
+        Node::Hash(h) => Some(&h.pairs),
+        Node::Kwargs(k) => Some(&k.pairs),
+        _ => None,
+    }
+}
+
+/// A `**splat` as written. Without the source, a bare variable or
+/// argument-less method call is rebuilt from its name (`**opts`), anything
+/// else is `**<expr>`.
+fn splat_text(node: &Node, src: Option<&str>) -> String {
+    let loc = node.expression();
+    if let Some(text) = src.and_then(|s| s.get(loc.begin..loc.end)) {
+        return text.to_owned();
+    }
+    let Node::Kwsplat(k) = node else {
+        return render_node(node);
     };
-    Some(hash_pairs(pairs))
+    let name = match &*k.value {
+        Node::Lvar(v) => v.name.clone(),
+        Node::Ivar(v) => v.name.clone(),
+        Node::Send(s) if s.recv.is_none() && s.args.is_empty() => s.method_name.clone(),
+        other => const_string(other).unwrap_or_else(|| "<expr>".to_string()),
+    };
+    format!("**{name}")
+}
+
+/// Like [`hash_pairs`], but a non-`Pair` element (a `**splat`) is returned
+/// as an [`OptionSplat`] instead of being dropped, with the number of
+/// explicit options before it.
+fn hash_pairs_and_splats(
+    pairs: &[Node],
+    src: Option<&str>,
+) -> (Vec<(String, String)>, Vec<OptionSplat>) {
+    let mut options = Vec::new();
+    let mut splats = Vec::new();
+    for pair_node in pairs {
+        if let Node::Pair(p) = pair_node {
+            options.push((pair_key(&p.key), render_node(&p.value)));
+        } else {
+            splats.push(OptionSplat {
+                source: splat_text(pair_node, src),
+                before: options.len(),
+            });
+        }
+    }
+    (options, splats)
 }
 
 /// Render the `Pair` nodes of a hash as `(key, value)` strings, source

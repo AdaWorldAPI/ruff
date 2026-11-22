@@ -129,6 +129,7 @@ pub(crate) fn build_associations(
                 kind: rel.kind,
                 name: rel.name.clone(),
                 options,
+                option_splats: Vec::new(),
             }
         })
         .collect()
