@@ -1674,9 +1674,14 @@ struct Ctx<'a> {
     file: &'a str,
 }
 
-/// Recurse into `module`/`class`/`begin` wrappers, threading the module
-/// namespace exactly as `parse::collect_classes_with_namespace` does, so a
-/// class IRI from this arm joins the shipped one.
+/// Recurse into `module`/`class`/`begin` wrappers, threading the lexical
+/// namespace. For top-level classes and classes nested in modules, the class
+/// IRI matches `parse::collect_classes_with_namespace`, so it joins the
+/// shipped arm. A unit nested in a class body is qualified by that class here
+/// (`class Host; module Hooks` gives `Host::Hooks`). The shipped arm does not
+/// do this yet: it names a class nested in a class by the module namespace
+/// alone. For that one shape the two arms' IRIs differ until
+/// `parse::collect_nested_classes` gets the same qualification.
 fn collect(
     node: &Node,
     ns: &[String],
@@ -1708,18 +1713,22 @@ fn collect(
             }
         }
         Node::Class(c) => {
-            let local = const_name(&c.name).unwrap_or_default();
+            let local_name = const_name(&c.name).unwrap_or_default();
             let qualified = if ns.is_empty() {
-                local
+                local_name.clone()
             } else {
-                format!("{}::{local}", ns.join("::"))
+                format!("{}::{local_name}", ns.join("::"))
             };
             if let Some(body) = c.body.as_deref() {
                 let iri = format!("{namespace}:{qualified}");
                 let mut ore = class_ore(&iri, &qualified, body, syms);
                 ore.superclass = c.superclass.as_deref().and_then(superclass_path);
                 out.push(ore);
-                collect(body, ns, namespace, ctx, syms, out);
+                // Units nested in a class body are qualified by the class too:
+                // `class Host; module Hooks` is `Host::Hooks`.
+                let mut nested = ns.to_vec();
+                nested.push(local_name);
+                collect(body, &nested, namespace, ctx, syms, out);
             } else {
                 let iri = format!("{namespace}:{qualified}");
                 let superclass = c.superclass.as_deref().and_then(superclass_path);
@@ -1817,6 +1826,42 @@ mod tests {
         assert!(cs[0].declarations.is_empty() && cs[0].methods.is_empty());
         let (cs, _) = ore("module O\n  class P < ::Q; end\nend\n");
         assert_eq!(by_name(&cs, "O::P").superclass.as_deref(), Some("::Q"));
+    }
+
+    #[test]
+    fn units_nested_in_a_class_are_qualified_by_it() {
+        let (cs, _) = ore(
+            "class Host\n  module Hooks\n    before_save :sync\n  end\n  class Inner\n    def x; end\n  end\nend\nclass Other\n  module Hooks\n    after_save :z\n  end\nend\nmodule A\n  class B\n    module C\n      before_save :c\n    end\n  end\nend\n",
+        );
+        let names: Vec<&str> = cs.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Host",
+                "Host::Hooks",
+                "Host::Inner",
+                "Other",
+                "Other::Hooks",
+                "A",
+                "A::B",
+                "A::B::C"
+            ]
+        );
+        assert_eq!(by_name(&cs, "Host::Hooks").iri, "op:Host::Hooks");
+        assert!(
+            by_name(&cs, "Host::Hooks")
+                .declarations
+                .iter()
+                .any(|e| matches!(&e.decl,
+            Declaration::Callback(c) if c.target == "sync"))
+        );
+        assert!(
+            by_name(&cs, "Other::Hooks")
+                .declarations
+                .iter()
+                .any(|e| matches!(&e.decl,
+            Declaration::Callback(c) if c.target == "z"))
+        );
     }
 
     #[test]
