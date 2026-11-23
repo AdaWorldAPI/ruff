@@ -534,11 +534,22 @@ fn emit_validates_helper(method: &str, args: &[Node], out: &mut Vec<Declaration>
     let Some(validator) = validates_helper_kind(method) else {
         return;
     };
-    let pairs: &[Node] = args.iter().find_map(hash_pairs_of).unwrap_or_default();
-    // `**opts` may carry `if:`, `on:` or `allow_nil:`, so the helper cannot
-    // be promoted to a validation whose options look complete. It stays a
-    // `DslCall`, whose args keep the `**<expr>` marker.
-    if pairs.iter().any(|n| !matches!(n, Node::Pair(_))) {
+    // Promote only `:a, :b, { k: v }` shapes: leading symbols, then at most
+    // one literal hash of plain pairs. Anything else (`**opts`, a variable
+    // `opts`, a method call) may carry `if:`, `on:` or `allow_nil:`, so the
+    // option set is unknown and the helper stays a `DslCall` with its args.
+    let rest = &args[args.iter().take_while(|a| sym_string(a).is_some()).count()..];
+    let pairs: &[Node] = match rest {
+        [] => &[],
+        [only] => hash_pairs_of(only).unwrap_or(&[]),
+        _ => &[],
+    };
+    let resolved = match rest {
+        [] => true,
+        [only] => hash_pairs_of(only).is_some() && pairs.iter().all(|n| matches!(n, Node::Pair(_))),
+        _ => false,
+    };
+    if !resolved {
         out.push(Declaration::DslCall(DslCall {
             name: method.to_string(),
             args: format_args(args),
