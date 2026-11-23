@@ -35,6 +35,7 @@ use ruff_spo_triplet::{
 };
 
 mod actions;
+mod attribute_blocks;
 mod class_constants;
 mod class_functions;
 mod class_macros;
@@ -59,6 +60,10 @@ mod widgets;
 pub use actions::{
     ActionScanReport, ActionVerb, RubyActionEdge, extract_action_edges,
     extract_action_edges_with_report,
+};
+pub use attribute_blocks::{
+    AttributeBlock, AttributeBlockCall, AttributeBlockReport, BlockCondition, UnreadStatement,
+    extract_attribute_blocks,
 };
 pub use class_constants::{ClassConstantReport, ClassConstantRow, extract_class_constants};
 pub use class_functions::{
