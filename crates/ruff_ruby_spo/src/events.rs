@@ -1897,7 +1897,9 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
     if is_inert_statement(leaf) {
         return;
     }
-    let at = anchor(leaf);
+    // `anchor` reads only the shapes this walker records; a branch leaf can be
+    // any node (a `def self.x` is `Defs`), so take its own extent.
+    let at = u32::try_from(leaf.expression().begin).unwrap_or(0);
     let mut found = Vec::new();
     if scan.bare == Bare::OnClass {
         read_class_statement(leaf, scan.src, &mut found);
@@ -1916,25 +1918,10 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
     let all_found_empty =
         registering.is_empty() && other.iter().all(|d| matches!(d, Declaration::DslCall(_)));
     out.decls.extend(registering);
-    let mut unread = |reason| out.unread.push(HiddenUnread { anchor: at, reason });
     let block = match leaf {
         Node::Block(b) => Some(b),
         _ => None,
     };
-    if all_found_empty {
-        unread(if block.is_some() {
-            HiddenUnreadReason::UnreadBlockBody
-        } else {
-            match unharvested_reason(leaf, scan) {
-                UnharvestedReason::MethodDefinition => HiddenUnreadReason::MethodDefinition,
-                UnharvestedReason::CallOnOtherReceiver => HiddenUnreadReason::CallOnOtherReceiver,
-                UnharvestedReason::UnrecognizedCall => HiddenUnreadReason::UnrecognizedCall,
-                UnharvestedReason::DynamicSend => HiddenUnreadReason::DynamicSend,
-                _ => HiddenUnreadReason::Other,
-            }
-        });
-        return;
-    }
     // `with_options ... do ... end` yields a wrapper call plus its body's
     // declarations; its body is read statement by statement below instead.
     let with_options = block.is_some_and(|b| {
@@ -1961,6 +1948,21 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
                 out.unread.extend(inner.unread);
             }
         }
+        return;
+    }
+    let mut unread = |reason| out.unread.push(HiddenUnread { anchor: at, reason });
+    if all_found_empty {
+        unread(if block.is_some() {
+            HiddenUnreadReason::UnreadBlockBody
+        } else {
+            match unharvested_reason(leaf, scan) {
+                UnharvestedReason::MethodDefinition => HiddenUnreadReason::MethodDefinition,
+                UnharvestedReason::CallOnOtherReceiver => HiddenUnreadReason::CallOnOtherReceiver,
+                UnharvestedReason::UnrecognizedCall => HiddenUnreadReason::UnrecognizedCall,
+                UnharvestedReason::DynamicSend => HiddenUnreadReason::DynamicSend,
+                _ => HiddenUnreadReason::Other,
+            }
+        });
         return;
     }
     if !other.is_empty() {
@@ -4258,6 +4260,49 @@ end");
             1,
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn with_options_of_inert_statements_is_complete() {
+        assert_eq!(
+            one(
+                "    if a\n      after_save :y\n      with_options({}) do\n        x = 1\n      end\n    end"
+            ),
+            (true, vec![])
+        );
+    }
+
+    #[test]
+    fn with_options_keeps_a_modifier_conditional_registration() {
+        let src = "module H\n  extend ActiveSupport::Concern\n  included do\n    if a\n      with_options on: :create do\n        before_save :b if inner\n      end\n    end\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let u = &by_name(&cs, "H").unharvested;
+        assert_eq!(u.len(), 1);
+        assert!(u[0].hidden_complete());
+        let names: Vec<String> = u[0]
+            .hidden
+            .iter()
+            .map(|e| format!("{:?}", e.decl))
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.contains(":b") || n.contains("\"b\""))
+                .count(),
+            1,
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn an_unread_singleton_def_is_anchored_at_its_own_offset() {
+        let src = "module H\n  extend ActiveSupport::Concern\n  included do\n    if a\n      after_save :x\n      def self.helper; end\n    end\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let u = &by_name(&cs, "H").unharvested;
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].hidden_unread.len(), 1);
+        let at = u[0].hidden_unread[0].anchor as usize;
+        assert!(src[at..].starts_with("def self.helper"), "anchor {at}");
     }
 
     #[test]
