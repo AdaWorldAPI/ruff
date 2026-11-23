@@ -126,6 +126,9 @@ pub struct AttributeBlock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AttributeBlockReport {
     pub files_scanned: usize,
+    /// Files skipped because the parser reported an error (a recovered AST
+    /// may be partial) or produced no AST.
+    pub files_unparsed: usize,
     pub classes_seen: usize,
     pub attribute_calls: usize,
     pub blocks_found: usize,
@@ -155,10 +158,20 @@ pub fn extract_attribute_blocks(
             buffer_name: (*rel).to_string(),
             ..Default::default()
         };
-        let Some(ast) = Parser::new(src.as_bytes().to_vec(), parser_options)
-            .do_parse()
-            .ast
-        else {
+        let result = Parser::new(src.as_bytes().to_vec(), parser_options).do_parse();
+        // A recovered AST after a syntax error can omit whole class bodies, so
+        // harvesting it would report incomplete facts as complete. Skip the
+        // file and count it instead (the same rule as `guards::parse`).
+        if result
+            .diagnostics
+            .iter()
+            .any(lib_ruby_parser::Diagnostic::is_error)
+        {
+            report.files_unparsed += 1;
+            continue;
+        }
+        let Some(ast) = result.ast else {
+            report.files_unparsed += 1;
             continue;
         };
         report.files_scanned += 1;
@@ -455,6 +468,7 @@ end
             report,
             AttributeBlockReport {
                 files_scanned: 1,
+                files_unparsed: 0,
                 classes_seen: 2,
                 attribute_calls: 2,
                 blocks_found: 1,
@@ -572,5 +586,17 @@ end
         assert_eq!(report.unread_statements, 2);
         assert_eq!(report.conditions_unlowered, 1);
         assert_eq!(report.conditions_lowered, 0);
+    }
+
+    #[test]
+    fn a_file_with_a_syntax_error_is_skipped_not_harvested() {
+        // The block parses on its own; the stray `end` after the class makes
+        // the file a syntax error, which the parser recovers from.
+        let body =
+            "class C < BaseContract\n  attribute :a do\n    check_a if model.x?\n  end\nend\nend\n";
+        let (blocks, report) = scan("syntax_error", body);
+        assert!(blocks.is_empty(), "{blocks:?}");
+        assert_eq!(report.files_unparsed, 1);
+        assert_eq!(report.files_scanned, 0);
     }
 }
