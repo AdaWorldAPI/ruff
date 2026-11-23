@@ -479,21 +479,36 @@ pub enum DeclOrigin {
 /// consumer that sees declarations from such a body must not assume the
 /// body was read in full: every statement that yielded nothing is listed
 /// here, so "read one association" and "read the whole hook" stay distinct.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Unharvested {
     /// Byte offset of the statement.
     pub anchor: u32,
     /// The include-time body it sits in.
     pub origin: DeclOrigin,
     pub reason: UnharvestedReason,
+    /// For [`UnharvestedReason::ControlFlow`]: the declarations that can
+    /// register a callback, as its branches write them, in source order. None
+    /// of them is known to run, and a branch may also hold statements ruff does
+    /// not recognise; this list only names what the statement could register,
+    /// so a consumer can tell which callbacks a skipped branch could add or
+    /// re-register. Empty for every other reason.
+    pub hidden: Vec<RailsEvent>,
 }
 
 /// Why an include-time statement produced no declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnharvestedReason {
-    /// `if` / `unless` / `case` / a loop, or a modifier form. Its branches
-    /// may declare macros, and none of them were read.
+    /// `if` / `unless` / `case` / a loop, or a modifier form, with a branch
+    /// that holds a statement ruff recognises as a declaration that can
+    /// register a callback (an association, a validation, a callback, an
+    /// `include`, an `acts_as_*` or gem macro). That declaration may or may not
+    /// run, and none of it was read.
     ControlFlow,
+    /// The same statement forms, but no branch holds such a declaration
+    /// (`return if journaled?`, `if options[:on] then opts[:on] = ... end`).
+    /// Like an unrecognised call, it is not known to register anything, so it
+    /// does not make the order of the registrations around it unknown.
+    ControlFlowWithoutDeclaration,
     /// A `def` or `def self.x`.
     MethodDefinition,
     /// A call on a receiver other than the hook parameter (`other.has_many`,
@@ -517,6 +532,7 @@ impl UnharvestedReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ControlFlow => "CONTROL_FLOW",
+            Self::ControlFlowWithoutDeclaration => "CONTROL_FLOW_WITHOUT_DECLARATION",
             Self::MethodDefinition => "METHOD_DEFINITION",
             Self::CallOnOtherReceiver => "CALL_ON_OTHER_RECEIVER",
             Self::UnrecognizedCall => "UNRECOGNIZED_CALL",
@@ -1593,15 +1609,28 @@ fn record_unread(
             anchor: u32::try_from(stmt.expression().begin).unwrap_or(0),
             origin: origin.clone(),
             reason: UnharvestedReason::UnreadBlockBody,
+            hidden: Vec::new(),
         });
     }
 }
 
 fn unharvested_at(stmt: &Node, param: Option<&str>, origin: &DeclOrigin) -> Unharvested {
+    let anchor = u32::try_from(stmt.expression().begin).unwrap_or(0);
+    let reason = unharvested_reason(stmt, param);
+    let mut hidden = Vec::new();
+    if reason == UnharvestedReason::ControlFlow {
+        push_decls(
+            registering_declarations(stmt, param),
+            anchor,
+            origin,
+            &mut hidden,
+        );
+    }
     Unharvested {
-        anchor: u32::try_from(stmt.expression().begin).unwrap_or(0),
+        anchor,
         origin: origin.clone(),
-        reason: unharvested_reason(stmt, param),
+        reason,
+        hidden,
     }
 }
 
@@ -1621,7 +1650,13 @@ fn unharvested_reason(stmt: &Node, param: Option<&str>) -> UnharvestedReason {
         | Node::UntilPost(_)
         | Node::For(_)
         | Node::And(_)
-        | Node::Or(_) => return UnharvestedReason::ControlFlow,
+        | Node::Or(_) => {
+            return if registering_declarations(stmt, param).is_empty() {
+                UnharvestedReason::ControlFlowWithoutDeclaration
+            } else {
+                UnharvestedReason::ControlFlow
+            };
+        }
         Node::Def(_) | Node::Defs(_) => return UnharvestedReason::MethodDefinition,
         Node::Send(s) => s,
         Node::Block(b) => match &*b.call {
@@ -1644,6 +1679,96 @@ fn unharvested_reason(stmt: &Node, param: Option<&str>) -> UnharvestedReason {
             }
         }
         Some(_) => UnharvestedReason::CallOnOtherReceiver,
+    }
+}
+
+/// The statements inside `node`, a conditional or loop (or anything inside
+/// one), that yield a declaration able to register a callback: an
+/// association (its autosave callbacks), a validation, a callback, an `include`
+/// or `prepend` (the module's `included` block), an `acts_as_*` / gem macro, or
+/// a promoted registration. An unrecognised call, an attribute, a scope or an
+/// `extend` is not one: the same leniency an unrecognised statement gets.
+/// `param` is the hook parameter (`base`), `None` in a class or `included do`
+/// body. Every branch is read; none is evaluated.
+fn registering_declarations(node: &Node, param: Option<&str>) -> Vec<Declaration> {
+    let mut out = Vec::new();
+    collect_registering(node, param, &mut out);
+    out
+}
+
+fn collect_registering(node: &Node, param: Option<&str>, out: &mut Vec<Declaration>) {
+    let opt = |n: Option<&Node>, out: &mut Vec<Declaration>| {
+        if let Some(n) = n {
+            collect_registering(n, param, out);
+        }
+    };
+    match node {
+        Node::If(n) => {
+            opt(n.if_true.as_deref(), out);
+            opt(n.if_false.as_deref(), out);
+        }
+        Node::IfMod(n) => {
+            opt(n.if_true.as_deref(), out);
+            opt(n.if_false.as_deref(), out);
+        }
+        Node::IfTernary(n) => {
+            collect_registering(&n.if_true, param, out);
+            collect_registering(&n.if_false, param, out);
+        }
+        Node::Case(n) => {
+            for w in &n.when_bodies {
+                collect_registering(w, param, out);
+            }
+            opt(n.else_body.as_deref(), out);
+        }
+        Node::When(n) => opt(n.body.as_deref(), out),
+        Node::While(n) => opt(n.body.as_deref(), out),
+        Node::WhilePost(n) => collect_registering(&n.body, param, out),
+        Node::Until(n) => opt(n.body.as_deref(), out),
+        Node::UntilPost(n) => collect_registering(&n.body, param, out),
+        Node::For(n) => opt(n.body.as_deref(), out),
+        Node::And(n) => {
+            collect_registering(&n.lhs, param, out);
+            collect_registering(&n.rhs, param, out);
+        }
+        Node::Or(n) => {
+            collect_registering(&n.lhs, param, out);
+            collect_registering(&n.rhs, param, out);
+        }
+        Node::Begin(n) => {
+            for st in &n.statements {
+                collect_registering(st, param, out);
+            }
+        }
+        Node::KwBegin(n) => {
+            for st in &n.statements {
+                collect_registering(st, param, out);
+            }
+        }
+        leaf => {
+            let mut found = Vec::new();
+            crate::walk::walk_class_body(leaf, None, &mut found);
+            if let Some(p) = param {
+                crate::walk::walk_hook_statement(p, leaf, None, &mut found);
+            }
+            out.extend(found.into_iter().filter(can_register_a_callback));
+        }
+    }
+}
+
+fn can_register_a_callback(decl: &Declaration) -> bool {
+    match decl {
+        Declaration::Association(_)
+        | Declaration::Validation(_)
+        | Declaration::Callback(_)
+        | Declaration::ActsAs(_)
+        | Declaration::GemDsl(_) => true,
+        Declaration::Concern(c) => matches!(
+            c.kind,
+            ruff_spo_triplet::ConcernKind::Include | ruff_spo_triplet::ConcernKind::Prepend
+        ),
+        Declaration::DslCall(c) => crate::walk::is_promoted_op_registration(&c.name),
+        _ => false,
     }
 }
 
@@ -2991,7 +3116,7 @@ end");
     fn a_fully_read_hook_lists_nothing_unharvested() {
         let (cs, _) = ore(STORAGES_PATCH);
         assert!(!hook_events(by_name(&cs, "Patch")).is_empty());
-        assert_eq!(by_name(&cs, "Patch").unharvested, []);
+        assert!(by_name(&cs, "Patch").unharvested.is_empty());
     }
 
     #[test]
@@ -3057,5 +3182,36 @@ end");
             "module P\n  def self.included(base)\n    puts base\n  end\n  def self.other(base)\n    base.class_eval do\n      has_many :x\n    end\n  end\nend\n",
         );
         assert!(hook_events(by_name(&cs, "P")).is_empty());
+    }
+
+    /// An `included do` conditional hides a registration only when a branch
+    /// declares one, and then names what that branch would register; one that
+    /// holds no declaration hides nothing and names nothing.
+    #[test]
+    fn an_included_conditional_is_split_by_what_its_branches_declare() {
+        let (cs, _) = ore(
+            "module P\n  extend ActiveSupport::Concern\n  included do\n    if flag?\n      has_many :a\n    else\n      before_save :b\n    end\n    self.mode = :x if flag?\n    helper_for(:c) && extend(Helpers)\n  end\nend\n",
+        );
+        let u = &by_name(&cs, "P").unharvested;
+        let reasons: Vec<UnharvestedReason> = u.iter().map(|u| u.reason).collect();
+        assert_eq!(
+            reasons,
+            [
+                UnharvestedReason::ControlFlow,
+                UnharvestedReason::ControlFlowWithoutDeclaration,
+                UnharvestedReason::ControlFlowWithoutDeclaration,
+            ]
+        );
+        let hidden: Vec<String> = u[0]
+            .hidden
+            .iter()
+            .map(|e| match &e.decl {
+                Declaration::Association(a) => format!("assoc:{}", a.name),
+                Declaration::Callback(c) => format!("{}:{}", c.phase, c.target),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(hidden, ["assoc:a", "before_save:b"]);
+        assert!(u[1].hidden.is_empty() && u[2].hidden.is_empty());
     }
 }
