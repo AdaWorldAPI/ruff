@@ -10,12 +10,16 @@
 //! (`ns::Name`), or of a module body and its `included do` block, with the
 //! module as scope (`ns::module:Name`).
 //! `BODY` rows are the events of a method body, with the method as scope.
+//! `UNREAD` rows are the statements of a module's include-time bodies
+//! (`included do`, `def self.included`) that produced no declaration: kind is
+//! the reason, subject is the origin (`included:<line>`). They keep a
+//! partially read hook distinguishable from a fully read one downstream.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use ruff_ruby_spo::Declaration;
-use ruff_ruby_spo::events::{ClassOre, OreKind, Symbols, source_ore};
+use ruff_ruby_spo::events::{ClassOre, DeclOrigin, OreKind, Symbols, source_ore};
 
 use crate::cell;
 use crate::error::Error;
@@ -23,13 +27,14 @@ use crate::rows::{
     assoc_macro, attr_macro, concern_macro, gem_macro, scope_macro, validation_macro,
 };
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const SCHEMA: &str = "scope\tseq\tlane\tkind\tsubject\tobject\tanchor";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
     Decl,
     Body,
+    Unread,
 }
 
 impl Lane {
@@ -38,6 +43,7 @@ impl Lane {
         match self {
             Self::Decl => "DECL",
             Self::Body => "BODY",
+            Self::Unread => "UNREAD",
         }
     }
 }
@@ -107,6 +113,23 @@ impl Events {
                     subject: cell::text(&subject),
                     object: cell::text(&object),
                     anchor: event.anchor,
+                },
+            );
+        }
+        for (seq, unread) in class.unharvested.iter().enumerate() {
+            let origin = match unread.origin {
+                DeclOrigin::Body => "body".to_owned(),
+                DeclOrigin::Included { line } => format!("included:{line}"),
+            };
+            self.push(
+                &scope,
+                EventRow {
+                    seq: u32::try_from(seq).unwrap_or(u32::MAX),
+                    lane: Lane::Unread,
+                    kind: unread.reason.as_str().to_owned(),
+                    subject: origin,
+                    object: "-".to_owned(),
+                    anchor: unread.anchor,
                 },
             );
         }
@@ -188,5 +211,34 @@ fn decl_cells(decl: &Declaration) -> (String, String) {
             "sti".to_owned(),
             s.inherits_from.clone().unwrap_or_default(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unread_include_time_statements_survive_as_their_own_lane() {
+        let src = "module P\n  def self.included(base)\n    base.has_many :x\n    if cond\n      base.has_many :y\n    end\n  end\nend\n";
+        let mut events = Events::default();
+        events.add_source("ns", src).unwrap();
+        let out = events.render();
+        let unread: Vec<&str> = out.lines().filter(|l| l.contains("\tUNREAD\t")).collect();
+        let anchor = src.find("if cond").unwrap();
+        assert_eq!(
+            unread,
+            [format!("ns::module:P\t0\tUNREAD\tCONTROL_FLOW\tincluded:2\t-\t{anchor}").as_str()]
+        );
+        assert_eq!(events.counts()["UNREAD"], 1);
+        assert_eq!(events.counts()["DECL"], 1);
+    }
+
+    #[test]
+    fn a_fully_read_hook_adds_no_unread_rows() {
+        let src = "module P\n  def self.included(base)\n    base.has_many :x\n  end\nend\n";
+        let mut events = Events::default();
+        events.add_source("ns", src).unwrap();
+        assert!(!events.counts().contains_key("UNREAD"));
     }
 }

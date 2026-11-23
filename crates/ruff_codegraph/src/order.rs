@@ -78,10 +78,12 @@ pub fn relation(
     let mut position = 0usize;
     for (i, line) in lines.enumerate() {
         let cells: Vec<&str> = line.split('\t').collect();
-        let [row_scope, _seq, _lane, _kind, subject, object, _anchor] = cells[..] else {
+        let [row_scope, _seq, lane, _kind, subject, object, _anchor] = cells[..] else {
             return Err(bad(format!("line {}: expected 7 cells", i + 3)));
         };
-        if row_scope != scope {
+        // `UNREAD` rows record statements that were not read, not events
+        // with a position in the run order.
+        if row_scope != scope || lane == "UNREAD" {
             continue;
         }
         if subject == a || object == a {

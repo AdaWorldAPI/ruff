@@ -211,7 +211,7 @@ fn validate_files(text: &str) -> Result<(), String> {
 }
 
 fn validate_events(text: &str) -> Result<(), String> {
-    let (names, body) = header(text, 1)?;
+    let (names, body) = header(text, 2)?;
     if names
         != [
             "scope", "seq", "lane", "kind", "subject", "object", "anchor",
@@ -223,7 +223,7 @@ fn validate_events(text: &str) -> Result<(), String> {
         let cells: Vec<&str> = line.split('\t').collect();
         if cells.len() != 7
             || cells[1].parse::<u32>().is_err()
-            || !["DECL", "BODY"].contains(&cells[2])
+            || !["DECL", "BODY", "UNREAD"].contains(&cells[2])
             || cells[6].parse::<u32>().is_err()
         {
             return Err(format!("line {}: not an event row", i + 3));
@@ -381,7 +381,7 @@ fn occurrences_that_interleave_make_the_answer_unknown() {
     };
     let events = |objects: &[&str]| {
         let mut text =
-            String::from("#version 1\n#schema scope\tseq\tlane\tkind\tsubject\tobject\tanchor\n");
+            String::from("#version 2\n#schema scope\tseq\tlane\tkind\tsubject\tobject\tanchor\n");
         for (i, object) in objects.iter().enumerate() {
             text.push_str(&row(u32::try_from(i).unwrap(), object));
         }
@@ -396,6 +396,17 @@ fn occurrences_that_interleave_make_the_answer_unknown() {
     // A repeated name is not ambiguous while all its occurrences are on one side.
     assert_eq!(ask(&["a", "a", "b"]), Relation::Before);
     assert_eq!(ask(&["b", "a", "a"]), Relation::After);
+    // An `UNREAD` row is not an event: a name in it does not count as an
+    // occurrence. Read as an event it would make `b` interleave with `a`.
+    let unread = "#version 2\n#schema scope\tseq\tlane\tkind\tsubject\tobject\tanchor\n\
+        S\t0\tUNREAD\tOTHER\tb\t-\t0\n\
+        S\t0\tDECL\tCallback\tbefore_save\ta\t1\n\
+        S\t1\tDECL\tCallback\tbefore_save\tb\t2\n";
+    fs::write(out.path().join("shop.events.tsv"), unread).unwrap();
+    assert_eq!(
+        relation(out.path(), "shop", "S", "a", "b").unwrap(),
+        Relation::Before
+    );
 }
 
 #[test]

@@ -511,6 +511,22 @@ pub enum UnharvestedReason {
     Other,
 }
 
+impl UnharvestedReason {
+    /// A stable spelling for serialized output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ControlFlow => "CONTROL_FLOW",
+            Self::MethodDefinition => "METHOD_DEFINITION",
+            Self::CallOnOtherReceiver => "CALL_ON_OTHER_RECEIVER",
+            Self::UnrecognizedCall => "UNRECOGNIZED_CALL",
+            Self::DynamicSend => "DYNAMIC_SEND",
+            Self::UnreadBlockBody => "UNREAD_BLOCK_BODY",
+            Self::Other => "OTHER",
+        }
+    }
+}
+
 /// Whether a [`ClassOre`] came from a `class` or a `module` body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OreKind {
