@@ -1930,6 +1930,65 @@ end
     }
 
     #[test]
+    fn with_options_conditions_reach_the_declarations_in_its_body() {
+        let classes = extract_from_source(
+            "class M\n  with_options if: :enabled? do\n    validates_presence_of :name\n    validates :code, presence: true, if: :other?\n    before_save :stamp\n    has_many :items\n  end\nend\n",
+        );
+        let decls = &classes[0].declarations;
+        let validation = |t: &str| {
+            decls
+                .iter()
+                .find_map(|d| match d {
+                    Declaration::Validation(v) if v.target == t => Some(v.options.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no validation for {t}"))
+        };
+        let has =
+            |o: &[(String, String)], k: &str, v: &str| o.iter().any(|(a, b)| a == k && b == v);
+        assert!(has(&validation("name"), "if", ":enabled?"));
+        // A key the call sets itself wins over the wrapper's.
+        let code = validation("code");
+        assert!(has(&code, "if", ":other?"));
+        assert!(!has(&code, "if", ":enabled?"));
+        assert!(decls.iter().any(|d| matches!(d, Declaration::Callback(c)
+            if c.target == "stamp" && c.options.iter().any(|(k, v)| k == "if" && v == ":enabled?"))));
+        assert!(decls.iter().any(|d| matches!(d, Declaration::Association(a)
+            if a.name == "items" && a.options.iter().any(|(k, v)| k == "if" && v == ":enabled?"))));
+    }
+
+    #[test]
+    fn unresolved_with_options_makes_nothing_in_its_body_unconditional() {
+        let classes = extract_from_source(
+            "class M\n  with_options opts do\n    validates_presence_of :name\n    validates :code, presence: true\n    before_save :stamp\n    has_many :items\n  end\nend\n",
+        );
+        let decls = &classes[0].declarations;
+        assert!(
+            !decls
+                .iter()
+                .any(|d| matches!(d, Declaration::Validation(_)))
+        );
+        assert!(decls.iter().any(|d| matches!(d, Declaration::DslCall(c)
+            if c.name == "validates" && c.args.starts_with(":name"))));
+        assert!(decls.iter().any(|d| matches!(d, Declaration::Callback(c)
+            if c.target == "stamp" && c.options.iter().any(|(k, _)| k == "if"))));
+        assert!(decls.iter().any(|d| matches!(d, Declaration::Association(a)
+            if a.name == "items" && !a.option_splats.is_empty())));
+    }
+
+    #[test]
+    fn a_validates_helper_with_a_computed_key_is_not_promoted() {
+        let src = "class M\n  validates_numericality_of :amount, { key => true }\nend\n";
+        let classes = extract_from_source(src);
+        assert!(
+            !classes[0]
+                .declarations
+                .iter()
+                .any(|d| matches!(d, Declaration::Validation(_)))
+        );
+    }
+
+    #[test]
     fn a_validates_helper_with_nonliteral_options_is_not_promoted() {
         for src in [
             "class M\n  validates_numericality_of :amount, opts\nend\n",

@@ -213,7 +213,10 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut 
         // because that's runtime-only).
         "with_options" => {
             if let Some(body) = blk.body.as_ref() {
-                walk_class_body(body, src, out);
+                let mut inner = Vec::new();
+                walk_class_body(body, src, &mut inner);
+                apply_grouping_options(&mut inner, literal_options(&s.args).as_deref());
+                out.extend(inner);
             }
             // Also record the wrapper call itself so the catch-all
             // coverage assertion still sees `with_options` somewhere.
@@ -225,6 +228,75 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut 
             // for coverage without inventing a Declaration shape for
             // arbitrary block DSLs.
             route_send(other, &s.args, src, out);
+        }
+    }
+}
+
+/// The options of a call whose arguments are exactly one literal hash with
+/// literal (symbol or string) keys, or none. `None` when any option is not
+/// statically known: a variable, a method call, a `**splat`, a computed key.
+fn literal_options(args: &[Node]) -> Option<Vec<(String, String)>> {
+    match args {
+        [] => Some(Vec::new()),
+        [only] => {
+            let pairs = hash_pairs_of(only)?;
+            pairs
+                .iter()
+                .map(|n| match n {
+                    Node::Pair(p) if matches!(&*p.key, Node::Sym(_) | Node::Str(_)) => {
+                        Some((pair_key(&p.key), render_node(&p.value)))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+/// Apply a `with_options` wrapper's options to the declarations of its body,
+/// as ActiveSupport's `OptionMerger` does: each call receives the wrapper's
+/// options, and a key the call sets itself wins.
+///
+/// When the wrapper's options are not statically known (`None`), they may
+/// hold `if:`, `on:` or `allow_nil:`, so nothing in the body may look
+/// unconditional: a validation becomes a `DslCall` (no constraint is
+/// derived from it), an association records an [`OptionSplat`], and a
+/// callback is marked conditional with `if: <expr>`.
+fn apply_grouping_options(decls: &mut [Declaration], wrapper: Option<&[(String, String)]>) {
+    fn merge(options: &mut Vec<(String, String)>, wrapper: &[(String, String)]) {
+        for (k, v) in wrapper {
+            if !options.iter().any(|(own, _)| own == k) {
+                options.push((k.clone(), v.clone()));
+            }
+        }
+    }
+    for decl in decls.iter_mut() {
+        match (decl, wrapper) {
+            (Declaration::Validation(v), Some(w)) => merge(&mut v.options, w),
+            (Declaration::Callback(c), Some(w)) => merge(&mut c.options, w),
+            (Declaration::Association(a), Some(w)) => merge(&mut a.options, w),
+            (d @ Declaration::Validation(_), None) => {
+                let Declaration::Validation(v) = &*d else {
+                    continue;
+                };
+                *d = Declaration::DslCall(DslCall {
+                    name: "validates".to_string(),
+                    args: format!(":{}, {{**<with_options>}}", v.target),
+                });
+            }
+            (Declaration::Callback(c), None) => {
+                if !c.options.iter().any(|(k, _)| k == "if") {
+                    c.options.push(("if".to_string(), "<expr>".to_string()));
+                }
+            }
+            (Declaration::Association(a), None) => {
+                a.option_splats.push(ruff_spo_triplet::OptionSplat {
+                    source: "<with_options>".to_string(),
+                    before: 0,
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -544,9 +616,13 @@ fn emit_validates_helper(method: &str, args: &[Node], out: &mut Vec<Declaration>
         [only] => hash_pairs_of(only).unwrap_or(&[]),
         _ => &[],
     };
+    // Keys must be literal too: `{ key => true }` may be `allow_nil`.
     let resolved = match rest {
         [] => true,
-        [only] => hash_pairs_of(only).is_some() && pairs.iter().all(|n| matches!(n, Node::Pair(_))),
+        [only] => hash_pairs_of(only).is_some()
+            && pairs.iter().all(
+                |n| matches!(n, Node::Pair(p) if matches!(&*p.key, Node::Sym(_) | Node::Str(_))),
+            ),
         _ => false,
     };
     if !resolved {
