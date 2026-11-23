@@ -75,7 +75,7 @@
   },
   "direction": "ruff->store",
   "formats": {
-    "events": 1,
+    "events": 2,
     "files": 1,
     "receipt": 1,
     "residuals": 1,

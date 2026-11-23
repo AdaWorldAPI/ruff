@@ -39,6 +39,95 @@ pub(crate) fn walk_class_body(body: &Node, src: Option<&str>, out: &mut Vec<Decl
     }
 }
 
+/// Walk one statement of a `def self.included(<param>)` hook body.
+///
+/// Only two shapes are read, both addressed to the hook's parameter:
+///
+/// - `<param>.class_eval do ... end` (also `class_exec`, and the brace
+///   form): the block body is a class body, walked as one.
+/// - `<param>.<macro> args` and `<param>.send(:<macro>, args)` (also
+///   `public_send` / `__send__`): routed like the bare class-body call, so
+///   `base.has_many :x`, `base.before_save :y`, `base.extend(M)`,
+///   `base.include(M)` and `base.send(:include, M)` are declarations.
+///
+/// Anything else (`def`, conditionals, calls on other receivers, `base.foo`
+/// for a `foo` that is not a recognised macro) produces nothing: an
+/// unrecognised call on the parameter is not guessed into a `DslCall`.
+pub(crate) fn walk_hook_statement(
+    param: &str,
+    node: &Node,
+    src: Option<&str>,
+    out: &mut Vec<Declaration>,
+) {
+    if let Some(body) = hook_eval_body(param, node) {
+        walk_class_body(body, src, out);
+        return;
+    }
+    match node {
+        Node::Send(s) if is_on_param(s.recv.as_deref(), param) => {
+            let (name, args): (String, &[Node]) =
+                match (s.method_name.as_str(), s.args.split_first()) {
+                    ("send" | "public_send" | "__send__", Some((first, rest))) => {
+                        match sym_string(first) {
+                            Some(inner) => (inner, rest),
+                            None => return,
+                        }
+                    }
+                    (name, _) => (name.to_string(), &s.args),
+                };
+            let mut found = Vec::new();
+            route_send(&name, args, src, &mut found);
+            // Only the unknown-name fallback is dropped; an OpenProject
+            // registration that `route_send` promotes by name is kept.
+            out.extend(found.into_iter().filter(|d| match d {
+                Declaration::DslCall(c) => is_promoted_op_registration(&c.name),
+                _ => true,
+            }));
+        }
+        _ => {}
+    }
+}
+
+/// Whether `recv` is the hook parameter itself (`base` in `base.has_many`).
+fn is_on_param(recv: Option<&Node>, param: &str) -> bool {
+    matches!(recv, Some(Node::Lvar(v)) if v.name == param)
+}
+
+/// The block body of `<param>.class_eval do ... end` (also `class_exec`
+/// and the brace form), or `None` for any other statement.
+///
+/// Callers that record source anchors walk this body statement by
+/// statement, so each macro inside keeps its own location.
+pub(crate) fn hook_eval_body<'a>(param: &str, node: &'a Node) -> Option<&'a Node> {
+    let Node::Block(blk) = node else { return None };
+    let Node::Send(s) = &*blk.call else {
+        return None;
+    };
+    if is_on_param(s.recv.as_deref(), param)
+        && matches!(s.method_name.as_str(), "class_eval" | "class_exec")
+    {
+        blk.body.as_deref()
+    } else {
+        None
+    }
+}
+
+/// `OpenProject` registration macros that `route_send` recognises by name
+/// and keeps as a `DslCall`, as opposed to the fallback that wraps any
+/// unrecognised name.
+pub(crate) fn is_promoted_op_registration(name: &str) -> bool {
+    matches!(
+        name,
+        "register_journal_formatter"
+            | "register_journal_formatted_fields"
+            | "register_query"
+            | "activity_provider_for"
+            | "deprecated_alias"
+            | "associated_to_ask_before_destruction"
+            | "has_details_table"
+    )
+}
+
 /// Process one class-body statement.
 fn walk_statement(node: &Node, src: Option<&str>, out: &mut Vec<Declaration>) {
     match node {
@@ -122,20 +211,161 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut 
         // known grouping idioms to avoid double-counting from arbitrary
         // blocks (e.g. `5.times do; validates :foo; end` would NOT count
         // because that's runtime-only).
-        "with_options" => {
-            if let Some(body) = blk.body.as_ref() {
-                walk_class_body(body, src, out);
-            }
-            // Also record the wrapper call itself so the catch-all
-            // coverage assertion still sees `with_options` somewhere.
-            route_send(s.method_name.as_str(), &s.args, src, out);
-        }
+        "with_options" => walk_with_options(blk, s, src, out, Some(&[])),
         other => {
             // Generic block: route the call as if it were a bare Send,
             // then drop the body. Conservative — keeps the call counted
             // for coverage without inventing a Declaration shape for
             // arbitrary block DSLs.
             route_send(other, &s.args, src, out);
+        }
+    }
+}
+
+/// One option of a literal hash: the key as a plain string, the key as
+/// written (for re-rendering), and the rendered value.
+#[derive(Clone)]
+struct Opt {
+    key: String,
+    key_src: String,
+    value: String,
+}
+
+/// The options of a call whose arguments are exactly one literal hash with
+/// literal (symbol or string) keys, or none. `None` when any option is not
+/// statically known: a variable, a method call, a `**splat`, a computed key.
+fn literal_options(args: &[Node]) -> Option<Vec<Opt>> {
+    match args {
+        [] => Some(Vec::new()),
+        [only] => hash_pairs_of(only)?
+            .iter()
+            .map(|n| match n {
+                Node::Pair(p) if matches!(&*p.key, Node::Sym(_) | Node::Str(_)) => Some(Opt {
+                    key: pair_key(&p.key),
+                    key_src: render_node(&p.key),
+                    value: render_node(&p.value),
+                }),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// `own` with every `inherited` option whose key `own` does not set: the
+/// call's own keys win, as in `ActiveSupport`'s `OptionMerger`.
+fn merge_opts(own: &[Opt], inherited: &[Opt]) -> Vec<Opt> {
+    let mut merged = own.to_vec();
+    for o in inherited {
+        if !merged.iter().any(|m| m.key == o.key) {
+            merged.push(o.clone());
+        }
+    }
+    merged
+}
+
+/// A `with_options` block. `outer` is the combined options of the enclosing
+/// `with_options` blocks (empty at the top), `None` when any of them is not
+/// statically known.
+///
+/// Each call in the body receives the combined options, as
+/// `ActiveSupport`'s `OptionMerger` does, with a key the call sets itself
+/// winning. A `validates_*_of` helper receives them before its own options
+/// are split into shared and validator-specific keys, so
+/// `with_options maximum: 80 do; validates_length_of :name; end` gives
+/// `length: {maximum: 80}` like the direct call. When the options are not
+/// statically known they may hold `if:`, `on:` or `allow_nil:`, so nothing
+/// in the body may look unconditional: a validation becomes a `DslCall`, an
+/// association records an [`OptionSplat`], and a callback is marked
+/// conditional with `if: <expr>`.
+fn walk_with_options(
+    blk: &lib_ruby_parser::nodes::Block,
+    call: &lib_ruby_parser::nodes::Send,
+    src: Option<&str>,
+    out: &mut Vec<Declaration>,
+    outer: Option<&[Opt]>,
+) {
+    let wrapper: Option<Vec<Opt>> = match (outer, literal_options(&call.args)) {
+        (Some(o), Some(w)) => Some(merge_opts(&w, o)),
+        _ => None,
+    };
+    if let Some(body) = blk.body.as_deref() {
+        let stmts: Vec<&Node> = match body {
+            Node::Begin(b) => b.statements.iter().collect(),
+            single => vec![single],
+        };
+        for stmt in stmts {
+            match stmt {
+                Node::Block(inner_blk)
+                    if matches!(&*inner_blk.call, Node::Send(s)
+                        if s.recv.is_none() && s.method_name == "with_options") =>
+                {
+                    let Node::Send(inner_call) = &*inner_blk.call else {
+                        continue;
+                    };
+                    walk_with_options(inner_blk, inner_call, src, out, wrapper.as_deref());
+                }
+                Node::Send(s)
+                    if s.recv.is_none()
+                        && validates_helper_kind(&s.method_name).is_some()
+                        && wrapper.is_some() =>
+                {
+                    emit_validates_helper(
+                        &s.method_name,
+                        &s.args,
+                        wrapper.as_deref().unwrap_or(&[]),
+                        out,
+                    );
+                }
+                _ => {
+                    let mut inner = Vec::new();
+                    walk_statement(stmt, src, &mut inner);
+                    apply_grouping_options(&mut inner, wrapper.as_deref());
+                    out.extend(inner);
+                }
+            }
+        }
+    }
+    // The wrapper call itself, so coverage still sees `with_options`.
+    route_send(call.method_name.as_str(), &call.args, src, out);
+}
+
+/// Apply combined `with_options` options to declarations other than
+/// `validates_*_of` helpers (see [`walk_with_options`]).
+fn apply_grouping_options(decls: &mut [Declaration], wrapper: Option<&[Opt]>) {
+    fn merge(options: &mut Vec<(String, String)>, wrapper: &[Opt]) {
+        for o in wrapper {
+            if !options.iter().any(|(own, _)| *own == o.key) {
+                options.push((o.key.clone(), o.value.clone()));
+            }
+        }
+    }
+    for decl in decls.iter_mut() {
+        match (decl, wrapper) {
+            (Declaration::Validation(v), Some(w)) => merge(&mut v.options, w),
+            (Declaration::Callback(c), Some(w)) => merge(&mut c.options, w),
+            (Declaration::Association(a), Some(w)) => merge(&mut a.options, w),
+            (d @ Declaration::Validation(_), None) => {
+                let Declaration::Validation(v) = &*d else {
+                    continue;
+                };
+                *d = Declaration::DslCall(DslCall {
+                    name: "validates".to_string(),
+                    args: format!(":{}, {{**<with_options>}}", v.target),
+                });
+            }
+            (Declaration::Callback(c), None) => {
+                if !c.options.iter().any(|(k, _)| k == "if") {
+                    c.options.push(("if".to_string(), "<expr>".to_string()));
+                }
+            }
+            (Declaration::Association(a), None) => {
+                a.option_splats.push(ruff_spo_triplet::OptionSplat {
+                    source: "<with_options>".to_string(),
+                    before: 0,
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -205,6 +435,7 @@ fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declar
         "normalizes" => emit_validation(ValidationKind::Normalizes, args, out),
         "validates_associated" => emit_validation(ValidationKind::ValidatesAssociated, args, out),
         "validates_each" => emit_validation(ValidationKind::ValidatesEach, args, out),
+        n if validates_helper_kind(n).is_some() => emit_validates_helper(n, args, &[], out),
         "validates_with" => emit_validates_with(args, out),
 
         // ───── Callbacks (13 phases) ─────
@@ -273,13 +504,7 @@ fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declar
         n if n.starts_with("acts_as_") => emit_acts_as(n, args, out),
 
         // ───── OpenProject custom registrations: promoted ─────
-        "register_journal_formatter"
-        | "register_journal_formatted_fields"
-        | "register_query"
-        | "activity_provider_for"
-        | "deprecated_alias"
-        | "associated_to_ask_before_destruction"
-        | "has_details_table" => {
+        n if is_promoted_op_registration(n) => {
             out.push(Declaration::DslCall(DslCall {
                 name: name.to_string(),
                 args: format_args(args),
@@ -395,6 +620,109 @@ fn emit_validation(kind: ValidationKind, args: &[Node], out: &mut Vec<Declaratio
     for target in targets {
         out.push(Declaration::Validation(Validation {
             kind,
+            target,
+            options: options.clone(),
+        }));
+    }
+}
+
+/// The validator an `ActiveModel` `validates_<kind>_of` helper stands for, as
+/// the key `validates` takes (`validates_presence_of` is `presence:`).
+///
+/// `ActiveModel` 8.1.4.1: `absence.rb:28`, `acceptance.rb:108`,
+/// `comparison.rb:85`, `confirmation.rb:75`, `exclusion.rb:44`,
+/// `format.rb:107`, `inclusion.rb:42`, `length.rb:123` (`validates_size_of`
+/// is its alias, `length.rb:127`), `numericality.rb:217`, `presence.rb:34`;
+/// `ActiveRecord`: `uniqueness.rb:291`. `validates_associated`,
+/// `validates_with` and `validates_each` have their own
+/// [`ValidationKind`]s and are routed separately.
+fn validates_helper_kind(method: &str) -> Option<&'static str> {
+    Some(match method {
+        "validates_presence_of" => "presence",
+        "validates_absence_of" => "absence",
+        "validates_acceptance_of" => "acceptance",
+        "validates_comparison_of" => "comparison",
+        "validates_confirmation_of" => "confirmation",
+        "validates_exclusion_of" => "exclusion",
+        "validates_format_of" => "format",
+        "validates_inclusion_of" => "inclusion",
+        "validates_length_of" | "validates_size_of" => "length",
+        "validates_numericality_of" => "numericality",
+        "validates_uniqueness_of" => "uniqueness",
+        _ => return None,
+    })
+}
+
+/// The option keys `validates` hands to every validator it builds rather
+/// than to one (`validates.rb:162-164`, `_validates_default_keys`).
+const VALIDATES_DEFAULT_KEYS: &[&str] = &[
+    "if",
+    "unless",
+    "on",
+    "allow_blank",
+    "allow_nil",
+    "strict",
+    "except_on",
+];
+
+/// `validates_numericality_of :a, :b, allow_nil: true, greater_than: 0` is
+/// `validates :a, :b, numericality: { greater_than: 0 }, allow_nil: true`:
+/// the helper builds one validator whose options are the whole trailing hash,
+/// and `validates` splits the shared keys off the same way. One `Validation`
+/// is emitted per attribute in the `validates` shape, so a consumer reads
+/// both spellings with one parser.
+/// `inherited` is the combined options of enclosing `with_options` blocks;
+/// they are merged into the helper's own options (its own keys winning)
+/// before the split into shared and validator-specific keys.
+fn emit_validates_helper(
+    method: &str,
+    args: &[Node],
+    inherited: &[Opt],
+    out: &mut Vec<Declaration>,
+) {
+    let Some(validator) = validates_helper_kind(method) else {
+        return;
+    };
+    // Promote only `:a, :b, { k: v }` shapes: leading symbols, then at most
+    // one literal hash with literal keys. Anything else (`**opts`, a variable
+    // `opts`, a method call, `{ key => true }`) may carry `if:`, `on:` or
+    // `allow_nil:`, so the option set is unknown and the helper stays a
+    // `DslCall` with its args.
+    let rest = &args[args.iter().take_while(|a| sym_string(a).is_some()).count()..];
+    let Some(own) = literal_options(rest) else {
+        out.push(Declaration::DslCall(DslCall {
+            name: method.to_string(),
+            args: format_args(args),
+        }));
+        return;
+    };
+    let merged = merge_opts(&own, inherited);
+    let (shared, specific): (Vec<&Opt>, Vec<&Opt>) = merged
+        .iter()
+        .partition(|o| VALIDATES_DEFAULT_KEYS.contains(&o.key.as_str()));
+    let validator_value = if specific.is_empty() {
+        "true".to_string()
+    } else {
+        let parts: Vec<String> = specific
+            .iter()
+            .map(|o| format!("{}: {}", o.key_src, o.value))
+            .collect();
+        format!("{{{}}}", parts.join(", "))
+    };
+    let mut options = vec![(validator.to_string(), validator_value)];
+    options.extend(shared.into_iter().map(|o| (o.key.clone(), o.value.clone())));
+    let targets: Vec<String> = args.iter().map_while(sym_string).collect();
+    if targets.is_empty() {
+        out.push(Declaration::Validation(Validation {
+            kind: ValidationKind::Validates,
+            target: if args.is_empty() { "<empty>" } else { "<expr>" }.to_string(),
+            options,
+        }));
+        return;
+    }
+    for target in targets {
+        out.push(Declaration::Validation(Validation {
+            kind: ValidationKind::Validates,
             target,
             options: options.clone(),
         }));
@@ -840,7 +1168,10 @@ fn render_node(node: &Node) -> String {
                 .join(",");
             format!("[{elems}]")
         }
-        Node::Hash(h) => format_hash_inline(h),
+        Node::Hash(h) => format_pairs_inline(&h.pairs),
+        // Trailing keyword arguments (`include_module "X", into: "Y"`) render
+        // exactly like the braced literal, so one parser reads both.
+        Node::Kwargs(k) => format_pairs_inline(&k.pairs),
         _ => "<expr>".to_string(),
     }
 }
@@ -929,14 +1260,23 @@ fn pair_key(key: &Node) -> String {
     }
 }
 
-/// Render a Hash node inline as `{k: v, k2: v2}` for the args blob.
-fn format_hash_inline(h: &lib_ruby_parser::nodes::Hash) -> String {
+/// Render the pairs of a `Hash` / `Kwargs` node inline as `{k: v, k2: v2}`
+/// for the args blob.
+fn format_pairs_inline(pairs: &[Node]) -> String {
     let mut parts = Vec::new();
-    for pair_node in &h.pairs {
-        let Node::Pair(p) = pair_node else { continue };
-        let key = render_node(&p.key);
-        let value = render_node(&p.value);
-        parts.push(format!("{key}: {value}"));
+    for pair_node in pairs {
+        match pair_node {
+            Node::Pair(p) => {
+                let key = render_node(&p.key);
+                let value = render_node(&p.value);
+                parts.push(format!("{key}: {value}"));
+            }
+            // `**opts` contributes keys the source does not spell out. It is
+            // kept as `**<expr>` so the rendering never reads as the complete
+            // option set: `{}` is an empty hash, `{**<expr>}` is unknown.
+            Node::Kwsplat(k) => parts.push(format!("**{}", render_node(&k.value))),
+            other => parts.push(render_node(other)),
+        }
     }
     format!("{{{}}}", parts.join(", "))
 }

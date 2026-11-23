@@ -1,4 +1,4 @@
-#version 1
+#version 2
 #schema scope	seq	lane	kind	subject	object	anchor
 shop::Attachment	0	DECL	Attribute	attribute	size	29
 shop::Attachment::label	0	BODY	ScopeEnter	Method	-	58
