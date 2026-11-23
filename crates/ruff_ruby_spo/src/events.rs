@@ -1929,24 +1929,7 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
     });
     if with_options {
         if let Some(body) = block.and_then(|b| b.body.as_deref()) {
-            // The wrapper's direct children came back above, with the
-            // inherited options merged in. Control flow nested in the body is
-            // not part of that walk, so what its branches could register is
-            // taken from the recursive read; a leaf's declarations are not,
-            // or they would be listed twice.
-            let statements: Vec<&Node> = match body {
-                Node::Begin(b) => b.statements.iter().collect(),
-                Node::KwBegin(b) => b.statements.iter().collect(),
-                single => vec![single],
-            };
-            for st in statements {
-                let mut inner = Branches::default();
-                collect_registering(st, scan, &mut inner);
-                if is_branching(st) {
-                    out.decls.extend(inner.decls);
-                }
-                out.unread.extend(inner.unread);
-            }
+            read_with_options_body(body, scan, out);
         }
         return;
     }
@@ -1971,6 +1954,41 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
         // A callback or validation block is code that runs later; any other
         // block is a DSL body that was not read.
         unread(HiddenUnreadReason::UnreadBlockBody);
+    }
+}
+
+/// Reads a `with_options` body inside a skipped branch. The wrapper's direct
+/// children, nested `with_options` included, came back from the class walk with
+/// the inherited options merged in. Control flow anywhere in the body is not
+/// part of that walk, so what its branches could register is taken from the
+/// recursive read; a leaf's declarations are not, or they would be listed
+/// twice. A nested `with_options` is read the same way.
+fn read_with_options_body(body: &Node, scan: Scan<'_>, out: &mut Branches) {
+    let statements: Vec<&Node> = match body {
+        Node::Begin(b) => b.statements.iter().collect(),
+        Node::KwBegin(b) => b.statements.iter().collect(),
+        single => vec![single],
+    };
+    for st in statements {
+        if let Some(inner_body) = with_options_body(st) {
+            read_with_options_body(inner_body, scan, out);
+            continue;
+        }
+        let mut inner = Branches::default();
+        collect_registering(st, scan, &mut inner);
+        if is_branching(st) {
+            out.decls.extend(inner.decls);
+        }
+        out.unread.extend(inner.unread);
+    }
+}
+
+/// The body of a bare `with_options ... do ... end` block.
+fn with_options_body(node: &Node) -> Option<&Node> {
+    let Node::Block(b) = node else { return None };
+    match &*b.call {
+        Node::Send(s) if s.recv.is_none() && s.method_name == "with_options" => b.body.as_deref(),
+        _ => None,
     }
 }
 
@@ -4303,6 +4321,28 @@ end");
         assert_eq!(u[0].hidden_unread.len(), 1);
         let at = u[0].hidden_unread[0].anchor as usize;
         assert!(src[at..].starts_with("def self.helper"), "anchor {at}");
+    }
+
+    #[test]
+    fn nested_with_options_keeps_a_conditional_registration() {
+        let src = "module H\n  extend ActiveSupport::Concern\n  included do\n    if outer\n      after_save :known\n      with_options on: :create do\n        with_options if: :ready? do\n          has_many :items\n          before_save :b if inner\n        end\n      end\n    end\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let u = &by_name(&cs, "H").unharvested;
+        assert_eq!(u.len(), 1);
+        assert!(u[0].hidden_complete());
+        let names: Vec<String> = u[0]
+            .hidden
+            .iter()
+            .map(|e| format!("{:?}", e.decl))
+            .collect();
+        for want in ["known", "items", "\"b\""] {
+            assert_eq!(
+                names.iter().filter(|n| n.contains(want)).count(),
+                1,
+                "{want}: {names:?}"
+            );
+        }
+        assert_eq!(names.len(), 3, "{names:?}");
     }
 
     #[test]
