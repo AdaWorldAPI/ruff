@@ -1748,6 +1748,28 @@ fn collect_registering(node: &Node, param: Option<&str>, bare: Bare, out: &mut V
             opt(n.else_body.as_deref(), out);
         }
         Node::When(n) => opt(n.body.as_deref(), out),
+        // `case ... in`: every `in` body and the `else`. A guard
+        // (`in x if ready?`) is a condition, read no more than an `if`'s.
+        Node::CaseMatch(n) => {
+            for b in &n.in_bodies {
+                collect_registering(b, param, bare, out);
+            }
+            opt(n.else_body.as_deref(), out);
+        }
+        Node::InPattern(n) => opt(n.body.as_deref(), out),
+        // `begin ... rescue ... else ... ensure ... end` inside a branch.
+        Node::Rescue(n) => {
+            opt(n.body.as_deref(), out);
+            for b in &n.rescue_bodies {
+                collect_registering(b, param, bare, out);
+            }
+            opt(n.else_.as_deref(), out);
+        }
+        Node::RescueBody(n) => opt(n.body.as_deref(), out),
+        Node::Ensure(n) => {
+            opt(n.body.as_deref(), out);
+            opt(n.ensure.as_deref(), out);
+        }
         Node::While(n) => opt(n.body.as_deref(), out),
         Node::WhilePost(n) => collect_registering(&n.body, param, bare, out),
         Node::Until(n) => opt(n.body.as_deref(), out),
@@ -4300,5 +4322,92 @@ end
         assert_eq!(step_labels(m), ["decl:a", "decl:b", "decl:c"]);
         let seqs: Vec<u32> = m.declarations.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, [0, 1, 2]);
+    }
+
+    /// Unread steps as `(reason, hidden callback targets)`.
+    fn unread_hidden(m: &MacroOre) -> Vec<(UnharvestedReason, Vec<String>)> {
+        m.steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Unread(u) => Some((
+                    u.reason,
+                    u.hidden
+                        .iter()
+                        .filter_map(|e| match &e.decl {
+                            Declaration::Callback(c) => Some(c.target.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pattern matching (`case ... in`) and a `begin`/`rescue`/`ensure` inside
+    /// a branch are read like any other branch: what they could register is
+    /// named, so the statement is not reported as hiding nothing.
+    #[test]
+    fn pattern_matching_and_rescue_branches_name_what_they_could_register() {
+        let src = "module M
+ def m
+  case mode
+  in :enabled
+   before_save :audit
+  in :guarded if ready?
+   before_save :guarded
+  else
+   before_save :fallback
+  end
+  if flag?
+   begin
+    before_save :tried
+   rescue StandardError
+    before_save :rescued
+   else
+    before_save :clean
+   ensure
+    before_save :ensured
+   end
+  end
+ end
+end
+";
+        assert_eq!(
+            unread_hidden(&macro_of_src(src, "m", None)[0]),
+            [
+                (
+                    UnharvestedReason::ControlFlow,
+                    vec!["audit".into(), "guarded".into(), "fallback".into()]
+                ),
+                (
+                    UnharvestedReason::ControlFlow,
+                    vec![
+                        "tried".into(),
+                        "rescued".into(),
+                        "clean".into(),
+                        "ensured".into()
+                    ]
+                ),
+            ]
+        );
+    }
+
+    /// The silence twin: an `in` branch that declares nothing still says so.
+    #[test]
+    fn a_pattern_match_without_a_declaration_hides_nothing() {
+        let src = "module M
+ def m
+  case mode
+  in :enabled
+   x = 1
+  end
+ end
+end
+";
+        assert_eq!(
+            unread_hidden(&macro_of_src(src, "m", None)[0]),
+            [(UnharvestedReason::ControlFlowWithoutDeclaration, vec![])]
+        );
     }
 }
