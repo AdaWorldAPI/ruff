@@ -2435,15 +2435,7 @@ fn macro_statement(
         // call, a bare `class_eval` or a bare `send` runs on whatever calls
         // the method, not on the class held in `param`, so it is not read.
         if let Some(eval_body) = crate::walk::hook_eval_body(param, stmt) {
-            include_time_into_src(
-                eval_body,
-                Some(src),
-                Some(param),
-                origin,
-                &mut events,
-                &mut unread,
-            );
-            return flush(out, events, unread);
+            return macro_class_body(eval_body, src, Some(param), origin, out);
         }
         let mut decls = Vec::new();
         crate::walk::walk_hook_statement(param, stmt, Some(src), &mut decls);
@@ -2474,8 +2466,7 @@ fn macro_statement(
                 && matches!(call.method_name.as_str(), "class_eval" | "class_exec")
             {
                 if let Some(body) = blk.body.as_deref() {
-                    include_time_into_src(body, Some(src), None, origin, &mut events, &mut unread);
-                    return flush(out, events, unread);
+                    return macro_class_body(body, src, None, origin, out);
                 }
             }
         }
@@ -2535,15 +2526,16 @@ fn delegate_step(stmt: &Node, at: u32, is_class: impl Fn(&Node) -> bool) -> Opti
     })
 }
 
-/// [`include_time_into`] with the source text, so a `**splat` keeps its exact
-/// spelling.
-fn include_time_into_src(
+/// A class body inside a macro (a `class_eval` block), read like an `included
+/// do` body with the source text, so a `**splat` keeps its exact spelling.
+/// Each statement is flushed before the next is read, so its declarations and
+/// what it left unread keep their place in [`MacroOre::steps`].
+fn macro_class_body(
     body: &Node,
-    src: Option<&str>,
+    src: &str,
     param: Option<&str>,
     origin: &DeclOrigin,
-    out: &mut Vec<RailsEvent>,
-    unharvested: &mut Vec<Unharvested>,
+    out: &mut MacroOre,
 ) {
     let stmts: Vec<&Node> = match body {
         Node::Begin(b) => b.statements.iter().collect(),
@@ -2551,9 +2543,12 @@ fn include_time_into_src(
     };
     for stmt in stmts {
         let mut decls = Vec::new();
-        crate::walk::walk_class_body(stmt, src, &mut decls);
-        record_unread(stmt, &decls, param, origin, unharvested);
-        push_decls(decls, anchor(stmt), origin, out);
+        crate::walk::walk_class_body(stmt, Some(src), &mut decls);
+        let mut unread = Vec::new();
+        record_unread(stmt, &decls, param, origin, &mut unread);
+        let mut events = Vec::new();
+        push_decls(decls, anchor(stmt), origin, &mut events);
+        flush(out, events, unread);
     }
 }
 
@@ -4230,5 +4225,80 @@ end
         assert!(itself.steps.iter().any(|s| matches!(s,
             MacroStep::Unread(u) if u.reason == UnharvestedReason::ControlFlow
                 && u.hidden.len() == 1)));
+    }
+
+    /// The steps of a macro as `decl:<target>` / `hides:<targets>` / `unread`.
+    fn step_labels(m: &MacroOre) -> Vec<String> {
+        let cb = |e: &RailsEvent| match &e.decl {
+            Declaration::Callback(c) => c.target.clone(),
+            _ => "?".to_string(),
+        };
+        m.steps
+            .iter()
+            .map(|s| match s {
+                MacroStep::Decl(i) => format!("decl:{}", cb(&m.declarations[*i as usize])),
+                MacroStep::Unread(u) if !u.hidden.is_empty() => format!(
+                    "hides:{}",
+                    u.hidden.iter().map(cb).collect::<Vec<_>>().join(",")
+                ),
+                MacroStep::Unread(_) => "unread".to_string(),
+                MacroStep::Delegate { .. } => "delegate".to_string(),
+            })
+            .collect()
+    }
+
+    /// A `class_eval` body that mixes declarations with unread statements keeps
+    /// them in source order, on its own class and on a class handed in.
+    #[test]
+    fn a_class_eval_body_keeps_unread_statements_in_source_order() {
+        let own = "module M
+ def m
+  class_eval do
+   before_save :a
+   before_save :b if flag?
+   before_save :c
+  end
+ end
+end
+";
+        assert_eq!(
+            step_labels(&macro_of_src(own, "m", None)[0]),
+            ["decl:a", "hides:b", "decl:c"]
+        );
+        let given = "module M
+ def self.m(k)
+  k.class_eval do
+   before_save :a
+   x = compute
+   before_save :b if flag?
+   before_save :c
+  end
+ end
+end
+";
+        assert_eq!(
+            step_labels(&macro_of_src(given, "m", Some(0))[0]),
+            ["decl:a", "unread", "hides:b", "decl:c"]
+        );
+    }
+
+    /// The silence twin: a body of declarations only keeps their order and
+    /// lists nothing unread.
+    #[test]
+    fn a_class_eval_body_of_declarations_keeps_their_order() {
+        let src = "module M
+ def m
+  class_eval do
+   before_save :a
+   before_save :b
+   before_save :c
+  end
+ end
+end
+";
+        let m = &macro_of_src(src, "m", None)[0];
+        assert_eq!(step_labels(m), ["decl:a", "decl:b", "decl:c"]);
+        let seqs: Vec<u32> = m.declarations.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [0, 1, 2]);
     }
 }
