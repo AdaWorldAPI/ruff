@@ -1614,6 +1614,7 @@ fn included_hook_arm(
                     param: Some(param),
                     bare: Bare::OnOtherReceiver,
                     src: None,
+                    wrap: None,
                 },
                 origin,
             ));
@@ -1639,6 +1640,7 @@ fn include_time_into(
         param,
         bare: Bare::OnClass,
         src: None,
+        wrap: None,
     };
     for stmt in stmts {
         let mut decls = Vec::new();
@@ -1754,6 +1756,10 @@ struct Scan<'a> {
     param: Option<&'a str>,
     bare: Bare,
     src: Option<&'a str>,
+    /// The options of the `with_options` blocks around the statement being
+    /// read, `None` outside any. Bare class-level declarations take them
+    /// exactly as the class walk gives them to a direct child of the block.
+    wrap: Option<&'a crate::walk::WrapperOptions>,
 }
 
 fn unharvested_in(stmt: &Node, scan: Scan<'_>, origin: &DeclOrigin) -> Unharvested {
@@ -1903,6 +1909,17 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
     let mut found = Vec::new();
     if scan.bare == Bare::OnClass {
         read_class_statement(leaf, scan.src, &mut found);
+        // Under a `with_options` wrapper the class walk would have merged the
+        // wrapper's options into this statement, so merge them here too.
+        if let Some(wrap) = scan.wrap {
+            found = match leaf {
+                Node::Send(_) => wrap.statement(leaf, scan.src),
+                _ => {
+                    wrap.apply(&mut found);
+                    found
+                }
+            };
+        }
     }
     if let Some(p) = scan.param {
         crate::walk::walk_hook_statement(p, leaf, scan.src, &mut found);
@@ -1917,7 +1934,6 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
     // that is "not recognised", not a recognised non-registering declaration.
     let all_found_empty =
         registering.is_empty() && other.iter().all(|d| matches!(d, Declaration::DslCall(_)));
-    out.decls.extend(registering);
     let block = match leaf {
         Node::Block(b) => Some(b),
         _ => None,
@@ -1928,11 +1944,26 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
         matches!(&*b.call, Node::Send(s) if s.recv.is_none() && s.method_name == "with_options")
     });
     if with_options {
-        if let Some(body) = block.and_then(|b| b.body.as_deref()) {
-            read_with_options_body(body, scan, out);
+        // The wrapper's declarations come from reading its body in source
+        // order, not from `registering`.
+        if let Some(b) = block
+            && let Node::Send(call) = &*b.call
+            && let Some(body) = b.body.as_deref()
+        {
+            let outer = scan
+                .wrap
+                .cloned()
+                .unwrap_or_else(crate::walk::WrapperOptions::top);
+            let within = outer.within(call);
+            let inner = Scan {
+                wrap: Some(&within),
+                ..scan
+            };
+            collect_registering(body, inner, out);
         }
         return;
     }
+    out.decls.extend(registering);
     let mut unread = |reason| out.unread.push(HiddenUnread { anchor: at, reason });
     if all_found_empty {
         unread(if block.is_some() {
@@ -1955,68 +1986,6 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
         // block is a DSL body that was not read.
         unread(HiddenUnreadReason::UnreadBlockBody);
     }
-}
-
-/// Reads a `with_options` body inside a skipped branch. The wrapper's direct
-/// children, nested `with_options` included, came back from the class walk with
-/// the inherited options merged in. Control flow anywhere in the body is not
-/// part of that walk, so what its branches could register is taken from the
-/// recursive read; a leaf's declarations are not, or they would be listed
-/// twice. A nested `with_options` is read the same way.
-fn read_with_options_body(body: &Node, scan: Scan<'_>, out: &mut Branches) {
-    let statements: Vec<&Node> = match body {
-        Node::Begin(b) => b.statements.iter().collect(),
-        Node::KwBegin(b) => b.statements.iter().collect(),
-        single => vec![single],
-    };
-    for st in statements {
-        if let Some(inner_body) = with_options_body(st) {
-            read_with_options_body(inner_body, scan, out);
-            continue;
-        }
-        let mut inner = Branches::default();
-        collect_registering(st, scan, &mut inner);
-        if is_branching(st) {
-            out.decls.extend(inner.decls);
-        }
-        out.unread.extend(inner.unread);
-    }
-}
-
-/// The body of a bare `with_options ... do ... end` block.
-fn with_options_body(node: &Node) -> Option<&Node> {
-    let Node::Block(b) = node else { return None };
-    match &*b.call {
-        Node::Send(s) if s.recv.is_none() && s.method_name == "with_options" => b.body.as_deref(),
-        _ => None,
-    }
-}
-
-/// Whether `collect_registering` walks into `node`'s branches rather than
-/// reading it as a leaf statement.
-fn is_branching(node: &Node) -> bool {
-    matches!(
-        node,
-        Node::If(_)
-            | Node::IfMod(_)
-            | Node::IfTernary(_)
-            | Node::Case(_)
-            | Node::When(_)
-            | Node::CaseMatch(_)
-            | Node::InPattern(_)
-            | Node::Rescue(_)
-            | Node::RescueBody(_)
-            | Node::Ensure(_)
-            | Node::While(_)
-            | Node::WhilePost(_)
-            | Node::Until(_)
-            | Node::UntilPost(_)
-            | Node::For(_)
-            | Node::And(_)
-            | Node::Or(_)
-            | Node::Begin(_)
-            | Node::KwBegin(_)
-    )
 }
 
 /// The body of `class_eval do ... end` / `self.class_eval do ... end` (also
@@ -2889,6 +2858,7 @@ fn macro_statement(
                 param: None,
                 bare: Bare::OnOtherReceiver,
                 src: Some(src),
+                wrap: None,
             };
             flush(out, Vec::new(), vec![unharvested_in(stmt, scan, origin)]);
         }
@@ -2917,6 +2887,7 @@ fn macro_statement(
                 param: Some(param),
                 bare: Bare::OnOtherReceiver,
                 src: Some(src),
+                wrap: None,
             };
             flush(out, Vec::new(), vec![unharvested_in(stmt, scan, origin)]);
         }
@@ -2997,6 +2968,7 @@ fn macro_class_statement(
         param,
         bare: Bare::OnClass,
         src: Some(src),
+        wrap: None,
     };
     let mut pieces = Vec::new();
     if crate::walk::walk_with_options_grouped(stmt, Some(src), &mut |g| pieces.push(g)) {
@@ -4310,6 +4282,103 @@ end");
             1,
             "{names:?}"
         );
+    }
+
+    /// The declarations a skipped `if a` branch of `included do` could
+    /// register, in the order `hidden` lists them.
+    fn hidden_decls(branch_body: &str) -> Vec<Declaration> {
+        let src = format!(
+            "module H\n  extend ActiveSupport::Concern\n  included do\n    if a\n{branch_body}\n    end\n  end\nend\n"
+        );
+        let (cs, _) = ore(&src);
+        let u = &by_name(&cs, "H").unharvested;
+        assert_eq!(u.len(), 1);
+        assert!(u[0].hidden_complete());
+        u[0].hidden.iter().map(|e| e.decl.clone()).collect()
+    }
+
+    /// `(target, options)` of every callback in `decls`.
+    fn callbacks(decls: &[Declaration]) -> Vec<(String, Vec<(String, String)>)> {
+        decls
+            .iter()
+            .filter_map(|d| match d {
+                Declaration::Callback(c) => Some((c.target.clone(), c.options.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn options_of(cbs: &[(String, Vec<(String, String)>)], target: &str) -> Vec<(String, String)> {
+        let mut o = cbs
+            .iter()
+            .find(|(t, _)| t == target)
+            .unwrap_or_else(|| panic!("no callback {target}: {cbs:?}"))
+            .1
+            .clone();
+        o.sort();
+        o
+    }
+
+    #[test]
+    fn with_options_hidden_declarations_keep_source_order() {
+        let cbs = callbacks(&hidden_decls(
+            "      with_options({}) do\n        if inner\n          before_save :first\n        end\n        before_save :second\n      end",
+        ));
+        let targets: Vec<&str> = cbs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(targets, ["first", "second"]);
+    }
+
+    #[test]
+    fn a_conditional_in_with_options_inherits_the_wrapper_options() {
+        let cbs = callbacks(&hidden_decls(
+            "      with_options on: :create do\n        before_save :audit if inner\n        before_save :direct\n      end",
+        ));
+        let direct = options_of(&cbs, "direct");
+        assert!(direct.iter().any(|(k, v)| k == "on" && v == ":create"));
+        assert_eq!(options_of(&cbs, "audit"), direct);
+        assert_eq!(cbs.len(), 2, "{cbs:?}");
+    }
+
+    #[test]
+    fn a_conditional_in_with_options_of_unknown_options_is_conditional_too() {
+        let cbs = callbacks(&hidden_decls(
+            "      with_options opts do\n        before_save :audit if inner\n        before_save :direct\n      end",
+        ));
+        let direct = options_of(&cbs, "direct");
+        assert!(direct.iter().any(|(k, _)| k == "if"), "{direct:?}");
+        assert_eq!(options_of(&cbs, "audit"), direct);
+    }
+
+    #[test]
+    fn a_conditional_in_nested_with_options_composes_both_wrappers() {
+        let cbs = callbacks(&hidden_decls(
+            "      with_options on: :create do\n        with_options if: :ready? do\n          before_save :b if inner\n          before_save :c\n        end\n      end",
+        ));
+        let direct = options_of(&cbs, "c");
+        assert!(direct.iter().any(|(k, _)| k == "on"), "{direct:?}");
+        assert!(direct.iter().any(|(k, _)| k == "if"), "{direct:?}");
+        assert_eq!(options_of(&cbs, "b"), direct);
+    }
+
+    #[test]
+    fn a_conditional_validates_helper_in_with_options_is_split_like_a_direct_one() {
+        let decls = hidden_decls(
+            "      with_options maximum: 80 do\n        validates_length_of :name if inner\n        validates_length_of :title\n      end",
+        );
+        let opts = |target: &str| {
+            decls.iter().find_map(|d| match d {
+                Declaration::Validation(v) if v.target == target => Some(v.options.clone()),
+                _ => None,
+            })
+        };
+        let direct = opts("title").expect("direct validation");
+        assert!(
+            direct
+                .iter()
+                .any(|(k, v)| k == "length" && v.contains("maximum")),
+            "{direct:?}"
+        );
+        assert_eq!(opts("name"), Some(direct));
     }
 
     #[test]
