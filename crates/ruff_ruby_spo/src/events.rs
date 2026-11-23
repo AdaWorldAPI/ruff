@@ -4225,6 +4225,89 @@ end");
         assert!(v[4].1);
     }
 
+    fn rb_files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                rb_files_under(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rb") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// How many `ControlFlow` entries are read in full, over a real checkout.
+    /// Run with `OPENPROJECT_PATH=/path/to/openproject cargo test -p
+    /// ruff_ruby_spo events::tests::control_flow_completeness_measurement --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs OPENPROJECT_PATH"]
+    #[expect(
+        clippy::print_stdout,
+        reason = "measurement output is the purpose of this test"
+    )]
+    fn control_flow_completeness_measurement() {
+        let Ok(root) = std::env::var("OPENPROJECT_PATH") else {
+            return;
+        };
+        let root = std::path::Path::new(&root);
+        for scope in ["app", "modules", "vendor/bundle"] {
+            let mut files = Vec::new();
+            rb_files_under(&root.join(scope), &mut files);
+            let (mut modules, mut with_cf, mut with_incomplete) = (0usize, 0usize, 0usize);
+            let (mut entries, mut complete, mut with_hidden_decls) = (0usize, 0usize, 0usize);
+            let mut unread: BTreeMap<&'static str, usize> = BTreeMap::new();
+            let mut reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+            for f in &files {
+                let Ok(src) = std::fs::read_to_string(f) else {
+                    continue;
+                };
+                let mut syms = Symbols::default();
+                for c in source_ore_from(&f.to_string_lossy(), &src, "op", &mut syms) {
+                    if c.kind != OreKind::Module {
+                        continue;
+                    }
+                    modules += 1;
+                    let cf: Vec<&Unharvested> = c
+                        .unharvested
+                        .iter()
+                        .filter(|u| u.reason == UnharvestedReason::ControlFlow)
+                        .collect();
+                    with_cf += usize::from(!cf.is_empty());
+                    with_incomplete += usize::from(cf.iter().any(|u| !u.hidden_complete()));
+                    for u in &c.unharvested {
+                        *reasons.entry(u.reason.as_str()).or_default() += 1;
+                    }
+                    for u in cf {
+                        entries += 1;
+                        complete += usize::from(u.hidden_complete());
+                        with_hidden_decls += usize::from(!u.hidden.is_empty());
+                        for h in &u.hidden_unread {
+                            *unread.entry(h.reason.as_str()).or_default() += 1;
+                        }
+                    }
+                }
+            }
+            println!(
+                "{scope}: {} files, {modules} modules, {with_cf} with a ControlFlow entry \
+                 ({with_incomplete} with at least one incomplete)",
+                files.len()
+            );
+            println!(
+                "{scope}: ControlFlow entries {entries}: complete {complete}, incomplete {} \
+                 ({with_hidden_decls} name hidden declarations)",
+                entries - complete
+            );
+            println!("{scope}: unread statements by reason {unread:?}");
+            println!("{scope}: every unharvested entry by reason {reasons:?}");
+        }
+    }
+
     // ── macro bodies ────────────────────────────────────────────────────
 
     fn macro_of_src(src: &str, name: &str, class_arg: Option<usize>) -> Vec<MacroOre> {
