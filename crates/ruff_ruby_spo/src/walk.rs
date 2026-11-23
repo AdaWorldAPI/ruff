@@ -68,21 +68,17 @@ pub(crate) fn walk_hook_statement(
             let (name, args): (String, &[Node]) =
                 match (s.method_name.as_str(), s.args.split_first()) {
                     ("send" | "public_send" | "__send__", Some((first, rest))) => {
-                        match sym_string(first) {
+                        match literal_method_name(first) {
                             Some(inner) => (inner, rest),
                             None => return,
                         }
                     }
                     (name, _) => (name.to_string(), &s.args),
                 };
-            let mut found = Vec::new();
-            route_send(&name, args, src, &mut found);
-            // Only the unknown-name fallback is dropped; an OpenProject
-            // registration that `route_send` promotes by name is kept.
-            out.extend(found.into_iter().filter(|d| match d {
-                Declaration::DslCall(c) => is_promoted_op_registration(&c.name),
-                _ => true,
-            }));
+            // Only the unknown-name fallback is dropped. A recognised name
+            // keeps what it emits, including a promoted OpenProject
+            // registration and a helper's deliberate `DslCall` residual.
+            route_known(&name, args, src, out);
         }
         _ => {}
     }
@@ -129,20 +125,27 @@ pub(crate) fn is_promoted_op_registration(name: &str) -> bool {
 }
 
 /// [`route_send`] for a call another module made on a macro's behalf
-/// (`send :include, M`): the recognised declarations only. The unknown-name
-/// fallback is dropped, as for a call on a hook parameter.
+/// (`send :include, M`): what a recognised name emits, including a helper's
+/// deliberate `DslCall` residual. The unknown-name fallback is dropped, as
+/// for a call on a hook parameter; `false` when the name is not recognised.
 pub(crate) fn route_send_public(
     name: &str,
     args: &[Node],
     src: Option<&str>,
     out: &mut Vec<Declaration>,
-) {
-    let mut found = Vec::new();
-    route_send(name, args, src, &mut found);
-    out.extend(found.into_iter().filter(|d| match d {
-        Declaration::DslCall(c) => is_promoted_op_registration(&c.name),
-        _ => true,
-    }));
+) -> bool {
+    route_known(name, args, src, out)
+}
+
+/// The method name of a reflective call (`send :include, M`,
+/// `send("include", M)`) when it is a literal symbol or a plain string.
+/// An interpolated or computed name is `None`.
+pub(crate) fn literal_method_name(node: &Node) -> Option<String> {
+    match node {
+        Node::Sym(s) => Some(s.name.to_string_lossy()),
+        Node::Str(s) => Some(s.value.to_string_lossy()),
+        _ => None,
+    }
 }
 
 /// Process one class-body statement.
@@ -228,7 +231,9 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut 
         // known grouping idioms to avoid double-counting from arbitrary
         // blocks (e.g. `5.times do; validates :foo; end` would NOT count
         // because that's runtime-only).
-        "with_options" => walk_with_options(blk, s, src, out, Some(&[])),
+        "with_options" => walk_with_options(blk, s, src, Some(&[]), &mut |g| match g {
+            Grouped::Stmt(_, d) | Grouped::Wrapper(d) => out.extend(d),
+        }),
         other => {
             // Generic block: route the call as if it were a bare Send,
             // then drop the body. Conservative — keeps the call counted
@@ -295,12 +300,16 @@ fn merge_opts(own: &[Opt], inherited: &[Opt]) -> Vec<Opt> {
 /// in the body may look unconditional: a validation becomes a `DslCall`, an
 /// association records an [`OptionSplat`], and a callback is marked
 /// conditional with `if: <expr>`.
-fn walk_with_options(
-    blk: &lib_ruby_parser::nodes::Block,
+///
+/// `sink` receives the declarations one body statement at a time, in source
+/// order, each with the statement it came from (a nested `with_options`
+/// block reports its own statements), and the wrapper call last.
+fn walk_with_options<'n>(
+    blk: &'n lib_ruby_parser::nodes::Block,
     call: &lib_ruby_parser::nodes::Send,
     src: Option<&str>,
-    out: &mut Vec<Declaration>,
     outer: Option<&[Opt]>,
+    sink: &mut dyn FnMut(Grouped<'n>),
 ) {
     let wrapper: Option<Vec<Opt>> = match (outer, literal_options(&call.args)) {
         (Some(o), Some(w)) => Some(merge_opts(&w, o)),
@@ -320,31 +329,63 @@ fn walk_with_options(
                     let Node::Send(inner_call) = &*inner_blk.call else {
                         continue;
                     };
-                    walk_with_options(inner_blk, inner_call, src, out, wrapper.as_deref());
+                    walk_with_options(inner_blk, inner_call, src, wrapper.as_deref(), sink);
                 }
                 Node::Send(s)
                     if s.recv.is_none()
                         && validates_helper_kind(&s.method_name).is_some()
                         && wrapper.is_some() =>
                 {
+                    let mut inner = Vec::new();
                     emit_validates_helper(
                         &s.method_name,
                         &s.args,
                         wrapper.as_deref().unwrap_or(&[]),
-                        out,
+                        &mut inner,
                     );
+                    sink(Grouped::Stmt(stmt, inner));
                 }
                 _ => {
                     let mut inner = Vec::new();
                     walk_statement(stmt, src, &mut inner);
                     apply_grouping_options(&mut inner, wrapper.as_deref());
-                    out.extend(inner);
+                    sink(Grouped::Stmt(stmt, inner));
                 }
             }
         }
     }
     // The wrapper call itself, so coverage still sees `with_options`.
-    route_send(call.method_name.as_str(), &call.args, src, out);
+    let mut own = Vec::new();
+    route_send(call.method_name.as_str(), &call.args, src, &mut own);
+    sink(Grouped::Wrapper(own));
+}
+
+/// One piece of a `with_options` block, as [`walk_with_options`] reads it.
+pub(crate) enum Grouped<'n> {
+    /// A body statement and the declarations it yielded (none when it was
+    /// not read).
+    Stmt(&'n Node, Vec<Declaration>),
+    /// The `with_options` call itself.
+    Wrapper(Vec<Declaration>),
+}
+
+/// When `stmt` is a bare `with_options ... do ... end` block, walk it as a
+/// class body does, handing `sink` each body statement's declarations in
+/// source order (see [`walk_with_options`]), and return `true`.
+pub(crate) fn walk_with_options_grouped<'n>(
+    stmt: &'n Node,
+    src: Option<&str>,
+    sink: &mut dyn FnMut(Grouped<'n>),
+) -> bool {
+    let Node::Block(blk) = stmt else { return false };
+    let Node::Send(call) = &*blk.call else {
+        return false;
+    };
+    if call.recv.is_some() || call.method_name != "with_options" {
+        return false;
+    }
+    walk_with_options(blk, call, src, Some(&[]), sink);
+    true
 }
 
 /// Apply combined `with_options` options to declarations other than
@@ -434,8 +475,29 @@ fn lambda_loc(node: &Node) -> Option<String> {
 /// observed on the `OpenProject` corpus MUST appear in either an
 /// explicit arm or the `has_dsl_call` catch-all. The D-AR-4 coverage
 /// test fails loudly if a real corpus call slips through unmatched.
-#[allow(clippy::too_many_lines)] // exhaustive 78-name routing — splitting hurts readability
 fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) {
+    if !route_known(name, args, src, out) {
+        // ───── Unknown DSL — catch-all so D-AR-4 coverage stays 100 % ─────
+        // The OpenProject §2 closed-vocab table lists every name observed
+        // on the corpus; this is the safety net for any name not yet
+        // promoted to a discriminated predicate (and for new OP DSL calls
+        // that arrive after the §2 census).
+        out.push(Declaration::DslCall(DslCall {
+            name: name.to_string(),
+            args: format_args(args),
+        }));
+    }
+}
+
+/// [`route_send`] without its unknown-name fallback: `false` when `name` is
+/// not a call the walker recognises, and nothing is emitted for it.
+///
+/// What a recognised name emits is kept as it is, including a deliberate
+/// `DslCall` residual (`validates_presence_of :a, **opts`, whose options are
+/// not statically known), so a caller that must drop only the fallback can
+/// tell the two apart.
+#[allow(clippy::too_many_lines)] // exhaustive 78-name routing — splitting hurts readability
+fn route_known(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declaration>) -> bool {
     match name {
         // ───── Associations (5) ─────
         "belongs_to" => emit_assoc(AssocKind::BelongsTo, args, src, out),
@@ -578,16 +640,9 @@ fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declar
         | "class_attribute"
         | "module_function" => {}
 
-        // ───── Unknown DSL — catch-all so D-AR-4 coverage stays 100 % ─────
-        // The OpenProject §2 closed-vocab table lists every name observed
-        // on the corpus; this arm is the safety net for any name not yet
-        // promoted to a discriminated predicate (and for new OP DSL
-        // calls that arrive after the §2 census).
-        _ => out.push(Declaration::DslCall(DslCall {
-            name: name.to_string(),
-            args: format_args(args),
-        })),
+        _ => return false,
     }
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────

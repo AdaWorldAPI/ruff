@@ -498,7 +498,8 @@ pub struct Unharvested {
 /// Why an include-time statement produced no declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnharvestedReason {
-    /// `if` / `unless` / `case` / a loop, or a modifier form, with a branch
+    /// `if` / `unless` / `case` / a loop, or a modifier form, or a body that
+    /// is a `rescue` / `ensure` / explicit `begin ... end`, with a branch
     /// that holds a statement ruff recognises as a declaration that can
     /// register a callback (an association, a validation, a callback, an
     /// `include`, an `acts_as_*` or gem macro). That declaration may or may not
@@ -517,7 +518,8 @@ pub enum UnharvestedReason {
     /// A call whose name the walker does not recognise as a declaration
     /// (`base.some_helper`, a bare `private`).
     UnrecognizedCall,
-    /// `base.send(expr, ...)` whose method name is not a literal symbol.
+    /// `send(expr, ...)` on the hook parameter, on `self` or with no receiver,
+    /// whose method name is not a literal symbol or plain string.
     DynamicSend,
     /// A block whose call was kept only as an unrecognised `DslCall`; its
     /// body was not read (`foo do; has_many :x; end`).
@@ -1537,7 +1539,17 @@ fn included_hook_arm(
         let mut decls = Vec::new();
         crate::walk::walk_hook_statement(param, stmt, None, &mut decls);
         if decls.is_empty() {
-            unharvested.push(unharvested_at(stmt, Some(param), origin));
+            // The hook body runs on the module that defines it: a bare call
+            // there is the module's, not the including class's.
+            unharvested.push(unharvested_in(
+                stmt,
+                Scan {
+                    param: Some(param),
+                    bare: Bare::OnOtherReceiver,
+                    src: None,
+                },
+                origin,
+            ));
         }
         push_decls(decls, anchor(stmt), origin, out);
     }
@@ -1556,12 +1568,47 @@ fn include_time_into(
         Node::Begin(b) => b.statements.iter().collect(),
         single => vec![single],
     };
+    let scan = Scan {
+        param,
+        bare: Bare::OnClass,
+        src: None,
+    };
     for stmt in stmts {
         let mut decls = Vec::new();
-        crate::walk::walk_class_body(stmt, None, &mut decls);
-        record_unread(stmt, &decls, param, origin, unharvested);
+        read_class_statement(stmt, None, &mut decls);
+        record_unread(stmt, &decls, scan, origin, unharvested);
         push_decls(decls, anchor(stmt), origin, out);
     }
+}
+
+/// `send(<name>, ...)` (also `public_send` / `__send__`) with no receiver or
+/// on `self`: a call whose method is chosen by its first argument.
+fn reflective_send(stmt: &Node) -> Option<&lib_ruby_parser::nodes::Send> {
+    let Node::Send(s) = stmt else { return None };
+    (matches!(s.recv.as_deref(), None | Some(Node::Self_(_))) && is_send_family(&s.method_name))
+        .then_some(s)
+}
+
+fn is_send_family(name: &str) -> bool {
+    matches!(name, "send" | "public_send" | "__send__")
+}
+
+/// One statement of a class body, as an include-time body or a macro reads
+/// it. A reflective `send` with a literal name (`send :include, M`,
+/// `send("include", M)`) is routed as the call it names, keeping only what a
+/// recognised name emits; one whose name is unknown or computed yields
+/// nothing, so it is listed as unread rather than kept as a `send` call.
+/// Anything else is walked as a class body.
+fn read_class_statement(stmt: &Node, src: Option<&str>, out: &mut Vec<Declaration>) {
+    if let Some(s) = reflective_send(stmt) {
+        if let Some((first, rest)) = s.args.split_first() {
+            if let Some(name) = crate::walk::literal_method_name(first) {
+                crate::walk::route_send_public(&name, rest, src, out);
+            }
+        }
+        return;
+    }
+    crate::walk::walk_class_body(stmt, src, out);
 }
 
 /// Record what `stmt` left unread, given the declarations it yielded.
@@ -1573,12 +1620,12 @@ fn include_time_into(
 fn record_unread(
     stmt: &Node,
     decls: &[Declaration],
-    param: Option<&str>,
+    scan: Scan<'_>,
     origin: &DeclOrigin,
     unharvested: &mut Vec<Unharvested>,
 ) {
     if decls.is_empty() {
-        unharvested.push(unharvested_at(stmt, param, origin));
+        unharvested.push(unharvested_in(stmt, scan, origin));
         return;
     }
     let Node::Block(blk) = stmt else { return };
@@ -1596,8 +1643,8 @@ fn record_unread(
         };
         for s in inner {
             let mut d = Vec::new();
-            crate::walk::walk_class_body(s, None, &mut d);
-            record_unread(s, &d, param, origin, unharvested);
+            crate::walk::walk_class_body(s, scan.src, &mut d);
+            record_unread(s, &d, scan, origin, unharvested);
         }
         return;
     }
@@ -1614,35 +1661,40 @@ fn record_unread(
     }
 }
 
-fn unharvested_at(stmt: &Node, param: Option<&str>, origin: &DeclOrigin) -> Unharvested {
-    unharvested_in(stmt, param, Bare::OnClass, origin)
-}
-
 /// Whether a bare call (no receiver, or `self.`) runs on the class being
 /// read.
 ///
 /// In a class body, an `included do` body or a `class_eval` block it does. In
-/// a method handed the class as a parameter, or one that registers on a class
-/// held in a local, it runs on whatever calls the method, so only calls on
-/// that parameter or local register on the class.
+/// a method handed the class as a parameter, one that registers on a class
+/// held in a local, or the body of `def self.included(base)`, it runs on
+/// whatever calls the method, so only calls on that parameter or local
+/// register on the class.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Bare {
     OnClass,
     OnOtherReceiver,
 }
 
-fn unharvested_in(
-    stmt: &Node,
-    param: Option<&str>,
+/// How an unread statement is read for what it could register.
+///
+/// `param` is the name that carries the class (`base`, a macro's class
+/// parameter, a local), `None` where macros are bare calls. `src` is the file
+/// the statement was parsed from, when the caller has it, so an option splat
+/// keeps its spelling; without it the walker's fallback rendering is used.
+#[derive(Clone, Copy)]
+struct Scan<'a> {
+    param: Option<&'a str>,
     bare: Bare,
-    origin: &DeclOrigin,
-) -> Unharvested {
+    src: Option<&'a str>,
+}
+
+fn unharvested_in(stmt: &Node, scan: Scan<'_>, origin: &DeclOrigin) -> Unharvested {
     let anchor = u32::try_from(stmt.expression().begin).unwrap_or(0);
-    let reason = unharvested_reason(stmt, param, bare);
+    let reason = unharvested_reason(stmt, scan);
     let mut hidden = Vec::new();
     if reason == UnharvestedReason::ControlFlow {
         push_decls(
-            registering_declarations(stmt, param, bare),
+            registering_declarations(stmt, scan),
             anchor,
             origin,
             &mut hidden,
@@ -1656,10 +1708,10 @@ fn unharvested_in(
     }
 }
 
-/// Classify a statement that produced no declaration. `param` is the hook
-/// parameter (`base`), or `None` inside `included do`, where macros are
+/// Classify a statement that produced no declaration. `scan.param` is the
+/// hook parameter (`base`), or `None` inside `included do`, where macros are
 /// bare calls. With [`Bare::OnOtherReceiver`] a bare call is not the class's.
-fn unharvested_reason(stmt: &Node, param: Option<&str>, bare: Bare) -> UnharvestedReason {
+fn unharvested_reason(stmt: &Node, scan: Scan<'_>) -> UnharvestedReason {
     let call = match stmt {
         Node::If(_)
         | Node::IfMod(_)
@@ -1672,8 +1724,15 @@ fn unharvested_reason(stmt: &Node, param: Option<&str>, bare: Bare) -> Unharvest
         | Node::UntilPost(_)
         | Node::For(_)
         | Node::And(_)
-        | Node::Or(_) => {
-            return if registering_declarations(stmt, param, bare).is_empty() {
+        | Node::Or(_)
+        // A body that is a `rescue` / `ensure` (`def m; x; rescue; y; end`),
+        // or an explicit `begin ... end`: a registration in it may run only
+        // when an exception is raised, or after one, so it is read like a
+        // branch, never as unconditional.
+        | Node::Rescue(_)
+        | Node::Ensure(_)
+        | Node::KwBegin(_) => {
+            return if registering_declarations(stmt, scan).is_empty() {
                 UnharvestedReason::ControlFlowWithoutDeclaration
             } else {
                 UnharvestedReason::ControlFlow
@@ -1687,22 +1746,25 @@ fn unharvested_reason(stmt: &Node, param: Option<&str>, bare: Bare) -> Unharvest
         },
         _ => return UnharvestedReason::Other,
     };
+    let reflective = is_send_family(&call.method_name);
+    let dynamic = reflective
+        && call
+            .args
+            .first()
+            .is_none_or(|a| crate::walk::literal_method_name(a).is_none());
+    let unrecognized = if dynamic {
+        UnharvestedReason::DynamicSend
+    } else {
+        UnharvestedReason::UnrecognizedCall
+    };
     match call.recv.as_deref() {
-        None | Some(Node::Self_(_)) if bare == Bare::OnOtherReceiver => {
+        None | Some(Node::Self_(_)) if scan.bare == Bare::OnOtherReceiver => {
             UnharvestedReason::CallOnOtherReceiver
         }
-        None => UnharvestedReason::UnrecognizedCall,
-        Some(Node::Lvar(v)) if Some(v.name.as_str()) == param => {
-            let dynamic = matches!(
-                call.method_name.as_str(),
-                "send" | "public_send" | "__send__"
-            ) && !matches!(call.args.first(), Some(Node::Sym(_)));
-            if dynamic {
-                UnharvestedReason::DynamicSend
-            } else {
-                UnharvestedReason::UnrecognizedCall
-            }
-        }
+        None => unrecognized,
+        // `self.send(...)` dispatches on the class, like a bare `send`.
+        Some(Node::Self_(_)) if reflective => unrecognized,
+        Some(Node::Lvar(v)) if Some(v.name.as_str()) == scan.param => unrecognized,
         Some(_) => UnharvestedReason::CallOnOtherReceiver,
     }
 }
@@ -1713,19 +1775,37 @@ fn unharvested_reason(stmt: &Node, param: Option<&str>, bare: Bare) -> Unharvest
 /// or `prepend` (the module's `included` block), an `acts_as_*` / gem macro, or
 /// a promoted registration. An unrecognised call, an attribute, a scope or an
 /// `extend` is not one: the same leniency an unrecognised statement gets.
-/// `param` is the hook parameter (`base`), `None` in a class or `included do`
-/// body. Every branch is read; none is evaluated. With
-/// [`Bare::OnOtherReceiver`] only calls on `param` count.
-fn registering_declarations(node: &Node, param: Option<&str>, bare: Bare) -> Vec<Declaration> {
+/// `scan.param` is the hook parameter (`base`), `None` in a class or
+/// `included do` body. Every branch is read; none is evaluated. With
+/// [`Bare::OnOtherReceiver`] only calls on `param` count. A `class_eval`
+/// block on the class (on `param`, or bare when bare calls are the class's)
+/// is a class body, read with its own conditions descended into.
+fn registering_declarations(node: &Node, scan: Scan<'_>) -> Vec<Declaration> {
     let mut out = Vec::new();
-    collect_registering(node, param, bare, &mut out);
+    collect_registering(node, scan, &mut out);
     out
 }
 
-fn collect_registering(node: &Node, param: Option<&str>, bare: Bare, out: &mut Vec<Declaration>) {
+/// The body of `class_eval do ... end` / `self.class_eval do ... end` (also
+/// `class_exec`), a block on the class being read when bare calls are its.
+fn own_class_eval_body(node: &Node) -> Option<&Node> {
+    let Node::Block(blk) = node else { return None };
+    let Node::Send(call) = &*blk.call else {
+        return None;
+    };
+    if matches!(call.recv.as_deref(), None | Some(Node::Self_(_)))
+        && matches!(call.method_name.as_str(), "class_eval" | "class_exec")
+    {
+        blk.body.as_deref()
+    } else {
+        None
+    }
+}
+
+fn collect_registering(node: &Node, scan: Scan<'_>, out: &mut Vec<Declaration>) {
     let opt = |n: Option<&Node>, out: &mut Vec<Declaration>| {
         if let Some(n) = n {
-            collect_registering(n, param, bare, out);
+            collect_registering(n, scan, out);
         }
     };
     match node {
@@ -1738,12 +1818,12 @@ fn collect_registering(node: &Node, param: Option<&str>, bare: Bare, out: &mut V
             opt(n.if_false.as_deref(), out);
         }
         Node::IfTernary(n) => {
-            collect_registering(&n.if_true, param, bare, out);
-            collect_registering(&n.if_false, param, bare, out);
+            collect_registering(&n.if_true, scan, out);
+            collect_registering(&n.if_false, scan, out);
         }
         Node::Case(n) => {
             for w in &n.when_bodies {
-                collect_registering(w, param, bare, out);
+                collect_registering(w, scan, out);
             }
             opt(n.else_body.as_deref(), out);
         }
@@ -1752,7 +1832,7 @@ fn collect_registering(node: &Node, param: Option<&str>, bare: Bare, out: &mut V
         // (`in x if ready?`) is a condition, read no more than an `if`'s.
         Node::CaseMatch(n) => {
             for b in &n.in_bodies {
-                collect_registering(b, param, bare, out);
+                collect_registering(b, scan, out);
             }
             opt(n.else_body.as_deref(), out);
         }
@@ -1761,7 +1841,7 @@ fn collect_registering(node: &Node, param: Option<&str>, bare: Bare, out: &mut V
         Node::Rescue(n) => {
             opt(n.body.as_deref(), out);
             for b in &n.rescue_bodies {
-                collect_registering(b, param, bare, out);
+                collect_registering(b, scan, out);
             }
             opt(n.else_.as_deref(), out);
         }
@@ -1771,35 +1851,53 @@ fn collect_registering(node: &Node, param: Option<&str>, bare: Bare, out: &mut V
             opt(n.ensure.as_deref(), out);
         }
         Node::While(n) => opt(n.body.as_deref(), out),
-        Node::WhilePost(n) => collect_registering(&n.body, param, bare, out),
+        Node::WhilePost(n) => collect_registering(&n.body, scan, out),
         Node::Until(n) => opt(n.body.as_deref(), out),
-        Node::UntilPost(n) => collect_registering(&n.body, param, bare, out),
+        Node::UntilPost(n) => collect_registering(&n.body, scan, out),
         Node::For(n) => opt(n.body.as_deref(), out),
         Node::And(n) => {
-            collect_registering(&n.lhs, param, bare, out);
-            collect_registering(&n.rhs, param, bare, out);
+            collect_registering(&n.lhs, scan, out);
+            collect_registering(&n.rhs, scan, out);
         }
         Node::Or(n) => {
-            collect_registering(&n.lhs, param, bare, out);
-            collect_registering(&n.rhs, param, bare, out);
+            collect_registering(&n.lhs, scan, out);
+            collect_registering(&n.rhs, scan, out);
         }
         Node::Begin(n) => {
             for st in &n.statements {
-                collect_registering(st, param, bare, out);
+                collect_registering(st, scan, out);
             }
         }
         Node::KwBegin(n) => {
             for st in &n.statements {
-                collect_registering(st, param, bare, out);
+                collect_registering(st, scan, out);
             }
         }
         leaf => {
-            let mut found = Vec::new();
-            if bare == Bare::OnClass {
-                crate::walk::walk_class_body(leaf, None, &mut found);
+            // A `class_eval` block on the class: its body runs in the class,
+            // where a bare call is the class's.
+            let eval_body = scan
+                .param
+                .and_then(|p| crate::walk::hook_eval_body(p, leaf))
+                .or_else(|| {
+                    (scan.bare == Bare::OnClass)
+                        .then(|| own_class_eval_body(leaf))
+                        .flatten()
+                });
+            if let Some(body) = eval_body {
+                let inner = Scan {
+                    bare: Bare::OnClass,
+                    ..scan
+                };
+                collect_registering(body, inner, out);
+                return;
             }
-            if let Some(p) = param {
-                crate::walk::walk_hook_statement(p, leaf, None, &mut found);
+            let mut found = Vec::new();
+            if scan.bare == Bare::OnClass {
+                read_class_statement(leaf, scan.src, &mut found);
+            }
+            if let Some(p) = scan.param {
+                crate::walk::walk_hook_statement(p, leaf, scan.src, &mut found);
             }
             out.extend(found.into_iter().filter(can_register_a_callback));
         }
@@ -2279,7 +2377,8 @@ pub struct MacroOre {
 enum MacroClass<'a> {
     /// The class the macro is called on: bare calls run on it.
     Itself,
-    /// A method handed the class as its `k`-th parameter.
+    /// A method handed the class as its `k`-th positional argument. When that
+    /// slot is missing or not a single plain binding, nothing names the class.
     Arg(usize),
     /// A local variable of the body that holds a class the body creates
     /// (`hierarchy_class = Class.new(...)`).
@@ -2387,29 +2486,30 @@ fn macro_of(file: &str, src: &str, owner: &str, def: &Node, class: MacroClass<'_
         Node::Defs(d) => (d.name.clone(), true, d.args.as_deref(), d.body.as_deref()),
         _ => (String::new(), false, None, None),
     };
-    let params: Vec<String> = match args {
-        Some(Node::Args(a)) => a
-            .args
-            .iter()
-            .filter_map(|p| match p {
-                Node::Arg(x) => Some(x.name.clone()),
-                Node::Optarg(x) => Some(x.name.clone()),
-                Node::Kwarg(x) => Some(x.name.clone()),
-                Node::Kwoptarg(x) => Some(x.name.clone()),
-                Node::Restarg(x) => x.name.clone(),
-                Node::Kwrestarg(x) => x.name.clone(),
-                Node::Blockarg(x) => x.name.clone(),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
+    let slots: &[Node] = match args {
+        Some(Node::Args(a)) => &a.args,
+        _ => &[],
     };
-    let class_param: Option<&str> = match class {
-        MacroClass::Itself => None,
-        MacroClass::Arg(k) => params.get(k).map(String::as_str),
-        MacroClass::Local(name) => Some(name),
+    let params: Vec<String> = slots
+        .iter()
+        .filter_map(|p| match p {
+            Node::Arg(x) => Some(x.name.clone()),
+            Node::Optarg(x) => Some(x.name.clone()),
+            Node::Kwarg(x) => Some(x.name.clone()),
+            Node::Kwoptarg(x) => Some(x.name.clone()),
+            Node::Restarg(x) => x.name.clone(),
+            Node::Kwrestarg(x) => x.name.clone(),
+            Node::Blockarg(x) => x.name.clone(),
+            _ => None,
+        })
+        .collect();
+    let holder = match class {
+        MacroClass::Itself => Holder::Itself,
+        MacroClass::Arg(k) => positional_binding(slots, k).map_or(Holder::Unbound, Holder::Name),
+        MacroClass::Local(name) => Holder::Name(name),
     };
-    let line = line_at(src, anchor(def));
+    // `expression()` covers `def self.x` as well as `def x`.
+    let line = line_at(src, u32::try_from(def.expression().begin).unwrap_or(0));
     let origin = DeclOrigin::Included { line };
     let mut out = MacroOre {
         owner: owner.to_string(),
@@ -2417,7 +2517,7 @@ fn macro_of(file: &str, src: &str, owner: &str, def: &Node, class: MacroClass<'_
         singleton,
         file: file.to_string(),
         line,
-        params: params.clone(),
+        params,
         declarations: Vec::new(),
         steps: Vec::new(),
     };
@@ -2426,109 +2526,195 @@ fn macro_of(file: &str, src: &str, owner: &str, def: &Node, class: MacroClass<'_
         Node::Begin(b) => b.statements.iter().collect(),
         single => vec![single],
     };
-    // Locals assigned from `self` (`caller_class = self`) name the class too.
-    let mut aliases: Vec<String> = Vec::new();
+    let mut state = MacroState {
+        holder,
+        rebinds_param: matches!(class, MacroClass::Arg(_)),
+        aliases: Vec::new(),
+    };
     for stmt in stmts {
-        macro_statement(src, stmt, class_param, &mut aliases, &origin, &mut out);
+        macro_statement(src, stmt, &state, &origin, &mut out);
+        state.after(stmt);
     }
     out
+}
+
+/// The name of the parameter that receives positional argument `k` (0-based),
+/// when that slot is a single plain binding (`target`, `target = nil`) at a
+/// fixed position. A destructured slot (`(left, right)`), a splat, a keyword
+/// or block parameter, a slot after a splat, or a missing slot is `None`:
+/// nothing names the class.
+fn positional_binding(slots: &[Node], k: usize) -> Option<&str> {
+    if slots[..k.min(slots.len())]
+        .iter()
+        .any(|p| matches!(p, Node::Restarg(_)))
+    {
+        return None;
+    }
+    match slots.get(k)? {
+        Node::Arg(x) => Some(x.name.as_str()),
+        Node::Optarg(x) => Some(x.name.as_str()),
+        _ => None,
+    }
+}
+
+/// Which name carries the class at a given statement of a macro body.
+#[derive(Clone, Copy)]
+enum Holder<'a> {
+    /// The class the macro is called on: bare calls run on it.
+    Itself,
+    /// The parameter or local `name` holds the class; bare calls do not run on
+    /// it.
+    Name(&'a str),
+    /// Nothing holds it: the selected argument does not exist or is not a
+    /// plain binding, or the parameter was assigned. Nothing registers on the
+    /// class, and every statement is unread.
+    Unbound,
+}
+
+/// What a macro body has bound so far.
+struct MacroState<'a> {
+    holder: Holder<'a>,
+    /// Whether an assignment to the holder's name ends its binding (a class
+    /// parameter). A local's own assignment is what makes it the class.
+    rebinds_param: bool,
+    /// Locals that provably hold the macro's own class (`caller = self`).
+    aliases: Vec<String>,
+}
+
+impl MacroState<'_> {
+    /// Update the bindings after `stmt` has been read, so it still counts the
+    /// names as they were when it started.
+    fn after(&mut self, stmt: &Node) {
+        let mut found = LocalAssigns::default();
+        lib_ruby_parser::traverse::visitor::Visitor::visit(&mut found, stmt);
+        if let (Holder::Name(name), true) = (self.holder, self.rebinds_param) {
+            if found.0.iter().any(|(n, _)| n == name) {
+                self.holder = Holder::Unbound;
+            }
+        }
+        for (name, value) in &found.0 {
+            let same_class = match value {
+                Assigned::SelfRef => true,
+                Assigned::Lvar(v) => self.aliases.contains(v),
+                Assigned::Other => false,
+            };
+            if !same_class {
+                self.aliases.retain(|a| a != name);
+            }
+        }
+        // Only a statement that is the assignment itself makes a new alias;
+        // one inside a branch may not run.
+        if let Node::Lvasgn(a) = stmt {
+            let is_self = match a.value.as_deref() {
+                Some(Node::Self_(_)) => true,
+                Some(Node::Lvar(v)) => self.aliases.contains(&v.name),
+                _ => false,
+            };
+            if is_self && !self.aliases.contains(&a.name) {
+                self.aliases.push(a.name.clone());
+            }
+        }
+    }
+}
+
+/// The value a local is assigned.
+enum Assigned {
+    SelfRef,
+    Lvar(String),
+    /// Anything else, including the targets of `a, b = ...`, `a ||= ...` and
+    /// `a += ...`.
+    Other,
+}
+
+/// Every local a statement assigns, anywhere inside it (a branch, a block, a
+/// multiple assignment), in source order. A nested `def`, `class`, `module`
+/// or `class << self` has its own locals and is not entered.
+#[derive(Default)]
+struct LocalAssigns(Vec<(String, Assigned)>);
+
+impl lib_ruby_parser::traverse::visitor::Visitor for LocalAssigns {
+    fn on_lvasgn(&mut self, node: &lib_ruby_parser::nodes::Lvasgn) {
+        let value = match node.value.as_deref() {
+            Some(Node::Self_(_)) => Assigned::SelfRef,
+            Some(Node::Lvar(v)) => Assigned::Lvar(v.name.clone()),
+            _ => Assigned::Other,
+        };
+        self.0.push((node.name.clone(), value));
+        lib_ruby_parser::traverse::visitor::visit_lvasgn(self, node);
+    }
+    fn on_def(&mut self, _: &lib_ruby_parser::nodes::Def) {}
+    fn on_defs(&mut self, _: &lib_ruby_parser::nodes::Defs) {}
+    fn on_class(&mut self, _: &lib_ruby_parser::nodes::Class) {}
+    fn on_module(&mut self, _: &lib_ruby_parser::nodes::Module) {}
+    fn on_s_class(&mut self, _: &lib_ruby_parser::nodes::SClass) {}
 }
 
 fn macro_statement(
     src: &str,
     stmt: &Node,
-    class_param: Option<&str>,
-    aliases: &mut Vec<String>,
+    state: &MacroState<'_>,
     origin: &DeclOrigin,
     out: &mut MacroOre,
 ) {
-    // `caller = self`
-    if let Node::Lvasgn(a) = stmt {
-        if matches!(a.value.as_deref(), Some(Node::Self_(_))) {
-            aliases.push(a.name.clone());
-        }
-    }
-    let mut events: Vec<RailsEvent> = Vec::new();
-    let mut unread: Vec<Unharvested> = Vec::new();
     let at = anchor(stmt);
-
-    if let Some(param) = class_param {
-        // `<param>.class_eval do ... end` and `<param>.<macro> ...`. A bare
-        // call, a bare `class_eval` or a bare `send` runs on whatever calls
-        // the method, not on the class held in `param`, so it is not read.
-        if let Some(eval_body) = crate::walk::hook_eval_body(param, stmt) {
-            return macro_class_body(eval_body, src, Some(param), origin, out);
+    match state.holder {
+        Holder::Unbound => {
+            let scan = Scan {
+                param: None,
+                bare: Bare::OnOtherReceiver,
+                src: Some(src),
+            };
+            flush(out, Vec::new(), vec![unharvested_in(stmt, scan, origin)]);
         }
-        let mut decls = Vec::new();
-        crate::walk::walk_hook_statement(param, stmt, Some(src), &mut decls);
-        if !decls.is_empty() {
-            push_decls(decls, at, origin, &mut events);
-            return flush(out, events, unread);
-        }
-        // `Const.method(.., <param>, ..)`
-        if let Some(step) =
-            delegate_step(stmt, at, |a| matches!(a, Node::Lvar(v) if v.name == param))
-        {
-            out.steps.push(step);
-            return;
-        }
-        unread.push(unharvested_in(
-            stmt,
-            Some(param),
-            Bare::OnOtherReceiver,
-            origin,
-        ));
-        return flush(out, events, unread);
-    }
-    // `class_eval do ... end` / `self.class_eval do ... end`: the macro's own
-    // class, so the block is a class body.
-    if let Node::Block(blk) = stmt {
-        if let Node::Send(call) = &*blk.call {
-            if matches!(call.recv.as_deref(), None | Some(Node::Self_(_)))
-                && matches!(call.method_name.as_str(), "class_eval" | "class_exec")
+        Holder::Name(param) => {
+            // `<param>.class_eval do ... end` and `<param>.<macro> ...`. A bare
+            // call, a bare `class_eval` or a bare `send` runs on whatever calls
+            // the method, not on the class held in `param`, so it is not read.
+            if let Some(eval_body) = crate::walk::hook_eval_body(param, stmt) {
+                return macro_class_body(eval_body, src, Some(param), origin, out);
+            }
+            let mut decls = Vec::new();
+            crate::walk::walk_hook_statement(param, stmt, Some(src), &mut decls);
+            if !decls.is_empty() {
+                let mut events = Vec::new();
+                push_decls(decls, at, origin, &mut events);
+                return flush(out, events, Vec::new());
+            }
+            // `Const.method(.., <param>, ..)`
+            if let Some(step) =
+                delegate_step(stmt, at, |a| matches!(a, Node::Lvar(v) if v.name == param))
             {
-                if let Some(body) = blk.body.as_deref() {
-                    return macro_class_body(body, src, None, origin, out);
-                }
+                out.steps.push(step);
+                return;
             }
+            let scan = Scan {
+                param: Some(param),
+                bare: Bare::OnOtherReceiver,
+                src: Some(src),
+            };
+            flush(out, Vec::new(), vec![unharvested_in(stmt, scan, origin)]);
+        }
+        Holder::Itself => {
+            // `class_eval do ... end` / `self.class_eval do ... end`: the
+            // macro's own class, so the block is a class body.
+            if let Some(body) = own_class_eval_body(stmt) {
+                return macro_class_body(body, src, None, origin, out);
+            }
+            // `Const.method(.., self, ..)`
+            let is_class = |a: &Node| match a {
+                Node::Self_(_) => true,
+                Node::Lvar(v) => state.aliases.contains(&v.name),
+                _ => false,
+            };
+            if let Some(step) = delegate_step(stmt, at, is_class) {
+                out.steps.push(step);
+                return;
+            }
+            // A bare macro call, `send :include, M` or a grouping block, as
+            // in an `included do` body.
+            macro_class_statement(stmt, src, None, origin, out);
         }
     }
-    // `Const.method(.., self, ..)`
-    let is_class = |a: &Node| match a {
-        Node::Self_(_) => true,
-        Node::Lvar(v) => aliases.contains(&v.name),
-        _ => false,
-    };
-    if let Some(step) = delegate_step(stmt, at, is_class) {
-        out.steps.push(step);
-        return;
-    }
-    if let Node::Send(s) = stmt {
-        // `send :include, M` / `self.send(:include, M)`
-        if matches!(s.recv.as_deref(), None | Some(Node::Self_(_)))
-            && matches!(s.method_name.as_str(), "send" | "public_send" | "__send__")
-        {
-            if let Some(Node::Sym(inner)) = s.args.first() {
-                let mut found = Vec::new();
-                crate::walk::route_send_public(
-                    &inner.name.to_string_lossy(),
-                    &s.args[1..],
-                    Some(src),
-                    &mut found,
-                );
-                if !found.is_empty() {
-                    push_decls(found, at, origin, &mut events);
-                    return flush(out, events, unread);
-                }
-            }
-        }
-    }
-    // A bare macro call or a grouping block, as in an `included do` body.
-    let mut decls = Vec::new();
-    crate::walk::walk_class_body(stmt, Some(src), &mut decls);
-    record_unread(stmt, &decls, class_param, origin, &mut unread);
-    push_decls(decls, at, origin, &mut events);
-    flush(out, events, unread);
 }
 
 /// `Const.method(.., <the class>, ..)`: a delegation step, where `is_class`
@@ -2564,14 +2750,52 @@ fn macro_class_body(
         single => vec![single],
     };
     for stmt in stmts {
-        let mut decls = Vec::new();
-        crate::walk::walk_class_body(stmt, Some(src), &mut decls);
-        let mut unread = Vec::new();
-        record_unread(stmt, &decls, param, origin, &mut unread);
-        let mut events = Vec::new();
-        push_decls(decls, anchor(stmt), origin, &mut events);
-        flush(out, events, unread);
+        macro_class_statement(stmt, src, param, origin, out);
     }
+}
+
+/// One statement of a class body inside a macro. A `with_options` block is
+/// read one inner statement at a time, so its declarations and the
+/// statements it left unread keep their source order in the steps; the
+/// declarations keep the order (and so the indexes) the walker gives them,
+/// with the wrapper call last.
+fn macro_class_statement(
+    stmt: &Node,
+    src: &str,
+    param: Option<&str>,
+    origin: &DeclOrigin,
+    out: &mut MacroOre,
+) {
+    let at = anchor(stmt);
+    let scan = Scan {
+        param,
+        bare: Bare::OnClass,
+        src: Some(src),
+    };
+    let mut pieces = Vec::new();
+    if crate::walk::walk_with_options_grouped(stmt, Some(src), &mut |g| pieces.push(g)) {
+        for piece in pieces {
+            let mut events = Vec::new();
+            let mut unread = Vec::new();
+            let decls = match piece {
+                crate::walk::Grouped::Stmt(inner, decls) => {
+                    record_unread(inner, &decls, scan, origin, &mut unread);
+                    decls
+                }
+                crate::walk::Grouped::Wrapper(decls) => decls,
+            };
+            push_decls(decls, at, origin, &mut events);
+            flush(out, events, unread);
+        }
+        return;
+    }
+    let mut decls = Vec::new();
+    read_class_statement(stmt, Some(src), &mut decls);
+    let mut unread = Vec::new();
+    record_unread(stmt, &decls, scan, origin, &mut unread);
+    let mut events = Vec::new();
+    push_decls(decls, at, origin, &mut events);
+    flush(out, events, unread);
 }
 
 /// Append one statement's events and unread statements to the macro, giving
@@ -2589,6 +2813,10 @@ fn flush(out: &mut MacroOre, events: Vec<RailsEvent>, unread: Vec<Unharvested>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use UnharvestedReason::{
+        CallOnOtherReceiver as OnOther, ControlFlow as Hides,
+        ControlFlowWithoutDeclaration as Quiet,
+    };
 
     fn ore(src: &str) -> (Vec<ClassOre>, Symbols) {
         let mut syms = Symbols::default();
@@ -3950,7 +4178,6 @@ end
     /// "never".
     #[test]
     fn a_conditional_hides_a_registration_only_when_a_branch_declares_one() {
-        use UnharvestedReason::{ControlFlow as Hides, ControlFlowWithoutDeclaration as Quiet};
         let src = r#"
 module M
   def quiet(options = {})
@@ -4173,8 +4400,6 @@ end
 
     #[test]
     fn a_class_handed_in_registers_only_through_calls_on_it() {
-        use UnharvestedReason::ControlFlowWithoutDeclaration as Quiet;
-        use UnharvestedReason::{CallOnOtherReceiver as Other, ControlFlow as Hides};
         let given = &macro_of_src(MIXED, "define", Some(0))[0];
         assert_eq!(callback_targets(given), ["target_callback"]);
         let concerns: Vec<&str> = given
@@ -4206,12 +4431,12 @@ end
         assert_eq!(
             unread,
             [
-                (Other, vec![]),
-                (Other, vec![]),
-                (Other, vec![]),
+                (OnOther, vec![]),
+                (OnOther, vec![]),
+                (OnOther, vec![]),
                 (Quiet, vec![]),
                 (Hides, vec!["target_conditional".to_string()]),
-                (Other, vec![]),
+                (OnOther, vec![]),
             ]
         );
         let delegates: Vec<usize> = given
@@ -4408,6 +4633,502 @@ end
         assert_eq!(
             unread_hidden(&macro_of_src(src, "m", None)[0]),
             [(UnharvestedReason::ControlFlowWithoutDeclaration, vec![])]
+        );
+    }
+
+    // ── review fixes ────────────────────────────────────────────────────
+
+    /// Every declaration a step names, as `kind:name`: a callback target, an
+    /// association, an included module, or a `DslCall`'s name.
+    fn label(e: &RailsEvent) -> String {
+        match &e.decl {
+            Declaration::Callback(c) => format!("cb:{}", c.target),
+            Declaration::Association(a) => format!("assoc:{}", a.name),
+            Declaration::Concern(c) => format!("{:?}:{}", c.kind, c.module),
+            Declaration::DslCall(c) => format!("dsl:{}", c.name),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// Steps as `decl:<label>` / `<reason>:<hidden labels>` / `delegate`.
+    fn steps_of(m: &MacroOre) -> Vec<String> {
+        m.steps
+            .iter()
+            .map(|s| match s {
+                MacroStep::Decl(i) => format!("decl:{}", label(&m.declarations[*i as usize])),
+                MacroStep::Unread(u) => format!(
+                    "{}:{}",
+                    u.reason.as_str(),
+                    u.hidden.iter().map(label).collect::<Vec<_>>().join(",")
+                ),
+                MacroStep::Delegate { .. } => "delegate".to_string(),
+            })
+            .collect()
+    }
+
+    /// A method body that is a `rescue`, an `ensure` or an explicit `begin`
+    /// names what it could register, and none of it is unconditional.
+    #[test]
+    fn rescue_ensure_and_begin_bodies_hide_what_they_register() {
+        let src = "module M
+ def a
+  configure
+ rescue StandardError
+  before_save :fallback
+ end
+ def b
+  configure
+ ensure
+  before_save :ensured
+ end
+ def c
+  begin
+   before_save :begun
+  end
+ end
+ def d
+  configure
+ rescue StandardError
+  log_it
+ end
+end
+";
+        for (name, step) in [
+            ("a", "CONTROL_FLOW:cb:fallback"),
+            ("b", "CONTROL_FLOW:cb:ensured"),
+            ("c", "CONTROL_FLOW:cb:begun"),
+            // The silence twin: a rescue that registers nothing hides nothing.
+            ("d", "CONTROL_FLOW_WITHOUT_DECLARATION:"),
+        ] {
+            let m = &macro_of_src(src, name, None)[0];
+            assert!(m.declarations.is_empty(), "{name}");
+            assert_eq!(steps_of(m), [step], "{name}");
+        }
+        // An `included do` block with a `rescue` is read the same way.
+        let (cs, _) = ore(
+            "module R\n  extend ActiveSupport::Concern\n  included do\n    configure\n  rescue StandardError\n    before_save :x\n  end\nend\n",
+        );
+        let r = by_name(&cs, "R");
+        assert!(hook_events(r).is_empty());
+        assert_eq!(r.unharvested.len(), 1);
+        assert_eq!(r.unharvested[0].reason, Hides);
+        assert_eq!(
+            r.unharvested[0]
+                .hidden
+                .iter()
+                .map(label)
+                .collect::<Vec<_>>(),
+            ["cb:x"]
+        );
+    }
+
+    /// In `def self.included(base)` a bare call runs on the module, so a
+    /// skipped branch names only what it would register on `base`; inside
+    /// `base.class_eval` a bare call is the class's.
+    #[test]
+    fn an_included_hook_body_hides_only_registrations_on_its_parameter() {
+        let (cs, _) = ore(
+            "module P\n  def self.included(base)\n    before_save :owner if enabled?\n    base.before_save :b if enabled?\n    base.class_eval do\n      before_save :inner if enabled?\n    end\n  end\nend\n",
+        );
+        let u: Vec<(UnharvestedReason, Vec<String>)> = by_name(&cs, "P")
+            .unharvested
+            .iter()
+            .map(|u| (u.reason, u.hidden.iter().map(label).collect()))
+            .collect();
+        assert_eq!(
+            u,
+            [
+                (Quiet, vec![]),
+                (Hides, vec!["cb:b".to_string()]),
+                (Hides, vec!["cb:inner".to_string()]),
+            ]
+        );
+    }
+
+    /// A reflective `send` with a literal name, symbol or string, is the call
+    /// it names, unconditional or inside a skipped branch; a computed name is
+    /// unread.
+    #[test]
+    fn a_literal_send_is_the_call_it_names_in_every_position() {
+        let src = r#"
+module M
+  def m
+    send(:include, Hooks) if enabled?
+    send("include", Plain)
+    self.send("prepend", Pre) if enabled?
+    send("inc#{x}", Computed)
+    send(:helper_thing, X) if enabled?
+  end
+  def self.given(target)
+    target.send("include", Given)
+    target.send("include", Hidden) if enabled?
+  end
+end
+"#;
+        assert_eq!(
+            steps_of(&macro_of_src(src, "m", None)[0]),
+            [
+                "CONTROL_FLOW:Include:Hooks",
+                "decl:Include:Plain",
+                "CONTROL_FLOW:Prepend:Pre",
+                "DYNAMIC_SEND:",
+                // The silence twin: an unknown name is not a registration.
+                "CONTROL_FLOW_WITHOUT_DECLARATION:",
+            ]
+        );
+        assert_eq!(
+            steps_of(&macro_of_src(src, "given", Some(0))[0]),
+            ["decl:Include:Given", "CONTROL_FLOW:Include:Hidden"]
+        );
+        // The same in an `included do` body.
+        let (cs, _) = ore(
+            "module R\n  extend ActiveSupport::Concern\n  included do\n    send(:include, Hooks) if enabled?\n  end\nend\n",
+        );
+        let r = by_name(&cs, "R");
+        assert_eq!(r.unharvested[0].reason, Hides);
+        assert_eq!(
+            r.unharvested[0]
+                .hidden
+                .iter()
+                .map(label)
+                .collect::<Vec<_>>(),
+            ["Include:Hooks"]
+        );
+    }
+
+    /// A reflective `send` that is recognised but cannot be resolved is unread,
+    /// not a generic `send` declaration, so the step stays visible.
+    #[test]
+    fn an_unresolved_send_is_unread_not_a_declaration() {
+        let src = "module M
+ def m
+  send(:some_helper, :audit)
+  send(name, :audit)
+  send(:include, Hooks)
+ end
+end
+";
+        assert_eq!(
+            steps_of(&macro_of_src(src, "m", None)[0]),
+            ["UNRECOGNIZED_CALL:", "DYNAMIC_SEND:", "decl:Include:Hooks"]
+        );
+    }
+
+    /// The splat of a hidden declaration keeps its spelling when the macro's
+    /// source is known, and falls back to `**<expr>` where it is not.
+    #[test]
+    fn a_hidden_declaration_keeps_its_splat_as_written() {
+        let src = "module M
+ def m(opts)
+  has_many :a, **opts.merge(dependent: :destroy) if flag?
+ end
+ def self.given(target, opts)
+  target.has_many :b, **opts.merge(dependent: :destroy) if flag?
+ end
+end
+";
+        let splat = |m: &MacroOre| {
+            let MacroStep::Unread(u) = &m.steps[0] else {
+                panic!("expected an unread step");
+            };
+            let Declaration::Association(a) = &u.hidden[0].decl else {
+                panic!("expected the association");
+            };
+            a.option_splats[0].source.clone()
+        };
+        let want = "**opts.merge(dependent: :destroy)";
+        assert_eq!(splat(&macro_of_src(src, "m", None)[0]), want);
+        assert_eq!(splat(&macro_of_src(src, "given", Some(0))[0]), want);
+        // Without the source (a module ore), the fallback rendering.
+        let (cs, _) = ore(
+            "module R\n  extend ActiveSupport::Concern\n  included do\n    has_many :a, **opts.merge(dependent: :destroy) if flag?\n  end\nend\n",
+        );
+        let Declaration::Association(a) = &by_name(&cs, "R").unharvested[0].hidden[0].decl else {
+            panic!("expected the association");
+        };
+        assert_eq!(a.option_splats[0].source, "**<expr>");
+    }
+
+    /// The class argument counts positional slots: a destructured slot is
+    /// one, and a slot that is not a single plain binding names no class.
+    #[test]
+    fn the_class_argument_is_a_positional_slot() {
+        let src = "module M
+ def self.setup((left, right), target)
+  target.before_save :t
+  left.before_save :l
+ end
+ def self.splat(*rest, target)
+  target.before_save :s
+ end
+end
+";
+        assert_eq!(
+            callback_targets(&macro_of_src(src, "setup", Some(1))[0]),
+            ["t"]
+        );
+        let destructured = &macro_of_src(src, "setup", Some(0))[0];
+        assert!(destructured.declarations.is_empty());
+        assert_eq!(steps_of(destructured), ["CALL_ON_OTHER_RECEIVER:"; 2]);
+        // After a splat the position is not fixed.
+        assert!(
+            macro_of_src(src, "splat", Some(1))[0]
+                .declarations
+                .is_empty()
+        );
+    }
+
+    /// A selected argument the method does not have extracts nothing, unlike
+    /// a macro on its own class.
+    #[test]
+    fn a_missing_class_argument_extracts_nothing() {
+        let src = "module M
+ def self.setup(config)
+  before_save :a
+  config.before_save :b
+  Helper.call(config)
+ end
+end
+";
+        let missing = &macro_of_src(src, "setup", Some(1))[0];
+        assert!(missing.declarations.is_empty());
+        assert_eq!(steps_of(missing), ["CALL_ON_OTHER_RECEIVER:"; 3]);
+        // The silence twins: on its own class it reads the bare call, handed
+        // the class as argument 0 it reads the call on it.
+        assert_eq!(
+            callback_targets(&macro_of_src(src, "setup", None)[0]),
+            ["a"]
+        );
+        assert_eq!(
+            callback_targets(&macro_of_src(src, "setup", Some(0))[0]),
+            ["b"]
+        );
+    }
+
+    /// The line of a `def self.x` is its own, like a `def x`'s.
+    #[test]
+    fn a_singleton_macro_reports_its_own_line() {
+        let src = "module M
+  # one
+  # two
+  def self.setup(target)
+    target.before_save :a
+  end
+
+  def other
+    before_save :b
+  end
+end
+";
+        let m = &macro_of_src(src, "setup", Some(0))[0];
+        assert_eq!(m.line, 4);
+        assert_eq!(m.declarations[0].origin, DeclOrigin::Included { line: 4 });
+        assert_eq!(macro_of_src(src, "other", None)[0].line, 8);
+    }
+
+    /// A local that held `self` stops naming the class once it is assigned
+    /// something else, in a branch or not; assigned the class again, it still
+    /// does.
+    #[test]
+    fn an_alias_of_self_ends_when_it_is_reassigned() {
+        let src = "module M
+ def kept
+  klass = self
+  x = 1
+  Installer.call(klass)
+  other = klass
+  klass = self
+  Installer.call(klass)
+  Installer.call(other)
+ end
+ def replaced
+  klass = self
+  Installer.call(klass)
+  klass = OtherModel
+  Installer.call(klass)
+ end
+ def branch
+  klass = self
+  klass = OtherModel if replace
+  Installer.call(klass)
+ end
+end
+";
+        let delegates = |n: &str| {
+            steps_of(&macro_of_src(src, n, None)[0])
+                .iter()
+                .filter(|s| *s == "delegate")
+                .count()
+        };
+        assert_eq!(delegates("kept"), 3);
+        assert_eq!(delegates("replaced"), 1);
+        assert_eq!(delegates("branch"), 0);
+    }
+
+    /// Assigning the class parameter ends its binding for later statements;
+    /// calls before the assignment still count.
+    #[test]
+    fn an_assigned_class_parameter_no_longer_names_the_class() {
+        let src = "module M
+ def self.setup(target)
+  target.before_save :a
+  target = OtherModel if replace
+  target.before_save :b
+ end
+ def self.kept(target)
+  target.before_save :a
+  other = OtherModel
+  target.before_save :b
+ end
+end
+";
+        let m = &macro_of_src(src, "setup", Some(0))[0];
+        assert_eq!(
+            steps_of(m),
+            [
+                "decl:cb:a",
+                "CONTROL_FLOW_WITHOUT_DECLARATION:",
+                "CALL_ON_OTHER_RECEIVER:"
+            ]
+        );
+        // The silence twin: assigning another local leaves the binding.
+        assert_eq!(
+            callback_targets(&macro_of_src(src, "kept", Some(0))[0]),
+            ["a", "b"]
+        );
+    }
+
+    /// A `class_eval` on the class inside a skipped branch is a class body:
+    /// its own conditions are descended into and what they register is named.
+    #[test]
+    fn a_class_eval_in_a_skipped_branch_names_its_registrations() {
+        let src = "module M
+ def self.given(target)
+  if enabled?
+   target.class_eval do
+    before_save :audit if configured?
+   end
+  end
+  if enabled?
+   other.class_eval do
+    before_save :elsewhere
+   end
+  end
+ end
+ def own
+  if enabled?
+   class_eval do
+    before_save :audit if configured?
+   end
+  end
+  if enabled?
+   Other.class_eval do
+    before_save :elsewhere
+   end
+  end
+ end
+end
+";
+        let want = ["CONTROL_FLOW:cb:audit", "CONTROL_FLOW_WITHOUT_DECLARATION:"];
+        let given = &macro_of_src(src, "given", Some(0))[0];
+        assert!(given.declarations.is_empty());
+        assert_eq!(steps_of(given), want);
+        let own = &macro_of_src(src, "own", None)[0];
+        assert!(own.declarations.is_empty());
+        assert_eq!(steps_of(own), want);
+    }
+
+    /// A known helper's deliberate residual survives a reflective call and a
+    /// call on the hook parameter; only the unknown-name fallback is dropped.
+    #[test]
+    fn a_helpers_residual_is_kept_through_send_and_the_hook_parameter() {
+        let src = "module M
+ def m(opts)
+  send(:validates_presence_of, :name, **opts)
+ end
+end
+";
+        assert_eq!(
+            steps_of(&macro_of_src(src, "m", None)[0]),
+            ["decl:dsl:validates_presence_of"]
+        );
+        let (cs, _) = ore(
+            "module P\n  def self.included(base)\n    base.validates_presence_of :name, **opts\n    base.send(:validates_length_of, :name, **opts)\n    base.some_helper :nope\n  end\nend\n",
+        );
+        let p = by_name(&cs, "P");
+        assert_eq!(
+            hook_events(p).iter().map(|e| label(e)).collect::<Vec<_>>(),
+            ["dsl:validates_presence_of", "dsl:validates_length_of"]
+        );
+        // The silence twin: the unknown helper is still dropped and listed.
+        assert_eq!(p.unharvested.len(), 1);
+        assert_eq!(p.unharvested[0].reason, UnharvestedReason::UnrecognizedCall);
+    }
+
+    /// A `with_options` block that mixes declarations with a skipped one keeps
+    /// them in statement order, with the wrapper call last and the
+    /// declarations' indexes unchanged.
+    #[test]
+    fn a_with_options_block_keeps_its_mixed_statements_in_order() {
+        let own = "module M
+ def m
+  with_options({}) do
+   before_save :a
+   before_save :b if flag?
+   before_save :c
+  end
+ end
+end
+";
+        let want = [
+            "decl:cb:a",
+            "CONTROL_FLOW:cb:b",
+            "decl:cb:c",
+            "decl:dsl:with_options",
+        ];
+        let m = &macro_of_src(own, "m", None)[0];
+        assert_eq!(steps_of(m), want);
+        assert_eq!(
+            m.declarations.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let given = "module M
+ def self.m(k)
+  k.class_eval do
+   with_options if: :ready? do
+    before_save :a
+    before_save :b if flag?
+    before_save :c
+   end
+  end
+ end
+end
+";
+        let g = &macro_of_src(given, "m", Some(0))[0];
+        assert_eq!(steps_of(g), want);
+        // The inherited option rides on each declaration.
+        let Declaration::Callback(c) = &g.declarations[1].decl else {
+            panic!("expected a callback");
+        };
+        assert_eq!(c.target, "c");
+        assert!(c.options.iter().any(|(k, v)| k == "if" && v == ":ready?"));
+    }
+
+    /// The silence twin: a block of declarations lists nothing unread.
+    #[test]
+    fn a_with_options_block_of_declarations_lists_nothing_unread() {
+        let src = "module M
+ def m
+  with_options({}) do
+   before_save :a
+   before_save :b
+  end
+ end
+end
+";
+        assert_eq!(
+            steps_of(&macro_of_src(src, "m", None)[0]),
+            ["decl:cb:a", "decl:cb:b", "decl:dsl:with_options"]
         );
     }
 }
