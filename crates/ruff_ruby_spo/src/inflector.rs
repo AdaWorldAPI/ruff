@@ -106,7 +106,12 @@ fn is_vowel_or_y(b: u8) -> bool {
     )
 }
 
-/// The first matching rule, newest first. The catch-all `/$/ -> "s"`
+/// The first matching rule, newest first.
+///
+/// A rule's replacement keeps only what its groups captured and writes the
+/// rest of the suffix as the rule spells it, lowercase: `^(m|l)ice$` ->
+/// `'\1ice'` turns `MICE` into `Mice`. A rule whose group captures the whole
+/// match (`(hive)$`, `^(oxen)$`) keeps the word's own case. The catch-all `/$/ -> "s"`
 /// (`inflections.rb:13`) always matches, so there is always a result.
 #[allow(clippy::too_many_lines)] // one arm per rule, in table order
 fn first_rule(w: &str) -> String {
@@ -137,7 +142,7 @@ fn first_rule(w: &str) -> String {
     }
     // :30 `^(m|l)ice$`
     if l == "mice" || l == "lice" {
-        return w.to_string();
+        return swap(w, 3, "ice");
     }
     // :29 `^(m|l)ouse$`
     if l == "mouse" || l == "louse" {
@@ -177,9 +182,9 @@ fn first_rule(w: &str) -> String {
     if l.ends_with("sis") {
         return swap(w, 3, "ses");
     }
-    // :22 `([ti])a$` keeps the word
+    // :22 `([ti])a$` -> `\1a`: the word, its `a` respelled
     if l.len() >= 2 && l.ends_with('a') && matches!(l.as_bytes()[n - 2], b't' | b'i') {
-        return w.to_string();
+        return swap(w, 1, "a");
     }
     // :21 `([ti])um$`
     if l.len() >= 3 && l.ends_with("um") && matches!(l.as_bytes()[n - 3], b't' | b'i') {
@@ -187,19 +192,19 @@ fn first_rule(w: &str) -> String {
     }
     // :20 `(buffal|tomat)o$`
     if l.ends_with("buffalo") || l.ends_with("tomato") {
-        return format!("{w}es");
+        return swap(w, 1, "oes");
     }
     // :19 `(bu)s$`
     if l.ends_with("bus") {
-        return format!("{w}es");
+        return swap(w, 1, "ses");
     }
     // :18 `(alias|status)$`
     if l.ends_with("alias") || l.ends_with("status") {
         return format!("{w}es");
     }
-    // :17 `(octop|vir)i$` keeps the word
+    // :17 `(octop|vir)i$` -> `\1i`: the word, its `i` respelled
     if l.ends_with("octopi") || l.ends_with("viri") {
-        return w.to_string();
+        return swap(w, 1, "i");
     }
     // :16 `(octop|vir)us$`
     if l.ends_with("octopus") || l.ends_with("virus") {
@@ -209,9 +214,9 @@ fn first_rule(w: &str) -> String {
     if l == "axis" || l == "testis" {
         return swap(w, 2, "es");
     }
-    // :14 `s$` keeps the word
+    // :14 `s$` -> "s": the word, its `s` respelled
     if l.ends_with('s') {
-        return w.to_string();
+        return swap(w, 1, "s");
     }
     // :13 `$` -> "s"
     format!("{w}s")
@@ -313,6 +318,33 @@ mod tests {
         assert_eq!(p("PERSON"), "People");
         assert_eq!(p("Status"), "Statuses");
         assert_eq!(p("Quiz"), "Quizzes");
+        // Each rule writes its literal suffix as written, even where the match
+        // already ended in those letters. Expected values are the output of
+        // `ActiveSupport::Inflector.pluralize` from activesupport-8.1.4.1.
+        for (word, plural) in [
+            ("MICE", "Mice"),
+            ("LICE", "Lice"),
+            ("MOUSE", "Mice"),
+            ("DATA", "DATa"),
+            ("MEDIA", "MEDIa"),
+            ("DATUM", "DATa"),
+            ("OCTOPI", "OCTOPi"),
+            ("VIRI", "VIRi"),
+            ("OCTOPUS", "OCTOPi"),
+            ("BUS", "BUses"),
+            ("TOMATO", "TOMAToes"),
+            ("BUFFALO", "BUFFALoes"),
+            ("POSTS", "POSTs"),
+            ("OXEN", "OXEN"),
+            ("OX", "OXen"),
+            ("HIVE", "HIVEs"),
+            ("STATUS", "STATUSes"),
+            ("ANALYSIS", "ANALYses"),
+            ("MATRIX", "MATRices"),
+            ("SHEEP", "SHEEP"),
+        ] {
+            assert_eq!(p(word), plural, "{word}");
+        }
     }
 
     #[test]
