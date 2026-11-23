@@ -2101,7 +2101,9 @@ mod tests {
         // `app/services` (a module that is not scanned is a gap).
         let all = extract_contract_permissions(&Path::new(&root).join("app"));
         let c = class(&all, "WorkPackages::CreateContract");
-        eprintln!("gaps: {:#?}", c.gaps);
+        // Pinned baseline: the create contract and its chain read fully.
+        assert!(c.gaps.is_empty(), "gaps: {:#?}", c.gaps);
+        assert_eq!(NEXGEN_CREATE.len(), 29);
         let mut different = Vec::new();
         for (attr, expected) in NEXGEN_CREATE {
             let got: Option<Vec<String>> = match c.lookup(attr) {
