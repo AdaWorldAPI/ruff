@@ -423,6 +423,41 @@ pub(crate) fn record_statement(
         {
             entry.is_concern = true;
         }
+        if let Node::Send(send) = stmt
+            && receiverless(send)
+            && send.method_name == "extend"
+        {
+            let names: Vec<MixinArg> = send
+                .args
+                .iter()
+                .filter(|arg| {
+                    const_path(arg)
+                        .as_deref()
+                        .map(|p| p.trim_start_matches("::"))
+                        != Some("ActiveSupport::Concern")
+                })
+                .map(|arg| match const_path(arg) {
+                    Some(path) => MixinArg::Const {
+                        path,
+                        absolute: is_absolute(arg),
+                    },
+                    None => MixinArg::Dynamic(format!(
+                        "dynamic `extend` argument `{}`",
+                        snippet_of(src, arg)
+                    )),
+                })
+                .collect();
+            if !names.is_empty() {
+                entry.extends.push((
+                    Mixin {
+                        prepend: false,
+                        ns: ns.to_vec(),
+                        names,
+                    },
+                    src_ref(file, src, scope, stmt),
+                ));
+            }
+        }
         // Singleton methods Ruby calls on `include`; they are applied at the
         // include point (see `State::module`).
         if let Node::Defs(def) = stmt
@@ -463,6 +498,12 @@ pub(crate) fn record_statement(
 /// expanded.)
 fn is_include_hook(name: &str) -> bool {
     matches!(name, "included" | "append_features")
+}
+
+/// Whether a module defines `included` or `append_features` as an instance
+/// method, which an `extend` of it turns into an include hook.
+fn is_include_hook_defined(entry: &ClassEntry<'_>) -> bool {
+    entry.defines("included") || entry.defines("append_features")
 }
 
 /// One statement of an `included do … end` block. An `include` there runs in
@@ -1139,10 +1180,20 @@ impl State<'_, '_> {
         let hook = |wanted: &str| entry.include_hooks.iter().find(|(h, _)| h == wanted);
         let replaced = hook("append_features");
         let included = hook("included");
+        let extended = self.extension_hook(entry);
         if self.installed.contains(name) {
             // Already an ancestor: nothing is installed again, but a
             // singleton `append_features` or `included` this module defines
             // is still called.
+            if replaced.is_none()
+                && included.is_none()
+                && let Some(reason) = &extended
+            {
+                self.gap(
+                    format!("module `{name}` is already included, but {reason} runs again"),
+                    at,
+                );
+            }
             if let Some((hook_name, hook_at)) = replaced.or(included) {
                 let def = self.source(hook_at);
                 self.gap(
@@ -1180,6 +1231,15 @@ impl State<'_, '_> {
                     "module `{name}` defines `self.append_features` ({}:{}), which decides what including it does",
                     def.file, def.line
                 ),
+                at,
+            );
+        } else if let Some(reason) = extended {
+            // The extension's `included` / `append_features` is found before
+            // `ActiveSupport::Concern#included`, so the block may never run.
+            self.installed.insert(name.to_string());
+            self.ancestry_unknown = true;
+            self.gap(
+                format!("module `{name}` is extended by {reason}, which can declare attributes and decides whether its `included` block runs"),
                 at,
             );
         } else if let Some((_, hook_at)) = included {
@@ -1255,6 +1315,36 @@ impl State<'_, '_> {
             .any(|name| name.split("::").next() == Some(first))
     }
 
+    /// What an `extend` of `entry` (other than `ActiveSupport::Concern`) may
+    /// contribute as an include hook. `None` only when every extension is a
+    /// scanned module that defines neither hook method and includes nothing.
+    fn extension_hook(&self, entry: &ClassEntry<'_>) -> Option<String> {
+        for (mixin, at) in &entry.extends {
+            let def = self.source(at);
+            for arg in &mixin.names {
+                let MixinArg::Const { path, absolute } = arg else {
+                    return Some(format!("a dynamic extension ({}:{})", def.file, def.line));
+                };
+                let Some(found) = self.lowerer.resolve_arg(&mixin.ns, path, *absolute) else {
+                    return Some(format!(
+                        "`{path}` ({}:{}), which is not scanned",
+                        def.file, def.line
+                    ));
+                };
+                let Some(ext) = self.lowerer.classes.get(&found) else {
+                    return Some(format!("`{path}` ({}:{})", def.file, def.line));
+                };
+                if is_include_hook_defined(ext) || !ext.mixins.is_empty() {
+                    return Some(format!(
+                        "`{found}` ({}:{}), whose instance methods can supply the hook",
+                        def.file, def.line
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     fn mark_possibly_installed(&mut self, modules: &[String]) {
         if modules.is_empty() {
             self.ancestry_unknown = true;
@@ -1325,7 +1415,7 @@ impl State<'_, '_> {
         let Some(entry) = self.lowerer.classes.get(name) else {
             return;
         };
-        if !entry.include_hooks.is_empty() {
+        if !entry.include_hooks.is_empty() || self.extension_hook(entry).is_some() {
             self.ancestry_unknown = true;
         }
         for event in &entry.events {
@@ -2319,6 +2409,39 @@ mod tests {
         let root = "class BaseContract\n  include Shared::Missing\nend\n";
         let all = scan("app_root", &[("m.rb", app), ("b.rb", root), ("c.rb", src)]);
         assert!(unresolved(class(&all, "C"), "a").contains("may be a no-op"));
+    }
+
+    #[test]
+    fn a_hook_installed_through_extend_keeps_the_include_open() {
+        let hooks = "module PermissionHooks\n  def included(base)\n    base.attribute_permission :secret, :admin\n  end\nend\nmodule Restricted\n  extend PermissionHooks\nend\n";
+        let src = "class C < BaseContract\n  include Restricted\nend\n";
+        let all = scan("extend_hook", &[("h.rb", hooks), ("c.rb", src)]);
+        let reason = unresolved(class(&all, "C"), "secret");
+        assert!(reason.contains("PermissionHooks"), "{reason}");
+        // Unscanned or dynamic extensions are unknown, so a gap as well.
+        let unknown = "module Restricted\n  extend Elsewhere::Hooks\nend\n";
+        let all = scan("extend_unknown", &[("h.rb", unknown), ("c.rb", src)]);
+        assert!(matches!(
+            class(&all, "C").lookup("secret"),
+            PermissionState::Unresolved { .. }
+        ));
+        // A hook from an extension also stops the `included do` block.
+        let concern = "module PermissionHooks\n  def included(base = nil, &block)\n  end\nend\nmodule Restricted\n  extend ActiveSupport::Concern\n  extend PermissionHooks\n  included do\n    attribute :secret, permission: :mixin\n  end\nend\n";
+        let all = scan("extend_block", &[("h.rb", concern), ("c.rb", src)]);
+        assert!(matches!(
+            class(&all, "C").lookup("secret"),
+            PermissionState::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn an_extension_without_hooks_or_concern_alone_adds_no_gap() {
+        let plain = "module Helpers\n  def helper; end\nend\nmodule Restricted\n  extend ActiveSupport::Concern\n  extend Helpers\n  included do\n    attribute :secret, permission: :mixin\n  end\nend\n";
+        let src = "class C < BaseContract\n  include Restricted\nend\n";
+        let all = scan("extend_plain", &[("h.rb", plain), ("c.rb", src)]);
+        let c = class(&all, "C");
+        assert!(c.gaps.is_empty(), "{:?}", c.gaps);
+        assert_eq!(explicit(c, "secret").value, any_of(&["mixin"]));
     }
 
     #[test]

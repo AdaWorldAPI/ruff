@@ -283,9 +283,18 @@ pub(crate) struct ClassEntry<'a> {
     /// so they are kept apart from `mixins`, which guard lowering reads as the
     /// module's own ancestors.
     pub(crate) included_mixins: Vec<Mixin>,
+    /// `extend` calls of a module body, other than `ActiveSupport::Concern`.
+    /// An extension's instance methods become the module's singleton
+    /// methods, so it can supply the `included` / `append_features` hook.
+    pub(crate) extends: Vec<(Mixin, SrcRef)>,
 }
 
 impl ClassEntry<'_> {
+    /// Whether the body defines instance method `name`.
+    pub(crate) fn defines(&self, name: &str) -> bool {
+        self.defs.contains_key(name)
+    }
+
     fn new(is_module: bool) -> Self {
         Self {
             superclass: None,
@@ -298,6 +307,7 @@ impl ClassEntry<'_> {
             events: Vec::new(),
             included_events: Vec::new(),
             included_mixins: Vec::new(),
+            extends: Vec::new(),
         }
     }
 }
