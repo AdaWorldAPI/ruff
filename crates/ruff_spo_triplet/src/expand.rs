@@ -1084,7 +1084,16 @@ fn extract_validation_kinds(options: &[(String, String)]) -> Vec<&'static str> {
     // Codex P2 on #21: any of these gating options makes the
     // validation conditional in Rails — suppress kind emission so
     // the schema doesn't invent an unconditional constraint.
-    const GATING_OPTIONS: &[&str] = &["if", "unless", "on", "allow_nil", "allow_blank"];
+    // `except_on` (Rails 7.1) skips the validation in the named contexts, so
+    // it gates the same way `on` does.
+    const GATING_OPTIONS: &[&str] = &[
+        "if",
+        "unless",
+        "on",
+        "except_on",
+        "allow_nil",
+        "allow_blank",
+    ];
     if options
         .iter()
         .any(|(k, _)| GATING_OPTIONS.contains(&k.as_str()))
@@ -1915,6 +1924,12 @@ mod tests {
         );
         // Empty options → empty.
         assert!(extract_validation_kinds(&[]).is_empty());
+        // `except_on` gates like `on`: no unconditional kind.
+        let except_on: Vec<(String, String)> = [("numericality", "true"), ("except_on", ":create")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert!(extract_validation_kinds(&except_on).is_empty());
         // Only non-recognised (no kind keys) → empty.
         let only_msg: Vec<(String, String)> = [("message", "\"oops\"")]
             .iter()

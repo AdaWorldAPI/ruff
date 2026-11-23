@@ -211,17 +211,7 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut 
         // known grouping idioms to avoid double-counting from arbitrary
         // blocks (e.g. `5.times do; validates :foo; end` would NOT count
         // because that's runtime-only).
-        "with_options" => {
-            if let Some(body) = blk.body.as_ref() {
-                let mut inner = Vec::new();
-                walk_class_body(body, src, &mut inner);
-                apply_grouping_options(&mut inner, literal_options(&s.args).as_deref());
-                out.extend(inner);
-            }
-            // Also record the wrapper call itself so the catch-all
-            // coverage assertion still sees `with_options` somewhere.
-            route_send(s.method_name.as_str(), &s.args, src, out);
-        }
+        "with_options" => walk_with_options(blk, s, src, out, Some(&[])),
         other => {
             // Generic block: route the call as if it were a bare Send,
             // then drop the body. Conservative — keeps the call counted
@@ -232,42 +222,121 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut 
     }
 }
 
+/// One option of a literal hash: the key as a plain string, the key as
+/// written (for re-rendering), and the rendered value.
+#[derive(Clone)]
+struct Opt {
+    key: String,
+    key_src: String,
+    value: String,
+}
+
 /// The options of a call whose arguments are exactly one literal hash with
 /// literal (symbol or string) keys, or none. `None` when any option is not
 /// statically known: a variable, a method call, a `**splat`, a computed key.
-fn literal_options(args: &[Node]) -> Option<Vec<(String, String)>> {
+fn literal_options(args: &[Node]) -> Option<Vec<Opt>> {
     match args {
         [] => Some(Vec::new()),
-        [only] => {
-            let pairs = hash_pairs_of(only)?;
-            pairs
-                .iter()
-                .map(|n| match n {
-                    Node::Pair(p) if matches!(&*p.key, Node::Sym(_) | Node::Str(_)) => {
-                        Some((pair_key(&p.key), render_node(&p.value)))
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
+        [only] => hash_pairs_of(only)?
+            .iter()
+            .map(|n| match n {
+                Node::Pair(p) if matches!(&*p.key, Node::Sym(_) | Node::Str(_)) => Some(Opt {
+                    key: pair_key(&p.key),
+                    key_src: render_node(&p.key),
+                    value: render_node(&p.value),
+                }),
+                _ => None,
+            })
+            .collect(),
         _ => None,
     }
 }
 
-/// Apply a `with_options` wrapper's options to the declarations of its body,
-/// as `ActiveSupport`'s `OptionMerger` does: each call receives the wrapper's
-/// options, and a key the call sets itself wins.
+/// `own` with every `inherited` option whose key `own` does not set: the
+/// call's own keys win, as in `ActiveSupport`'s `OptionMerger`.
+fn merge_opts(own: &[Opt], inherited: &[Opt]) -> Vec<Opt> {
+    let mut merged = own.to_vec();
+    for o in inherited {
+        if !merged.iter().any(|m| m.key == o.key) {
+            merged.push(o.clone());
+        }
+    }
+    merged
+}
+
+/// A `with_options` block. `outer` is the combined options of the enclosing
+/// `with_options` blocks (empty at the top), `None` when any of them is not
+/// statically known.
 ///
-/// When the wrapper's options are not statically known (`None`), they may
-/// hold `if:`, `on:` or `allow_nil:`, so nothing in the body may look
-/// unconditional: a validation becomes a `DslCall` (no constraint is
-/// derived from it), an association records an [`OptionSplat`], and a
-/// callback is marked conditional with `if: <expr>`.
-fn apply_grouping_options(decls: &mut [Declaration], wrapper: Option<&[(String, String)]>) {
-    fn merge(options: &mut Vec<(String, String)>, wrapper: &[(String, String)]) {
-        for (k, v) in wrapper {
-            if !options.iter().any(|(own, _)| own == k) {
-                options.push((k.clone(), v.clone()));
+/// Each call in the body receives the combined options, as
+/// `ActiveSupport`'s `OptionMerger` does, with a key the call sets itself
+/// winning. A `validates_*_of` helper receives them before its own options
+/// are split into shared and validator-specific keys, so
+/// `with_options maximum: 80 do; validates_length_of :name; end` gives
+/// `length: {maximum: 80}` like the direct call. When the options are not
+/// statically known they may hold `if:`, `on:` or `allow_nil:`, so nothing
+/// in the body may look unconditional: a validation becomes a `DslCall`, an
+/// association records an [`OptionSplat`], and a callback is marked
+/// conditional with `if: <expr>`.
+fn walk_with_options(
+    blk: &lib_ruby_parser::nodes::Block,
+    call: &lib_ruby_parser::nodes::Send,
+    src: Option<&str>,
+    out: &mut Vec<Declaration>,
+    outer: Option<&[Opt]>,
+) {
+    let wrapper: Option<Vec<Opt>> = match (outer, literal_options(&call.args)) {
+        (Some(o), Some(w)) => Some(merge_opts(&w, o)),
+        _ => None,
+    };
+    if let Some(body) = blk.body.as_deref() {
+        let stmts: Vec<&Node> = match body {
+            Node::Begin(b) => b.statements.iter().collect(),
+            single => vec![single],
+        };
+        for stmt in stmts {
+            match stmt {
+                Node::Block(inner_blk)
+                    if matches!(&*inner_blk.call, Node::Send(s)
+                        if s.recv.is_none() && s.method_name == "with_options") =>
+                {
+                    let Node::Send(inner_call) = &*inner_blk.call else {
+                        continue;
+                    };
+                    walk_with_options(inner_blk, inner_call, src, out, wrapper.as_deref());
+                }
+                Node::Send(s)
+                    if s.recv.is_none()
+                        && validates_helper_kind(&s.method_name).is_some()
+                        && wrapper.is_some() =>
+                {
+                    emit_validates_helper(
+                        &s.method_name,
+                        &s.args,
+                        wrapper.as_deref().unwrap_or(&[]),
+                        out,
+                    );
+                }
+                _ => {
+                    let mut inner = Vec::new();
+                    walk_statement(stmt, src, &mut inner);
+                    apply_grouping_options(&mut inner, wrapper.as_deref());
+                    out.extend(inner);
+                }
+            }
+        }
+    }
+    // The wrapper call itself, so coverage still sees `with_options`.
+    route_send(call.method_name.as_str(), &call.args, src, out);
+}
+
+/// Apply combined `with_options` options to declarations other than
+/// `validates_*_of` helpers (see [`walk_with_options`]).
+fn apply_grouping_options(decls: &mut [Declaration], wrapper: Option<&[Opt]>) {
+    fn merge(options: &mut Vec<(String, String)>, wrapper: &[Opt]) {
+        for o in wrapper {
+            if !options.iter().any(|(own, _)| *own == o.key) {
+                options.push((o.key.clone(), o.value.clone()));
             }
         }
     }
@@ -366,7 +435,7 @@ fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declar
         "normalizes" => emit_validation(ValidationKind::Normalizes, args, out),
         "validates_associated" => emit_validation(ValidationKind::ValidatesAssociated, args, out),
         "validates_each" => emit_validation(ValidationKind::ValidatesEach, args, out),
-        n if validates_helper_kind(n).is_some() => emit_validates_helper(n, args, out),
+        n if validates_helper_kind(n).is_some() => emit_validates_helper(n, args, &[], out),
         "validates_with" => emit_validates_with(args, out),
 
         // ───── Callbacks (13 phases) ─────
@@ -602,53 +671,46 @@ const VALIDATES_DEFAULT_KEYS: &[&str] = &[
 /// and `validates` splits the shared keys off the same way. One `Validation`
 /// is emitted per attribute in the `validates` shape, so a consumer reads
 /// both spellings with one parser.
-fn emit_validates_helper(method: &str, args: &[Node], out: &mut Vec<Declaration>) {
+/// `inherited` is the combined options of enclosing `with_options` blocks;
+/// they are merged into the helper's own options (its own keys winning)
+/// before the split into shared and validator-specific keys.
+fn emit_validates_helper(
+    method: &str,
+    args: &[Node],
+    inherited: &[Opt],
+    out: &mut Vec<Declaration>,
+) {
     let Some(validator) = validates_helper_kind(method) else {
         return;
     };
     // Promote only `:a, :b, { k: v }` shapes: leading symbols, then at most
-    // one literal hash of plain pairs. Anything else (`**opts`, a variable
-    // `opts`, a method call) may carry `if:`, `on:` or `allow_nil:`, so the
-    // option set is unknown and the helper stays a `DslCall` with its args.
+    // one literal hash with literal keys. Anything else (`**opts`, a variable
+    // `opts`, a method call, `{ key => true }`) may carry `if:`, `on:` or
+    // `allow_nil:`, so the option set is unknown and the helper stays a
+    // `DslCall` with its args.
     let rest = &args[args.iter().take_while(|a| sym_string(a).is_some()).count()..];
-    let pairs: &[Node] = match rest {
-        [] => &[],
-        [only] => hash_pairs_of(only).unwrap_or(&[]),
-        _ => &[],
-    };
-    // Keys must be literal too: `{ key => true }` may be `allow_nil`.
-    let resolved = match rest {
-        [] => true,
-        [only] => hash_pairs_of(only).is_some()
-            && pairs.iter().all(
-                |n| matches!(n, Node::Pair(p) if matches!(&*p.key, Node::Sym(_) | Node::Str(_))),
-            ),
-        _ => false,
-    };
-    if !resolved {
+    let Some(own) = literal_options(rest) else {
         out.push(Declaration::DslCall(DslCall {
             name: method.to_string(),
             args: format_args(args),
         }));
         return;
-    }
-    let (shared, own): (Vec<&Node>, Vec<&Node>) = pairs
+    };
+    let merged = merge_opts(&own, inherited);
+    let (shared, specific): (Vec<&Opt>, Vec<&Opt>) = merged
         .iter()
-        .filter(|n| matches!(n, Node::Pair(_)))
-        .partition(|n| {
-            matches!(n, Node::Pair(p) if VALIDATES_DEFAULT_KEYS.contains(&pair_key(&p.key).as_str()))
-        });
-    let validator_value = if own.is_empty() {
+        .partition(|o| VALIDATES_DEFAULT_KEYS.contains(&o.key.as_str()));
+    let validator_value = if specific.is_empty() {
         "true".to_string()
     } else {
-        let own: Vec<Node> = own.into_iter().cloned().collect();
-        format_pairs_inline(&own)
+        let parts: Vec<String> = specific
+            .iter()
+            .map(|o| format!("{}: {}", o.key_src, o.value))
+            .collect();
+        format!("{{{}}}", parts.join(", "))
     };
     let mut options = vec![(validator.to_string(), validator_value)];
-    options.extend(shared.into_iter().filter_map(|n| match n {
-        Node::Pair(p) => Some((pair_key(&p.key), render_node(&p.value))),
-        _ => None,
-    }));
+    options.extend(shared.into_iter().map(|o| (o.key.clone(), o.value.clone())));
     let targets: Vec<String> = args.iter().map_while(sym_string).collect();
     if targets.is_empty() {
         out.push(Declaration::Validation(Validation {

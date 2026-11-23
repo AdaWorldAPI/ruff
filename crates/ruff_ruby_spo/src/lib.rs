@@ -1958,6 +1958,41 @@ end
     }
 
     #[test]
+    fn grouped_helper_options_match_the_direct_call() {
+        let validations = |src: &str| -> Vec<(String, Vec<(String, String)>)> {
+            extract_from_source(src)[0]
+                .declarations
+                .iter()
+                .filter_map(|d| match d {
+                    Declaration::Validation(v) => Some((v.target.clone(), v.options.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let direct = validations("class M\n  validates_length_of :name, maximum: 80\nend\n");
+        let grouped = validations(
+            "class M\n  with_options maximum: 80 do\n    validates_length_of :name\n  end\nend\n",
+        );
+        assert_eq!(
+            direct,
+            [("name".to_string(), pairs(&[("length", "{:maximum: 80}")]))]
+        );
+        assert_eq!(grouped, direct);
+        // Nested blocks combine, the inner block winning a shared key, and the
+        // helper's own key winning over both.
+        let nested = validations(
+            "class M\n  with_options if: :a?, maximum: 9 do\n    with_options maximum: 5 do\n      validates_length_of :name, minimum: 2\n    end\n  end\nend\n",
+        );
+        assert_eq!(
+            nested,
+            [(
+                "name".to_string(),
+                pairs(&[("length", "{:minimum: 2, :maximum: 5}"), ("if", ":a?")])
+            )]
+        );
+    }
+
+    #[test]
     fn unresolved_with_options_makes_nothing_in_its_body_unconditional() {
         let classes = extract_from_source(
             "class M\n  with_options opts do\n    validates_presence_of :name\n    validates :code, presence: true\n    before_save :stamp\n    has_many :items\n  end\nend\n",
