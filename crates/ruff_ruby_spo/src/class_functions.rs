@@ -500,6 +500,33 @@ end
         assert!(def.function.self_calls.is_empty());
     }
 
+    /// The block of `attribute :schedule_manually do … end` is already a
+    /// class function with its validator call. Its `if` modifier is read for
+    /// facts and flattened: the call and the condition's `receiver_reads` sit
+    /// side by side with no pairing. [`crate::extract_attribute_blocks`] keeps
+    /// the pairing.
+    #[test]
+    fn attribute_block_modifier_is_flattened() {
+        let body = "class CreateContract < BaseContract
+  attribute :schedule_manually do
+    validate_has_predecessors_or_children if model.schedule_automatically?
+  end
+end
+";
+        let (classes, report) = scan("modifier", body, &["model"]);
+        let class = only_class(&classes);
+        let block = by_name(class, "attribute:schedule_manually:block");
+        assert_eq!(report.blocks_found, 1);
+        assert_eq!(
+            names(&block.function.self_calls),
+            ["validate_has_predecessors_or_children"]
+        );
+        assert_eq!(
+            names(&block.function.receiver_reads),
+            ["schedule_automatically?"]
+        );
+    }
+
     /// Without `model` as a receiver, `model.leaf?` is a call on whatever the
     /// bare call `model` returns: `model` is a `self_calls` entry and `leaf?`,
     /// a send to a non-self receiver, is not recorded at all.
