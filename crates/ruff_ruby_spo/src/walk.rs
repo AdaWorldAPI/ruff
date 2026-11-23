@@ -255,7 +255,7 @@ fn literal_options(args: &[Node]) -> Option<Vec<(String, String)>> {
 }
 
 /// Apply a `with_options` wrapper's options to the declarations of its body,
-/// as ActiveSupport's `OptionMerger` does: each call receives the wrapper's
+/// as `ActiveSupport`'s `OptionMerger` does: each call receives the wrapper's
 /// options, and a key the call sets itself wins.
 ///
 /// When the wrapper's options are not statically known (`None`), they may
