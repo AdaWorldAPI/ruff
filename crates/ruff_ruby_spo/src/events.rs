@@ -4421,6 +4421,30 @@ end");
     }
 
     #[test]
+    fn a_reflective_validates_helper_in_with_options_is_split_like_a_direct_one() {
+        let src = |stmt: &str| {
+            format!(
+                "module H\n  extend ActiveSupport::Concern\n  included do\n    if outer\n      after_save :k\n      with_options maximum: 80 do\n        {stmt}\n      end\n    end\n  end\nend\n"
+            )
+        };
+        let render = |s: &str| {
+            let (cs, _) = ore(s);
+            let u = &by_name(&cs, "H").unharvested;
+            assert_eq!(u.len(), 1);
+            assert!(u[0].hidden_complete());
+            u[0].hidden
+                .iter()
+                .map(|e| format!("{:?}", e.decl))
+                .filter(|d| d.contains("name"))
+                .collect::<Vec<_>>()
+        };
+        let direct = render(&src("validates_length_of :name"));
+        let reflective = render(&src("send(:validates_length_of, :name)"));
+        assert_eq!(direct.len(), 1, "{direct:?}");
+        assert_eq!(reflective, direct);
+    }
+
+    #[test]
     fn a_hook_conditional_reports_completeness_too() {
         let src = "module H\n  def self.included(base)\n    base.class_eval do\n      if flag?\n        has_many :a\n      end\n    end\n    if base.respond_to?(:x)\n      base.before_save :b\n      base.helper :c\n    end\n  end\nend\n";
         let (cs, _) = ore(src);

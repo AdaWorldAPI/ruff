@@ -384,11 +384,20 @@ impl WrapperOptions {
         let (Node::Send(s), Some(w)) = (stmt, &self.0) else {
             return None;
         };
-        if s.recv.is_some() || validates_helper_kind(&s.method_name).is_none() {
+        if s.recv.is_some() {
             return None;
         }
+        // A literal reflective call (`send(:validates_length_of, :name)`)
+        // names the helper it calls; resolve it before choosing the path.
+        let (name, args): (String, &[Node]) = match (s.method_name.as_str(), s.args.split_first()) {
+            ("send" | "public_send" | "__send__", Some((first, rest))) => {
+                (literal_method_name(first)?, rest)
+            }
+            (name, _) => (name.to_string(), &s.args),
+        };
+        validates_helper_kind(&name)?;
         let mut inner = Vec::new();
-        emit_validates_helper(&s.method_name, &s.args, w, &mut inner);
+        emit_validates_helper(&name, args, w, &mut inner);
         Some(inner)
     }
 
