@@ -1615,12 +1615,34 @@ fn record_unread(
 }
 
 fn unharvested_at(stmt: &Node, param: Option<&str>, origin: &DeclOrigin) -> Unharvested {
+    unharvested_in(stmt, param, Bare::OnClass, origin)
+}
+
+/// Whether a bare call (no receiver, or `self.`) runs on the class being
+/// read.
+///
+/// In a class body, an `included do` body or a `class_eval` block it does. In
+/// a method handed the class as a parameter, or one that registers on a class
+/// held in a local, it runs on whatever calls the method, so only calls on
+/// that parameter or local register on the class.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bare {
+    OnClass,
+    OnOtherReceiver,
+}
+
+fn unharvested_in(
+    stmt: &Node,
+    param: Option<&str>,
+    bare: Bare,
+    origin: &DeclOrigin,
+) -> Unharvested {
     let anchor = u32::try_from(stmt.expression().begin).unwrap_or(0);
-    let reason = unharvested_reason(stmt, param);
+    let reason = unharvested_reason(stmt, param, bare);
     let mut hidden = Vec::new();
     if reason == UnharvestedReason::ControlFlow {
         push_decls(
-            registering_declarations(stmt, param),
+            registering_declarations(stmt, param, bare),
             anchor,
             origin,
             &mut hidden,
@@ -1636,8 +1658,8 @@ fn unharvested_at(stmt: &Node, param: Option<&str>, origin: &DeclOrigin) -> Unha
 
 /// Classify a statement that produced no declaration. `param` is the hook
 /// parameter (`base`), or `None` inside `included do`, where macros are
-/// bare calls.
-fn unharvested_reason(stmt: &Node, param: Option<&str>) -> UnharvestedReason {
+/// bare calls. With [`Bare::OnOtherReceiver`] a bare call is not the class's.
+fn unharvested_reason(stmt: &Node, param: Option<&str>, bare: Bare) -> UnharvestedReason {
     let call = match stmt {
         Node::If(_)
         | Node::IfMod(_)
@@ -1651,7 +1673,7 @@ fn unharvested_reason(stmt: &Node, param: Option<&str>) -> UnharvestedReason {
         | Node::For(_)
         | Node::And(_)
         | Node::Or(_) => {
-            return if registering_declarations(stmt, param).is_empty() {
+            return if registering_declarations(stmt, param, bare).is_empty() {
                 UnharvestedReason::ControlFlowWithoutDeclaration
             } else {
                 UnharvestedReason::ControlFlow
@@ -1666,6 +1688,9 @@ fn unharvested_reason(stmt: &Node, param: Option<&str>) -> UnharvestedReason {
         _ => return UnharvestedReason::Other,
     };
     match call.recv.as_deref() {
+        None | Some(Node::Self_(_)) if bare == Bare::OnOtherReceiver => {
+            UnharvestedReason::CallOnOtherReceiver
+        }
         None => UnharvestedReason::UnrecognizedCall,
         Some(Node::Lvar(v)) if Some(v.name.as_str()) == param => {
             let dynamic = matches!(
@@ -1689,17 +1714,18 @@ fn unharvested_reason(stmt: &Node, param: Option<&str>) -> UnharvestedReason {
 /// a promoted registration. An unrecognised call, an attribute, a scope or an
 /// `extend` is not one: the same leniency an unrecognised statement gets.
 /// `param` is the hook parameter (`base`), `None` in a class or `included do`
-/// body. Every branch is read; none is evaluated.
-fn registering_declarations(node: &Node, param: Option<&str>) -> Vec<Declaration> {
+/// body. Every branch is read; none is evaluated. With
+/// [`Bare::OnOtherReceiver`] only calls on `param` count.
+fn registering_declarations(node: &Node, param: Option<&str>, bare: Bare) -> Vec<Declaration> {
     let mut out = Vec::new();
-    collect_registering(node, param, &mut out);
+    collect_registering(node, param, bare, &mut out);
     out
 }
 
-fn collect_registering(node: &Node, param: Option<&str>, out: &mut Vec<Declaration>) {
+fn collect_registering(node: &Node, param: Option<&str>, bare: Bare, out: &mut Vec<Declaration>) {
     let opt = |n: Option<&Node>, out: &mut Vec<Declaration>| {
         if let Some(n) = n {
-            collect_registering(n, param, out);
+            collect_registering(n, param, bare, out);
         }
     };
     match node {
@@ -1712,42 +1738,44 @@ fn collect_registering(node: &Node, param: Option<&str>, out: &mut Vec<Declarati
             opt(n.if_false.as_deref(), out);
         }
         Node::IfTernary(n) => {
-            collect_registering(&n.if_true, param, out);
-            collect_registering(&n.if_false, param, out);
+            collect_registering(&n.if_true, param, bare, out);
+            collect_registering(&n.if_false, param, bare, out);
         }
         Node::Case(n) => {
             for w in &n.when_bodies {
-                collect_registering(w, param, out);
+                collect_registering(w, param, bare, out);
             }
             opt(n.else_body.as_deref(), out);
         }
         Node::When(n) => opt(n.body.as_deref(), out),
         Node::While(n) => opt(n.body.as_deref(), out),
-        Node::WhilePost(n) => collect_registering(&n.body, param, out),
+        Node::WhilePost(n) => collect_registering(&n.body, param, bare, out),
         Node::Until(n) => opt(n.body.as_deref(), out),
-        Node::UntilPost(n) => collect_registering(&n.body, param, out),
+        Node::UntilPost(n) => collect_registering(&n.body, param, bare, out),
         Node::For(n) => opt(n.body.as_deref(), out),
         Node::And(n) => {
-            collect_registering(&n.lhs, param, out);
-            collect_registering(&n.rhs, param, out);
+            collect_registering(&n.lhs, param, bare, out);
+            collect_registering(&n.rhs, param, bare, out);
         }
         Node::Or(n) => {
-            collect_registering(&n.lhs, param, out);
-            collect_registering(&n.rhs, param, out);
+            collect_registering(&n.lhs, param, bare, out);
+            collect_registering(&n.rhs, param, bare, out);
         }
         Node::Begin(n) => {
             for st in &n.statements {
-                collect_registering(st, param, out);
+                collect_registering(st, param, bare, out);
             }
         }
         Node::KwBegin(n) => {
             for st in &n.statements {
-                collect_registering(st, param, out);
+                collect_registering(st, param, bare, out);
             }
         }
         leaf => {
             let mut found = Vec::new();
-            crate::walk::walk_class_body(leaf, None, &mut found);
+            if bare == Bare::OnClass {
+                crate::walk::walk_class_body(leaf, None, &mut found);
+            }
             if let Some(p) = param {
                 crate::walk::walk_hook_statement(p, leaf, None, &mut found);
             }
@@ -2403,7 +2431,9 @@ fn macro_statement(
     let at = anchor(stmt);
 
     if let Some(param) = class_param {
-        // `<param>.class_eval do ... end` and `<param>.<macro> ...`.
+        // `<param>.class_eval do ... end` and `<param>.<macro> ...`. A bare
+        // call, a bare `class_eval` or a bare `send` runs on whatever calls
+        // the method, not on the class held in `param`, so it is not read.
         if let Some(eval_body) = crate::walk::hook_eval_body(param, stmt) {
             include_time_into_src(
                 eval_body,
@@ -2421,6 +2451,20 @@ fn macro_statement(
             push_decls(decls, at, origin, &mut events);
             return flush(out, events, unread);
         }
+        // `Const.method(.., <param>, ..)`
+        if let Some(step) =
+            delegate_step(stmt, at, |a| matches!(a, Node::Lvar(v) if v.name == param))
+        {
+            out.steps.push(step);
+            return;
+        }
+        unread.push(unharvested_in(
+            stmt,
+            Some(param),
+            Bare::OnOtherReceiver,
+            origin,
+        ));
+        return flush(out, events, unread);
     }
     // `class_eval do ... end` / `self.class_eval do ... end`: the macro's own
     // class, so the block is a class body.
@@ -2437,25 +2481,16 @@ fn macro_statement(
         }
     }
     // `Const.method(.., self, ..)`
+    let is_class = |a: &Node| match a {
+        Node::Self_(_) => true,
+        Node::Lvar(v) => aliases.contains(&v.name),
+        _ => false,
+    };
+    if let Some(step) = delegate_step(stmt, at, is_class) {
+        out.steps.push(step);
+        return;
+    }
     if let Node::Send(s) = stmt {
-        if let Some(recv) = s.recv.as_deref() {
-            if matches!(recv, Node::Const(_)) {
-                let class_arg = s.args.iter().position(|a| match a {
-                    Node::Self_(_) => true,
-                    Node::Lvar(v) => aliases.contains(&v.name),
-                    _ => false,
-                });
-                if let (Some(class_arg), Some(receiver)) = (class_arg, const_name(recv)) {
-                    out.steps.push(MacroStep::Delegate {
-                        receiver,
-                        method: s.method_name.clone(),
-                        class_arg,
-                        anchor: at,
-                    });
-                    return;
-                }
-            }
-        }
         // `send :include, M` / `self.send(:include, M)`
         if matches!(s.recv.as_deref(), None | Some(Node::Self_(_)))
             && matches!(s.method_name.as_str(), "send" | "public_send" | "__send__")
@@ -2481,6 +2516,23 @@ fn macro_statement(
     record_unread(stmt, &decls, class_param, origin, &mut unread);
     push_decls(decls, at, origin, &mut events);
     flush(out, events, unread);
+}
+
+/// `Const.method(.., <the class>, ..)`: a delegation step, where `is_class`
+/// says which argument carries the class.
+fn delegate_step(stmt: &Node, at: u32, is_class: impl Fn(&Node) -> bool) -> Option<MacroStep> {
+    let Node::Send(s) = stmt else { return None };
+    let recv = s.recv.as_deref()?;
+    if !matches!(recv, Node::Const(_)) {
+        return None;
+    }
+    let class_arg = s.args.iter().position(is_class)?;
+    Some(MacroStep::Delegate {
+        receiver: const_name(recv)?,
+        method: s.method_name.clone(),
+        class_arg,
+        anchor: at,
+    })
 }
 
 /// [`include_time_into`] with the source text, so a `**splat` keeps its exact
@@ -4069,5 +4121,114 @@ end
             ["A", "B"]
         );
         assert!(macro_of_src(src, "missing", None).is_empty());
+    }
+
+    fn callback_targets(m: &MacroOre) -> Vec<String> {
+        m.declarations
+            .iter()
+            .filter_map(|e| match &e.decl {
+                Declaration::Callback(c) => Some(c.target.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A method handed the class, or registering through a local, reads only
+    /// the calls on that parameter or local: a bare call, a bare `class_eval`
+    /// and a bare `send` run on whatever calls the method.
+    const MIXED: &str = r#"
+module M
+  def self.define(target)
+    before_save :owner_callback
+    target.before_save :target_callback
+    class_eval do
+      after_save :owner_eval
+    end
+    send :include, OwnerModule
+    target.send(:include, TargetModule)
+    after_save :owner_conditional if flag?
+    target.after_save :target_conditional if flag?
+    Helper.call(self)
+    Helper.call(target)
+  end
+end
+"#;
+
+    #[test]
+    fn a_class_handed_in_registers_only_through_calls_on_it() {
+        use UnharvestedReason::ControlFlowWithoutDeclaration as Quiet;
+        use UnharvestedReason::{CallOnOtherReceiver as Other, ControlFlow as Hides};
+        let given = &macro_of_src(MIXED, "define", Some(0))[0];
+        assert_eq!(callback_targets(given), ["target_callback"]);
+        let concerns: Vec<&str> = given
+            .declarations
+            .iter()
+            .filter_map(|e| match &e.decl {
+                Declaration::Concern(c) => Some(c.module.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(concerns, ["TargetModule"]);
+        let unread: Vec<(UnharvestedReason, Vec<String>)> = given
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Unread(u) => Some((
+                    u.reason,
+                    u.hidden
+                        .iter()
+                        .filter_map(|e| match &e.decl {
+                            Declaration::Callback(c) => Some(c.target.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                (Other, vec![]),
+                (Other, vec![]),
+                (Other, vec![]),
+                (Quiet, vec![]),
+                (Hides, vec!["target_conditional".to_string()]),
+                (Other, vec![]),
+            ]
+        );
+        let delegates: Vec<usize> = given
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Delegate { class_arg, .. } => Some(*class_arg),
+                _ => None,
+            })
+            .collect();
+        // Only `Helper.call(target)` hands the class on.
+        assert_eq!(delegates.len(), 1);
+        // Through a local the same holds.
+        let local = &macro_ore_local_from("<m>", MIXED, "define", "target")[0];
+        assert_eq!(callback_targets(local), ["target_callback"]);
+    }
+
+    /// The silence twin: run on its own class, the same body reads every bare
+    /// call and none of the calls on the parameter.
+    #[test]
+    fn a_macro_on_its_own_class_still_reads_bare_calls() {
+        let itself = &macro_of_src(MIXED, "define", None)[0];
+        assert_eq!(callback_targets(itself), ["owner_callback", "owner_eval"]);
+        let concerns: Vec<&str> = itself
+            .declarations
+            .iter()
+            .filter_map(|e| match &e.decl {
+                Declaration::Concern(c) => Some(c.module.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(concerns, ["OwnerModule"]);
+        assert!(itself.steps.iter().any(|s| matches!(s,
+            MacroStep::Unread(u) if u.reason == UnharvestedReason::ControlFlow
+                && u.hidden.len() == 1)));
     }
 }
