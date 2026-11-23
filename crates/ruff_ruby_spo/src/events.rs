@@ -1446,6 +1446,13 @@ fn included_hook_arm(param: &str, body: &Node, origin: &DeclOrigin, out: &mut Ve
         single => vec![single],
     };
     for stmt in stmts {
+        // A `base.class_eval do ... end` body is walked statement by
+        // statement, so each macro inside is anchored at its own call, not
+        // at the wrapper. The origin keeps the hook's own line.
+        if let Some(eval_body) = crate::walk::hook_eval_body(param, stmt) {
+            rails_arm_into(eval_body, origin, out);
+            continue;
+        }
         let mut decls = Vec::new();
         crate::walk::walk_hook_statement(param, stmt, None, &mut decls);
         push_decls(decls, anchor(stmt), origin, out);
@@ -2736,6 +2743,11 @@ end");
         );
         assert!(matches!(&got[2].decl, Declaration::Association(a)
             if a.options.contains(&("dependent".to_string(), ":delete_all".to_string()))));
+        // Each macro inside `class_eval` is anchored at its own call.
+        let at = |needle: &str| u32::try_from(STORAGES_PATCH.find(needle).unwrap()).unwrap();
+        assert_eq!(got[2].anchor, at("has_many :file_links"));
+        assert_eq!(got[3].anchor, at("has_many :storages"));
+        assert_eq!(got[4].anchor, at("attr_accessor"));
     }
 
     #[test]
@@ -2756,6 +2768,20 @@ end");
         // Not invented: a call on a different receiver, an unrecognised
         // macro on the parameter, a conditional's body.
         assert_eq!(kinds, ["assoc:x", "cb:y", "Include:Other", "val:z"]);
+    }
+
+    #[test]
+    fn included_hook_keeps_promoted_registrations_and_drops_unknown_calls() {
+        let src = "module P\n  def self.included(base)\n    base.register_journal_formatter :custom\n    base.some_helper :nope\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let names: Vec<String> = hook_events(by_name(&cs, "P"))
+            .iter()
+            .filter_map(|e| match &e.decl {
+                Declaration::DslCall(c) => Some(c.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["register_journal_formatter"]);
     }
 
     #[test]

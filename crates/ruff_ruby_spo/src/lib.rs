@@ -1910,6 +1910,27 @@ end
     }
 
     #[test]
+    fn a_keyword_splat_stays_visible_and_unresolved() {
+        // `**opts` must not read as an empty hash or a complete option set.
+        let splat_only = dsl_args(
+            "class E\n  include_module \"X\", **opts\nend\n",
+            "include_module",
+        );
+        assert_eq!(splat_only, ["\"X\", {**<expr>}"]);
+        let empty = dsl_args(
+            "class E\n  include_module \"X\", {}\nend\n",
+            "include_module",
+        );
+        assert_eq!(empty, ["\"X\", {}"]);
+        assert_ne!(splat_only, empty);
+        let mixed = dsl_args(
+            "class E\n  include_module \"X\", into: \"Y\", **opts\nend\n",
+            "include_module",
+        );
+        assert_eq!(mixed, ["\"X\", {:into: \"Y\", **<expr>}"]);
+    }
+
+    #[test]
     fn validates_helper_emits_one_numericality_validation_per_attribute() {
         let classes = extract_from_source(
             "class M\n  validates_numericality_of :a, :b, allow_nil: true\nend\n",

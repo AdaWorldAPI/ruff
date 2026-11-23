@@ -59,18 +59,12 @@ pub(crate) fn walk_hook_statement(
     src: Option<&str>,
     out: &mut Vec<Declaration>,
 ) {
-    let on_param = |recv: &Option<Box<Node>>| matches!(recv.as_deref(), Some(Node::Lvar(v)) if v.name == param);
+    if let Some(body) = hook_eval_body(param, node) {
+        walk_class_body(body, src, out);
+        return;
+    }
     match node {
-        Node::Block(blk) => {
-            let Node::Send(s) = &*blk.call else { return };
-            if on_param(&s.recv)
-                && matches!(s.method_name.as_str(), "class_eval" | "class_exec")
-                && let Some(body) = blk.body.as_deref()
-            {
-                walk_class_body(body, src, out);
-            }
-        }
-        Node::Send(s) if on_param(&s.recv) => {
+        Node::Send(s) if is_on_param(&s.recv, param) => {
             let (name, args): (String, &[Node]) =
                 match (s.method_name.as_str(), s.args.split_first()) {
                     ("send" | "public_send" | "__send__", Some((first, rest))) => {
@@ -83,14 +77,54 @@ pub(crate) fn walk_hook_statement(
                 };
             let mut found = Vec::new();
             route_send(&name, args, src, &mut found);
-            out.extend(
-                found
-                    .into_iter()
-                    .filter(|d| !matches!(d, Declaration::DslCall(_))),
-            );
+            // Only the unknown-name fallback is dropped; an OpenProject
+            // registration that `route_send` promotes by name is kept.
+            out.extend(found.into_iter().filter(|d| match d {
+                Declaration::DslCall(c) => is_promoted_op_registration(&c.name),
+                _ => true,
+            }));
         }
         _ => {}
     }
+}
+
+/// Whether `recv` is the hook parameter itself (`base` in `base.has_many`).
+fn is_on_param(recv: &Option<Box<Node>>, param: &str) -> bool {
+    matches!(recv.as_deref(), Some(Node::Lvar(v)) if v.name == param)
+}
+
+/// The block body of `<param>.class_eval do ... end` (also `class_exec`
+/// and the brace form), or `None` for any other statement.
+///
+/// Callers that record source anchors walk this body statement by
+/// statement, so each macro inside keeps its own location.
+pub(crate) fn hook_eval_body<'a>(param: &str, node: &'a Node) -> Option<&'a Node> {
+    let Node::Block(blk) = node else { return None };
+    let Node::Send(s) = &*blk.call else {
+        return None;
+    };
+    if is_on_param(&s.recv, param) && matches!(s.method_name.as_str(), "class_eval" | "class_exec")
+    {
+        blk.body.as_deref()
+    } else {
+        None
+    }
+}
+
+/// OpenProject registration macros that `route_send` recognises by name
+/// and keeps as a `DslCall`, as opposed to the fallback that wraps any
+/// unrecognised name.
+fn is_promoted_op_registration(name: &str) -> bool {
+    matches!(
+        name,
+        "register_journal_formatter"
+            | "register_journal_formatted_fields"
+            | "register_query"
+            | "activity_provider_for"
+            | "deprecated_alias"
+            | "associated_to_ask_before_destruction"
+            | "has_details_table"
+    )
 }
 
 /// Process one class-body statement.
@@ -328,13 +362,7 @@ fn route_send(name: &str, args: &[Node], src: Option<&str>, out: &mut Vec<Declar
         n if n.starts_with("acts_as_") => emit_acts_as(n, args, out),
 
         // ───── OpenProject custom registrations: promoted ─────
-        "register_journal_formatter"
-        | "register_journal_formatted_fields"
-        | "register_query"
-        | "activity_provider_for"
-        | "deprecated_alias"
-        | "associated_to_ask_before_destruction"
-        | "has_details_table" => {
+        n if is_promoted_op_registration(n) => {
             out.push(Declaration::DslCall(DslCall {
                 name: name.to_string(),
                 args: format_args(args),
@@ -1077,10 +1105,18 @@ fn pair_key(key: &Node) -> String {
 fn format_pairs_inline(pairs: &[Node]) -> String {
     let mut parts = Vec::new();
     for pair_node in pairs {
-        let Node::Pair(p) = pair_node else { continue };
-        let key = render_node(&p.key);
-        let value = render_node(&p.value);
-        parts.push(format!("{key}: {value}"));
+        match pair_node {
+            Node::Pair(p) => {
+                let key = render_node(&p.key);
+                let value = render_node(&p.value);
+                parts.push(format!("{key}: {value}"));
+            }
+            // `**opts` contributes keys the source does not spell out. It is
+            // kept as `**<expr>` so the rendering never reads as the complete
+            // option set: `{}` is an empty hash, `{**<expr>}` is unknown.
+            Node::Kwsplat(k) => parts.push(format!("**{}", render_node(&k.value))),
+            other => parts.push(render_node(other)),
+        }
     }
     format!("{{{}}}", parts.join(", "))
 }
