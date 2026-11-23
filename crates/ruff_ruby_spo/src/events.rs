@@ -2169,6 +2169,354 @@ fn const_name(node: &Node) -> Option<String> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Macro bodies — what a class-level macro registers in the class that calls it
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One step of a macro body, in source order.
+#[derive(Debug, Clone)]
+pub enum MacroStep {
+    /// A declaration the body registers in the class that called the macro.
+    /// The index is into [`MacroOre::declarations`] (it is the event's `seq`).
+    Decl(u32),
+    /// `Some::Module.method(.., <the class>, ..)`: the body hands the class it
+    /// runs in to a method of another module, which registers on it. The class
+    /// is the receiver `self` (or a local assigned from it, `caller = self`)
+    /// passed as argument number `class_arg` (0-based). `receiver` is the
+    /// constant as written.
+    Delegate {
+        receiver: String,
+        method: String,
+        class_arg: usize,
+        anchor: u32,
+    },
+    /// A statement that produced no declaration. `reason` says why, with the
+    /// same meaning as for an `included do` body.
+    Unread(Unharvested),
+}
+
+/// A `def` read as a class-level macro: the ordered declarations it registers
+/// on the class that calls it (`acts_as_x`, `has_closure_tree`), or on the
+/// class it is handed.
+///
+/// What is read is what `include_time_into` reads for an `included do` body:
+/// bare macro calls, `<class>.<macro>` and `<class>.class_eval do ... end`
+/// where `<class>` is the parameter that carries the class, and
+/// `send :include, M`. Everything else is a [`MacroStep::Unread`] with its
+/// reason; nothing is guessed. Statements are not evaluated: a conditional is
+/// unread (`ControlFlow`), so a registration behind an `if` is never reported
+/// as unconditional.
+#[derive(Debug, Clone)]
+pub struct MacroOre {
+    /// The `class` / `module` whose body holds the `def`, fully qualified.
+    pub owner: String,
+    pub name: String,
+    /// `def self.name` rather than `def name`.
+    pub singleton: bool,
+    pub file: String,
+    /// 1-based line of the `def`.
+    pub line: u32,
+    /// The parameter names, in order (`options`, `caller_class`, ...).
+    pub params: Vec<String>,
+    /// The declarations, in order; `declarations[i].seq == i`.
+    pub declarations: Vec<RailsEvent>,
+    /// Declarations, delegations and unread statements, in source order.
+    pub steps: Vec<MacroStep>,
+}
+
+/// Which name carries the class a macro registers on.
+#[derive(Clone, Copy)]
+enum MacroClass<'a> {
+    /// The class the macro is called on: bare calls run on it.
+    Itself,
+    /// A method handed the class as its `k`-th parameter.
+    Arg(usize),
+    /// A local variable of the body that holds a class the body creates
+    /// (`hierarchy_class = Class.new(...)`).
+    Local(&'a str),
+}
+
+/// Every `def <def_name>` / `def self.<def_name>` in `src` read as a macro, in
+/// source order. `class_arg` is `None` for a macro called on the class itself
+/// (bare calls inside the body run on it), and `Some(k)` for a method handed
+/// the class as its `k`-th parameter (`<param>.class_eval do ... end`,
+/// `<param>.has_many ...`).
+#[must_use]
+pub fn macro_ore_from(
+    file: &str,
+    src: &str,
+    def_name: &str,
+    class_arg: Option<usize>,
+) -> Vec<MacroOre> {
+    let class = class_arg.map_or(MacroClass::Itself, MacroClass::Arg);
+    macro_ores(file, src, def_name, class)
+}
+
+/// [`macro_ore_from`] for a body that creates a class and registers on it
+/// through the local variable `local` (`local.class_eval do ... end`,
+/// `local.has_many ...`), as `closure_tree`'s `hierarchy_class_for_model` does.
+/// Bare calls in the body run on whatever calls the method, and are not the
+/// created class's.
+#[must_use]
+pub fn macro_ore_local_from(file: &str, src: &str, def_name: &str, local: &str) -> Vec<MacroOre> {
+    macro_ores(file, src, def_name, MacroClass::Local(local))
+}
+
+fn macro_ores(file: &str, src: &str, def_name: &str, class: MacroClass<'_>) -> Vec<MacroOre> {
+    let options = lib_ruby_parser::ParserOptions {
+        buffer_name: file.to_string(),
+        ..Default::default()
+    };
+    let parser = lib_ruby_parser::Parser::new(src.as_bytes().to_vec(), options);
+    let Some(ast) = parser.do_parse().ast else {
+        return Vec::new();
+    };
+    let mut defs = Vec::new();
+    find_defs(&ast, &[], def_name, &mut defs);
+    defs.into_iter()
+        .map(|(owner, node)| macro_of(file, src, &owner, &node, class))
+        .collect()
+}
+
+/// Every `def` named `name` directly in a class or module body, with the
+/// qualified name of that body.
+fn find_defs(node: &Node, ns: &[String], name: &str, out: &mut Vec<(String, Node)>) {
+    match node {
+        Node::Begin(b) => {
+            for stmt in &b.statements {
+                find_defs(stmt, ns, name, out);
+            }
+        }
+        Node::Module(m) => {
+            let mut nested = ns.to_vec();
+            nested.extend(const_name(&m.name));
+            if let Some(body) = m.body.as_deref() {
+                find_defs_in(body, &nested, name, out);
+            }
+        }
+        Node::Class(c) => {
+            let mut nested = ns.to_vec();
+            nested.extend(const_name(&c.name));
+            if let Some(body) = c.body.as_deref() {
+                find_defs_in(body, &nested, name, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The statements of one unit body: its own `def`s, then its nested units.
+fn find_defs_in(body: &Node, ns: &[String], name: &str, out: &mut Vec<(String, Node)>) {
+    let stmts: Vec<&Node> = match body {
+        Node::Begin(b) => b.statements.iter().collect(),
+        single => vec![single],
+    };
+    for stmt in stmts {
+        match stmt {
+            Node::Def(d) if d.name == name => out.push((ns.join("::"), stmt.clone())),
+            Node::Defs(d) if d.name == name && matches!(&*d.definee, Node::Self_(_)) => {
+                out.push((ns.join("::"), stmt.clone()));
+            }
+            // `private def x`: the def rides as an argument.
+            Node::Send(s) => {
+                for arg in &s.args {
+                    if matches!(arg, Node::Def(d) if d.name == name) {
+                        out.push((ns.join("::"), arg.clone()));
+                    }
+                }
+            }
+            Node::Module(_) | Node::Class(_) => find_defs(stmt, ns, name, out),
+            _ => {}
+        }
+    }
+}
+
+fn macro_of(file: &str, src: &str, owner: &str, def: &Node, class: MacroClass<'_>) -> MacroOre {
+    let (name, singleton, args, body) = match def {
+        Node::Def(d) => (d.name.clone(), false, d.args.as_deref(), d.body.as_deref()),
+        Node::Defs(d) => (d.name.clone(), true, d.args.as_deref(), d.body.as_deref()),
+        _ => (String::new(), false, None, None),
+    };
+    let params: Vec<String> = match args {
+        Some(Node::Args(a)) => a
+            .args
+            .iter()
+            .filter_map(|p| match p {
+                Node::Arg(x) => Some(x.name.clone()),
+                Node::Optarg(x) => Some(x.name.clone()),
+                Node::Kwarg(x) => Some(x.name.clone()),
+                Node::Kwoptarg(x) => Some(x.name.clone()),
+                Node::Restarg(x) => x.name.clone(),
+                Node::Kwrestarg(x) => x.name.clone(),
+                Node::Blockarg(x) => x.name.clone(),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let class_param: Option<&str> = match class {
+        MacroClass::Itself => None,
+        MacroClass::Arg(k) => params.get(k).map(String::as_str),
+        MacroClass::Local(name) => Some(name),
+    };
+    let line = line_at(src, anchor(def));
+    let origin = DeclOrigin::Included { line };
+    let mut out = MacroOre {
+        owner: owner.to_string(),
+        name,
+        singleton,
+        file: file.to_string(),
+        line,
+        params: params.clone(),
+        declarations: Vec::new(),
+        steps: Vec::new(),
+    };
+    let Some(body) = body else { return out };
+    let stmts: Vec<&Node> = match body {
+        Node::Begin(b) => b.statements.iter().collect(),
+        single => vec![single],
+    };
+    // Locals assigned from `self` (`caller_class = self`) name the class too.
+    let mut aliases: Vec<String> = Vec::new();
+    for stmt in stmts {
+        macro_statement(src, stmt, class_param, &mut aliases, &origin, &mut out);
+    }
+    out
+}
+
+fn macro_statement(
+    src: &str,
+    stmt: &Node,
+    class_param: Option<&str>,
+    aliases: &mut Vec<String>,
+    origin: &DeclOrigin,
+    out: &mut MacroOre,
+) {
+    // `caller = self`
+    if let Node::Lvasgn(a) = stmt {
+        if matches!(a.value.as_deref(), Some(Node::Self_(_))) {
+            aliases.push(a.name.clone());
+        }
+    }
+    let mut events: Vec<RailsEvent> = Vec::new();
+    let mut unread: Vec<Unharvested> = Vec::new();
+    let at = anchor(stmt);
+
+    if let Some(param) = class_param {
+        // `<param>.class_eval do ... end` and `<param>.<macro> ...`.
+        if let Some(eval_body) = crate::walk::hook_eval_body(param, stmt) {
+            include_time_into_src(
+                eval_body,
+                Some(src),
+                Some(param),
+                origin,
+                &mut events,
+                &mut unread,
+            );
+            return flush(out, events, unread);
+        }
+        let mut decls = Vec::new();
+        crate::walk::walk_hook_statement(param, stmt, Some(src), &mut decls);
+        if !decls.is_empty() {
+            push_decls(decls, at, origin, &mut events);
+            return flush(out, events, unread);
+        }
+    }
+    // `class_eval do ... end` / `self.class_eval do ... end`: the macro's own
+    // class, so the block is a class body.
+    if let Node::Block(blk) = stmt {
+        if let Node::Send(call) = &*blk.call {
+            if matches!(call.recv.as_deref(), None | Some(Node::Self_(_)))
+                && matches!(call.method_name.as_str(), "class_eval" | "class_exec")
+            {
+                if let Some(body) = blk.body.as_deref() {
+                    include_time_into_src(body, Some(src), None, origin, &mut events, &mut unread);
+                    return flush(out, events, unread);
+                }
+            }
+        }
+    }
+    // `Const.method(.., self, ..)`
+    if let Node::Send(s) = stmt {
+        if let Some(recv) = s.recv.as_deref() {
+            if matches!(recv, Node::Const(_)) {
+                let class_arg = s.args.iter().position(|a| match a {
+                    Node::Self_(_) => true,
+                    Node::Lvar(v) => aliases.contains(&v.name),
+                    _ => false,
+                });
+                if let (Some(class_arg), Some(receiver)) = (class_arg, const_name(recv)) {
+                    out.steps.push(MacroStep::Delegate {
+                        receiver,
+                        method: s.method_name.clone(),
+                        class_arg,
+                        anchor: at,
+                    });
+                    return;
+                }
+            }
+        }
+        // `send :include, M` / `self.send(:include, M)`
+        if matches!(s.recv.as_deref(), None | Some(Node::Self_(_)))
+            && matches!(s.method_name.as_str(), "send" | "public_send" | "__send__")
+        {
+            if let Some(Node::Sym(inner)) = s.args.first() {
+                let mut found = Vec::new();
+                crate::walk::route_send_public(
+                    &inner.name.to_string_lossy(),
+                    &s.args[1..],
+                    Some(src),
+                    &mut found,
+                );
+                if !found.is_empty() {
+                    push_decls(found, at, origin, &mut events);
+                    return flush(out, events, unread);
+                }
+            }
+        }
+    }
+    // A bare macro call or a grouping block, as in an `included do` body.
+    let mut decls = Vec::new();
+    crate::walk::walk_class_body(stmt, Some(src), &mut decls);
+    record_unread(stmt, &decls, class_param, origin, &mut unread);
+    push_decls(decls, at, origin, &mut events);
+    flush(out, events, unread);
+}
+
+/// [`include_time_into`] with the source text, so a `**splat` keeps its exact
+/// spelling.
+fn include_time_into_src(
+    body: &Node,
+    src: Option<&str>,
+    param: Option<&str>,
+    origin: &DeclOrigin,
+    out: &mut Vec<RailsEvent>,
+    unharvested: &mut Vec<Unharvested>,
+) {
+    let stmts: Vec<&Node> = match body {
+        Node::Begin(b) => b.statements.iter().collect(),
+        single => vec![single],
+    };
+    for stmt in stmts {
+        let mut decls = Vec::new();
+        crate::walk::walk_class_body(stmt, src, &mut decls);
+        record_unread(stmt, &decls, param, origin, unharvested);
+        push_decls(decls, anchor(stmt), origin, out);
+    }
+}
+
+/// Append one statement's events and unread statements to the macro, giving
+/// the events the next free `seq`s.
+fn flush(out: &mut MacroOre, events: Vec<RailsEvent>, unread: Vec<Unharvested>) {
+    for mut e in events {
+        let seq = u32::try_from(out.declarations.len()).unwrap_or(u32::MAX);
+        e.seq = seq;
+        out.declarations.push(e);
+        out.steps.push(MacroStep::Decl(seq));
+    }
+    out.steps.extend(unread.into_iter().map(MacroStep::Unread));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3213,5 +3561,513 @@ end");
             .collect();
         assert_eq!(hidden, ["assoc:a", "before_save:b"]);
         assert!(u[1].hidden.is_empty() && u[2].hidden.is_empty());
+    }
+
+    // ── macro bodies ────────────────────────────────────────────────────
+
+    fn macro_of_src(src: &str, name: &str, class_arg: Option<usize>) -> Vec<MacroOre> {
+        macro_ore_from("<macro>", src, name, class_arg)
+    }
+
+    fn decl_kinds(m: &MacroOre) -> Vec<RailsKind> {
+        m.steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Decl(i) => Some(m.declarations[*i as usize].kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The shape of `acts_as_attachable`: a macro on `ClassMethods` that
+    /// declares an association (its options a `**splat` of the call's own),
+    /// an attribute, and includes a module through `send :include`.
+    const ATTACHABLE: &str = r#"
+module Redmine::Acts::Attachable
+  module ClassMethods
+    def acts_as_attachable(options = {})
+      Redmine::Acts::Attachable.attachables.push(self)
+      class_attribute :attachable_options
+      attachments_order = options.delete(:order) || "created_at"
+      has_many :attachments, -> {
+        order(attachments_order)
+      }, **options.reverse_merge!(as: :container, dependent: :destroy)
+
+      attr_accessor :attachments_replacements
+      send :include, Redmine::Acts::Attachable::InstanceMethods
+    end
+  end
+end
+"#;
+
+    #[test]
+    fn a_macro_def_yields_its_declarations_in_order_with_the_splat_kept_verbatim() {
+        let ms = macro_of_src(ATTACHABLE, "acts_as_attachable", None);
+        assert_eq!(ms.len(), 1);
+        let m = &ms[0];
+        assert_eq!(m.owner, "Redmine::Acts::Attachable::ClassMethods");
+        assert_eq!(m.params, ["options"]);
+        assert!(!m.singleton);
+        assert_eq!(
+            decl_kinds(m),
+            [
+                RailsKind::Association,
+                RailsKind::Attribute,
+                RailsKind::Concern
+            ]
+        );
+        let Declaration::Association(a) = &m.declarations[0].decl else {
+            panic!("expected the association");
+        };
+        assert_eq!(a.name, "attachments");
+        assert_eq!(a.option_splats.len(), 1);
+        assert_eq!(
+            a.option_splats[0].source,
+            "**options.reverse_merge!(as: :container, dependent: :destroy)"
+        );
+        let Declaration::Concern(c) = &m.declarations[2].decl else {
+            panic!("expected the include");
+        };
+        assert_eq!(c.module, "Redmine::Acts::Attachable::InstanceMethods");
+        // seq is the index into `declarations`.
+        assert!(
+            m.declarations
+                .iter()
+                .enumerate()
+                .all(|(i, e)| e.seq as usize == i)
+        );
+    }
+
+    #[test]
+    fn statements_that_register_nothing_are_listed_unread() {
+        let ms = macro_of_src(ATTACHABLE, "acts_as_attachable", None);
+        let unread: Vec<UnharvestedReason> = ms[0]
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Unread(u) => Some(u.reason),
+                _ => None,
+            })
+            .collect();
+        // `Redmine::Acts::Attachable.attachables.push(self)` (other receiver),
+        // `class_attribute` (a scope marker) and the `attachments_order = ...`
+        // assignment. None is a declaration.
+        assert!(
+            unread.contains(&UnharvestedReason::CallOnOtherReceiver),
+            "{unread:?}"
+        );
+        assert!(unread.contains(&UnharvestedReason::Other), "{unread:?}");
+    }
+
+    /// A registration behind a conditional is never reported: it is unread
+    /// with `ControlFlow`, the reason that makes an order claim unknown.
+    #[test]
+    fn a_conditional_registration_is_unread_not_unconditional() {
+        let src = r#"
+module M
+  def acts_as_x(options = {})
+    if options[:comments]
+      has_many :comments
+    end
+    has_many :always
+    before_save :a unless options[:skip]
+  end
+end
+"#;
+        let m = &macro_of_src(src, "acts_as_x", None)[0];
+        let names: Vec<&str> = m
+            .declarations
+            .iter()
+            .filter_map(|e| match &e.decl {
+                Declaration::Association(a) => Some(a.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["always"]);
+        let flow = m
+            .steps
+            .iter()
+            .filter(
+                |s| matches!(s, MacroStep::Unread(u) if u.reason == UnharvestedReason::ControlFlow),
+            )
+            .count();
+        assert_eq!(flow, 2);
+    }
+
+    /// `def self.call(caller_class, ...)` registers on the class it is handed
+    /// (`caller_class.class_eval do ... end`): read only when the caller says
+    /// which argument carries the class.
+    const DEFINER: &str = r#"
+module ActiveRecord::Acts::List::CallbackDefiner
+  def self.call(caller_class, add_new_at)
+    caller_class.class_eval do
+      before_validation :check_top_position, unless: :act_as_list_no_update?
+      after_save :clear_scope_changed
+      before_create :avoid_collision, unless: :act_as_list_no_update?
+    end
+  end
+end
+"#;
+
+    #[test]
+    fn a_method_handed_the_class_registers_on_it_only_when_told_which_argument() {
+        let given = &macro_of_src(DEFINER, "call", Some(0))[0];
+        assert!(given.singleton);
+        assert_eq!(given.owner, "ActiveRecord::Acts::List::CallbackDefiner");
+        let targets: Vec<String> = given
+            .declarations
+            .iter()
+            .filter_map(|e| match &e.decl {
+                Declaration::Callback(c) => Some(format!("{}:{}", c.phase, c.target)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "before_validation:check_top_position",
+                "after_save:clear_scope_changed",
+                "before_create:avoid_collision"
+            ]
+        );
+        // The options ride along: the condition is kept.
+        let Declaration::Callback(first) = &given.declarations[0].decl else {
+            panic!("expected a callback");
+        };
+        assert!(first.options.iter().any(|(k, _)| k == "unless"));
+        // Without the class argument the block is a call on another receiver.
+        let blind = &macro_of_src(DEFINER, "call", None)[0];
+        assert!(blind.declarations.is_empty());
+        assert!(blind.steps.iter().any(|s| matches!(s,
+            MacroStep::Unread(u) if u.reason == UnharvestedReason::CallOnOtherReceiver)));
+        // A parameter that is not the class registers nothing.
+        let wrong = &macro_of_src(DEFINER, "call", Some(1))[0];
+        assert!(wrong.declarations.is_empty());
+    }
+
+    /// `acts_as_list` hands the class on: `caller_class = self`, then
+    /// `Definer.call(caller_class, ...)`. The delegation is a step with the
+    /// argument that carries the class; a call that does not pass the class
+    /// is not one.
+    #[test]
+    fn a_call_that_passes_the_class_on_is_a_delegate_step() {
+        let src = r#"
+module ActiveRecord::Acts::List
+  def acts_as_list(options = {})
+    caller_class = self
+    ActiveRecord::Acts::List::AuxMethodDefiner.call(caller_class)
+    ActiveRecord::Acts::List::CallbackDefiner.call(caller_class, :bottom)
+    Other::Thing.call(configuration)
+    include ActiveRecord::Acts::List::InstanceMethods
+  end
+end
+"#;
+        let m = &macro_of_src(src, "acts_as_list", None)[0];
+        let delegates: Vec<(&str, &str, usize)> = m
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Delegate {
+                    receiver,
+                    method,
+                    class_arg,
+                    ..
+                } => Some((receiver.as_str(), method.as_str(), *class_arg)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delegates,
+            [
+                ("ActiveRecord::Acts::List::AuxMethodDefiner", "call", 0),
+                ("ActiveRecord::Acts::List::CallbackDefiner", "call", 0),
+            ]
+        );
+        // The delegation and the include keep their source order.
+        let order: Vec<&str> = m
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Delegate { receiver, .. } => {
+                    Some(receiver.rsplit("::").next().unwrap_or(""))
+                }
+                MacroStep::Decl(_) => Some("include"),
+                MacroStep::Unread(_) => None,
+            })
+            .collect();
+        assert_eq!(order, ["AuxMethodDefiner", "CallbackDefiner", "include"]);
+    }
+
+    /// `acts_as_watchable` registers inside `class_eval do ... end`, called on
+    /// the macro's own class: the block is a class body, each statement keeps
+    /// its own place, and what it cannot read is listed.
+    #[test]
+    fn a_bare_class_eval_block_in_a_macro_is_a_class_body() {
+        let src = r#"
+module OpenProject::Acts::Watchable
+  module ClassMethods
+    def acts_as_watchable(options = {})
+      return if included_modules.include?(InstanceMethods)
+      class_eval do
+        prepend InstanceMethods
+        has_many :watchers, as: :watchable, dependent: :delete_all, validate: false
+        has_many :watcher_users, through: :watchers, source: :user, validate: false
+        scope :watched_by, ->(user_id) { includes(:watchers) }
+        class_attribute :acts_as_watchable_options
+        self.acts_as_watchable_options = options
+      end
+      Registry.add(self)
+    end
+  end
+end
+"#;
+        let m = &macro_of_src(src, "acts_as_watchable", None)[0];
+        assert_eq!(
+            decl_kinds(m),
+            [
+                RailsKind::Concern,
+                RailsKind::Association,
+                RailsKind::Association,
+                RailsKind::Scope
+            ]
+        );
+        // The `return if ...` guard is a conditional that holds no declaration:
+        // unread, and not one that hides a registration.
+        assert!(m.steps.iter().any(|s| matches!(s,
+            MacroStep::Unread(u) if u.reason == UnharvestedReason::ControlFlowWithoutDeclaration)));
+        // `self.foo.class_eval` is the same; a block on another receiver is not.
+        let on_self = "module M
+ def m
+  self.class_eval do
+   has_many :a
+  end
+ end
+end
+";
+        assert_eq!(macro_of_src(on_self, "m", None)[0].declarations.len(), 1);
+        let other = "module M
+ def m
+  Other.class_eval do
+   has_many :a
+  end
+ end
+end
+";
+        assert!(macro_of_src(other, "m", None)[0].declarations.is_empty());
+    }
+
+    fn flow_reasons(src: &str, name: &str, class_arg: Option<usize>) -> Vec<UnharvestedReason> {
+        macro_of_src(src, name, class_arg)[0]
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Unread(u)
+                    if matches!(
+                        u.reason,
+                        UnharvestedReason::ControlFlow
+                            | UnharvestedReason::ControlFlowWithoutDeclaration
+                    ) =>
+                {
+                    Some(u.reason)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A conditional hides a registration only when a branch holds a
+    /// declaration that can register a callback. Both directions, and every
+    /// conditional form, so the split cannot silently become "always" or
+    /// "never".
+    #[test]
+    fn a_conditional_hides_a_registration_only_when_a_branch_declares_one() {
+        use UnharvestedReason::{ControlFlow as Hides, ControlFlowWithoutDeclaration as Quiet};
+        let src = r#"
+module M
+  def quiet(options = {})
+    return if done?
+    if options[:on]
+      opts[:on] = options[:on]
+    end
+    case kind
+    when :a then tweak(1)
+    else tweak(2)
+    end
+    attr_accessor :x if flag?
+    scope :s, -> { all } if flag?
+    extend Helpers if flag?
+    while more?
+      advance
+    end
+  end
+
+  def loud(options = {})
+    has_many :a if flag?
+    if flag?
+      validates :b, presence: true
+    else
+      before_save :c
+    end
+    case kind
+    when :a then include Mixin
+    end
+    until done?
+      belongs_to :d
+    end
+    flag? && after_save(:e)
+    acts_as_thing if flag?
+    has_closure_tree if flag?
+  end
+end
+"#;
+        assert_eq!(flow_reasons(src, "quiet", None), [Quiet; 7]);
+        assert_eq!(flow_reasons(src, "loud", None), [Hides; 7]);
+        // The hook-parameter form: `base.has_many` inside a branch declares,
+        // `base.helper` does not.
+        let hook = r#"
+module H
+  def self.hook(base)
+    base.class_eval do
+      has_many :seen
+    end
+    if flag?
+      base.has_many :a
+    end
+    if flag?
+      base.helper
+    end
+  end
+end
+"#;
+        assert_eq!(flow_reasons(hook, "hook", Some(0)), [Hides, Quiet]);
+    }
+
+    /// A conditional that may hide a registration lists the declarations its
+    /// branches write, every branch read and none evaluated; one that hides
+    /// nothing, and every other reason, lists none.
+    #[test]
+    fn a_hiding_conditional_names_what_its_branches_would_register() {
+        let src = r#"
+module M
+  def m(options = {})
+    if flag?
+      has_many :a, autosave: true
+      tweak(1)
+    else
+      before_save :b
+    end
+    return if done?
+  end
+end
+"#;
+        let m = &macro_of_src(src, "m", None)[0];
+        let unread: Vec<&Unharvested> = m
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                MacroStep::Unread(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unread.len(), 2, "{unread:?}");
+        assert_eq!(unread[0].reason, UnharvestedReason::ControlFlow);
+        let hidden: Vec<String> = unread[0]
+            .hidden
+            .iter()
+            .map(|e| match &e.decl {
+                Declaration::Association(a) => format!("assoc:{}", a.name),
+                Declaration::Callback(c) => format!("{}:{}", c.phase, c.target),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(hidden, ["assoc:a", "before_save:b"]);
+        // The hidden association keeps its options, so its generated callbacks
+        // can be derived like any other's.
+        let Declaration::Association(a) = &unread[0].hidden[0].decl else {
+            panic!("expected the association");
+        };
+        assert!(
+            a.options
+                .iter()
+                .any(|(k, v)| k == "autosave" && v == "true")
+        );
+        assert_eq!(
+            unread[1].reason,
+            UnharvestedReason::ControlFlowWithoutDeclaration
+        );
+        assert!(unread[1].hidden.is_empty());
+    }
+
+    /// `closure_tree`'s `hierarchy_class_for_model` builds a class and registers
+    /// on it through a local: `hierarchy_class.class_eval do ... end`.
+    const HIERARCHY: &str = r#"
+module ClosureTree
+  class Support
+    def hierarchy_class_for_model
+      parent_class = model_class.module_parent
+      hierarchy_class = parent_class.const_set(short_hierarchy_class_name, Class.new(abstract_base_class))
+      model_class_name = model_class.to_s
+      hierarchy_class.class_eval do
+        self.implicit_order_column = 'ancestor_id'
+        belongs_to :ancestor, class_name: model_class_name
+        belongs_to :descendant, class_name: model_class_name
+        def hash; end
+      end
+      hierarchy_class.table_name = hierarchy_table_name
+      hierarchy_class
+    end
+  end
+end
+"#;
+
+    #[test]
+    fn a_body_that_creates_a_class_registers_on_it_through_its_local() {
+        let ms = macro_ore_local_from(
+            "<m>",
+            HIERARCHY,
+            "hierarchy_class_for_model",
+            "hierarchy_class",
+        );
+        assert_eq!(ms.len(), 1);
+        let names: Vec<&str> = ms[0]
+            .declarations
+            .iter()
+            .filter_map(|e| match &e.decl {
+                Declaration::Association(a) => Some(a.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["ancestor", "descendant"]);
+        assert_eq!(ms[0].owner, "ClosureTree::Support");
+        // Its options are read like any association's.
+        let Declaration::Association(a) = &ms[0].declarations[0].decl else {
+            panic!("expected the association");
+        };
+        assert!(a.options.iter().any(|(k, _)| k == "class_name"));
+        // Run for the caller's own class, the block is a call on another
+        // receiver and registers nothing; a different local is not it either.
+        let itself = macro_of_src(HIERARCHY, "hierarchy_class_for_model", None);
+        assert!(itself[0].declarations.is_empty());
+        let other = macro_ore_local_from("<m>", HIERARCHY, "hierarchy_class_for_model", "other");
+        assert!(other[0].declarations.is_empty());
+    }
+
+    #[test]
+    fn only_the_named_def_is_a_macro_and_the_same_name_twice_is_two() {
+        let src = r#"
+module A
+  def other; has_many :nope; end
+  def acts_as_y; has_many :one; end
+end
+module B
+  def acts_as_y; has_many :two; end
+end
+"#;
+        let ms = macro_of_src(src, "acts_as_y", None);
+        assert_eq!(
+            ms.iter().map(|m| m.owner.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert!(macro_of_src(src, "missing", None).is_empty());
     }
 }

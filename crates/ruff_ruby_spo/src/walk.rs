@@ -128,6 +128,23 @@ pub(crate) fn is_promoted_op_registration(name: &str) -> bool {
     )
 }
 
+/// [`route_send`] for a call another module made on a macro's behalf
+/// (`send :include, M`): the recognised declarations only. The unknown-name
+/// fallback is dropped, as for a call on a hook parameter.
+pub(crate) fn route_send_public(
+    name: &str,
+    args: &[Node],
+    src: Option<&str>,
+    out: &mut Vec<Declaration>,
+) {
+    let mut found = Vec::new();
+    route_send(name, args, src, &mut found);
+    out.extend(found.into_iter().filter(|d| match d {
+        Declaration::DslCall(c) => is_promoted_op_registration(&c.name),
+        _ => true,
+    }));
+}
+
 /// Process one class-body statement.
 fn walk_statement(node: &Node, src: Option<&str>, out: &mut Vec<Declaration>) {
     match node {
