@@ -55,6 +55,8 @@ use std::path::{Path, PathBuf};
 use lib_ruby_parser::nodes::{Block, Def as DefNode, Send as SendNode};
 use lib_ruby_parser::{Node, Parser, ParserOptions};
 
+use crate::contract_permissions::{ContractEvent, SrcRef, record_statement};
+
 /// Deepest chain of inlined `def`s; a fifth nested call is unlowered.
 const MAX_INLINE_DEPTH: usize = 4;
 /// Longest source snippet quoted in an unlowered reason.
@@ -171,13 +173,13 @@ pub fn extract_contract_guards_with_report(root: &Path) -> (Vec<ContractGuard>, 
     (guards, report)
 }
 
-struct Parsed {
-    rel: String,
-    src: String,
-    ast: Option<Node>,
+pub(crate) struct Parsed {
+    pub(crate) rel: String,
+    pub(crate) src: String,
+    pub(crate) ast: Option<Node>,
 }
 
-fn collect_rb(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn collect_rb(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -191,7 +193,7 @@ fn collect_rb(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn parse(root: &Path, path: &Path) -> Parsed {
+pub(crate) fn parse(root: &Path, path: &Path) -> Parsed {
     let rel = path
         .strip_prefix(root)
         .unwrap_or(path)
@@ -224,15 +226,15 @@ struct DefRef<'a> {
 }
 
 /// One `include A, B` / `prepend A, B` call as written.
-struct Mixin {
-    prepend: bool,
+pub(crate) struct Mixin {
+    pub(crate) prepend: bool,
     /// Lexical nesting the call was written in.
-    ns: Vec<String>,
-    names: Vec<MixinArg>,
+    pub(crate) ns: Vec<String>,
+    pub(crate) names: Vec<MixinArg>,
 }
 
 /// One argument of an `include` / `prepend` call.
-enum MixinArg {
+pub(crate) enum MixinArg {
     /// A constant path such as `A::B`.
     Const(String),
     /// Anything else (`Object.const_get(:M)`, `*mods`, a local variable): the
@@ -242,15 +244,20 @@ enum MixinArg {
 }
 
 /// A scanned class or module.
-struct ClassEntry<'a> {
+pub(crate) struct ClassEntry<'a> {
     /// Superclass as written, with the module nesting it was written in.
-    superclass: Option<(Vec<String>, String)>,
+    pub(crate) superclass: Option<(Vec<String>, String)>,
     defs: HashMap<String, DefRef<'a>>,
     /// In declaration order.
-    mixins: Vec<Mixin>,
+    pub(crate) mixins: Vec<Mixin>,
     /// Modules carry predicates but their `attribute` calls are not guards of
     /// a contract, so they are not counted.
-    is_module: bool,
+    pub(crate) is_module: bool,
+    /// Contract-permission declarations in body order, for
+    /// [`crate::contract_permissions`]. Guard lowering never reads them.
+    pub(crate) events: Vec<ContractEvent>,
+    /// Body of the module's `included do … end` block (`ActiveSupport::Concern`).
+    pub(crate) included_events: Vec<ContractEvent>,
 }
 
 impl ClassEntry<'_> {
@@ -260,6 +267,8 @@ impl ClassEntry<'_> {
             defs: HashMap::new(),
             mixins: Vec::new(),
             is_module,
+            events: Vec::new(),
+            included_events: Vec::new(),
         }
     }
 }
@@ -275,8 +284,8 @@ struct Pending<'a> {
 }
 
 #[derive(Default)]
-struct Scan<'a> {
-    classes: HashMap<String, ClassEntry<'a>>,
+pub(crate) struct Scan<'a> {
+    pub(crate) classes: HashMap<String, ClassEntry<'a>>,
     pending: Vec<Pending<'a>>,
     attribute_calls: usize,
 }
@@ -286,7 +295,7 @@ impl<'a> Scan<'a> {
     /// lexical nesting, innermost last: one fully qualified name per enclosing
     /// `module` / `class` keyword (Ruby's `Module.nesting`), so `class A::B` at
     /// top level contributes the single scope `A::B`, never `A`.
-    fn walk(&mut self, file: usize, src: &str, node: &'a Node, ns: &[String]) {
+    pub(crate) fn walk(&mut self, file: usize, src: &str, node: &'a Node, ns: &[String]) {
         match node {
             Node::Begin(b) => {
                 for stmt in &b.statements {
@@ -355,6 +364,9 @@ impl<'a> Scan<'a> {
     }
 
     fn statement(&mut self, file: usize, src: &str, class: &str, ns: &[String], stmt: &'a Node) {
+        if let Some(entry) = self.classes.get_mut(class) {
+            record_statement(entry, file, src, class, stmt);
+        }
         match stmt {
             Node::Def(def) => self.add_def(file, class, def),
             Node::Class(_) | Node::Module(_) => self.walk(file, src, stmt, ns),
@@ -385,6 +397,16 @@ impl<'a> Scan<'a> {
                             ns: ns.to_vec(),
                             names,
                         });
+                        if send.method_name == "include" {
+                            entry.events.push(ContractEvent::Include {
+                                mixin: entry.mixins.len() - 1,
+                                at: SrcRef {
+                                    file,
+                                    scope: class.to_string(),
+                                    line: line_of(src, send.expression_l.begin),
+                                },
+                            });
+                        }
                     }
                 } else if send.method_name == "attribute" && !self.is_module(class) {
                     self.attribute_call(file, src, class, send);
@@ -468,7 +490,7 @@ fn note_unresolved(order: &mut Vec<Ancestor>, what: String) {
     }
 }
 
-fn line_of(src: &str, offset: usize) -> usize {
+pub(crate) fn line_of(src: &str, offset: usize) -> usize {
     1 + src
         .as_bytes()
         .iter()
@@ -479,7 +501,7 @@ fn line_of(src: &str, offset: usize) -> usize {
 
 /// `A::B` for a constant path made only of constants (a leading `::` is
 /// dropped; see [`is_absolute`]).
-fn const_path(node: &Node) -> Option<String> {
+pub(crate) fn const_path(node: &Node) -> Option<String> {
     let Node::Const(c) = node else {
         return None;
     };
@@ -524,9 +546,9 @@ struct Frame {
     bindings: HashMap<String, GuardExpr>,
 }
 
-struct Lowerer<'a> {
-    files: &'a [Parsed],
-    classes: &'a HashMap<String, ClassEntry<'a>>,
+pub(crate) struct Lowerer<'a> {
+    pub(crate) files: &'a [Parsed],
+    pub(crate) classes: &'a HashMap<String, ClassEntry<'a>>,
 }
 
 impl Lowerer<'_> {
@@ -817,7 +839,7 @@ impl Lowerer<'_> {
 
     /// Resolve a constant name against the lexical nesting it was written in
     /// (one qualified name per enclosing scope), innermost scope first.
-    fn resolve(&self, ns: &[String], sup: &str) -> Option<String> {
+    pub(crate) fn resolve(&self, ns: &[String], sup: &str) -> Option<String> {
         (0..=ns.len()).rev().find_map(|depth| {
             let candidate = if depth == 0 {
                 sup.to_string()
@@ -841,15 +863,20 @@ impl Lowerer<'_> {
     }
 }
 
-/// Source text of `node`, whitespace-flattened and cut to [`SNIPPET_MAX_CHARS`].
-fn snippet_of(src: &str, node: &Node) -> String {
+/// Source text of `node`, whitespace-flattened, not cut.
+pub(crate) fn flat_source(src: &str, node: &Node) -> String {
     let loc = node.expression();
     let raw = src
         .as_bytes()
         .get(loc.begin..loc.end)
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
-    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Source text of `node`, whitespace-flattened and cut to [`SNIPPET_MAX_CHARS`].
+fn snippet_of(src: &str, node: &Node) -> String {
+    let flat = flat_source(src, node);
     if flat.chars().count() > SNIPPET_MAX_CHARS {
         let head: String = flat.chars().take(SNIPPET_MAX_CHARS).collect();
         format!("{head}…")
