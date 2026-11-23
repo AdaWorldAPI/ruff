@@ -472,6 +472,42 @@ pub enum DeclOrigin {
     Included { line: u32 },
 }
 
+/// A statement in an include-time body that produced no declaration.
+///
+/// The include-time bodies are `included do ... end` and
+/// `def self.included(base)`, including its `base.class_eval` body. A
+/// consumer that sees declarations from such a body must not assume the
+/// body was read in full: every statement that yielded nothing is listed
+/// here, so "read one association" and "read the whole hook" stay distinct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unharvested {
+    /// Byte offset of the statement.
+    pub anchor: u32,
+    /// The include-time body it sits in.
+    pub origin: DeclOrigin,
+    pub reason: UnharvestedReason,
+}
+
+/// Why an include-time statement produced no declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnharvestedReason {
+    /// `if` / `unless` / `case` / a loop, or a modifier form. Its branches
+    /// may declare macros, and none of them were read.
+    ControlFlow,
+    /// A `def` or `def self.x`.
+    MethodDefinition,
+    /// A call on a receiver other than the hook parameter (`other.has_many`,
+    /// `Foo.register`).
+    CallOnOtherReceiver,
+    /// A call whose name the walker does not recognise as a declaration
+    /// (`base.some_helper`, a bare `private`).
+    UnrecognizedCall,
+    /// `base.send(expr, ...)` whose method name is not a literal symbol.
+    DynamicSend,
+    /// Any other statement shape.
+    Other,
+}
+
 /// Whether a [`ClassOre`] came from a `class` or a `module` body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OreKind {
@@ -537,6 +573,10 @@ pub struct ClassOre {
     /// the class node; [`class_ore`] receives only the body, so it always
     /// leaves this `None`.
     pub superclass: Option<String>,
+    /// Include-time statements that produced no declaration, in source
+    /// order. Empty for a class, and for a module whose include-time bodies
+    /// were read in full.
+    pub unharvested: Vec<Unharvested>,
 }
 
 /// The canonical identity table — the ONLY place dedup happens.
@@ -1440,7 +1480,13 @@ fn included_hook(stmt: &Node) -> Option<(String, &Node)> {
 
 /// The declarations of a `def self.included(base)` body, in source order.
 /// See [`crate::walk::walk_hook_statement`] for the shapes that count.
-fn included_hook_arm(param: &str, body: &Node, origin: &DeclOrigin, out: &mut Vec<RailsEvent>) {
+fn included_hook_arm(
+    param: &str,
+    body: &Node,
+    origin: &DeclOrigin,
+    out: &mut Vec<RailsEvent>,
+    unharvested: &mut Vec<Unharvested>,
+) {
     let stmts: Vec<&Node> = match body {
         Node::Begin(b) => b.statements.iter().collect(),
         single => vec![single],
@@ -1450,12 +1496,88 @@ fn included_hook_arm(param: &str, body: &Node, origin: &DeclOrigin, out: &mut Ve
         // statement, so each macro inside is anchored at its own call, not
         // at the wrapper. The origin keeps the hook's own line.
         if let Some(eval_body) = crate::walk::hook_eval_body(param, stmt) {
-            rails_arm_into(eval_body, origin, out);
+            include_time_into(eval_body, Some(param), origin, out, unharvested);
             continue;
         }
         let mut decls = Vec::new();
         crate::walk::walk_hook_statement(param, stmt, None, &mut decls);
+        if decls.is_empty() {
+            unharvested.push(unharvested_at(stmt, Some(param), origin));
+        }
         push_decls(decls, anchor(stmt), origin, out);
+    }
+}
+
+/// [`rails_arm_into`] for an include-time body: each statement that yields
+/// no declaration is recorded in `unharvested`.
+fn include_time_into(
+    body: &Node,
+    param: Option<&str>,
+    origin: &DeclOrigin,
+    out: &mut Vec<RailsEvent>,
+    unharvested: &mut Vec<Unharvested>,
+) {
+    let stmts: Vec<&Node> = match body {
+        Node::Begin(b) => b.statements.iter().collect(),
+        single => vec![single],
+    };
+    for stmt in stmts {
+        let mut decls = Vec::new();
+        crate::walk::walk_class_body(stmt, None, &mut decls);
+        if decls.is_empty() {
+            unharvested.push(unharvested_at(stmt, param, origin));
+        }
+        push_decls(decls, anchor(stmt), origin, out);
+    }
+}
+
+fn unharvested_at(stmt: &Node, param: Option<&str>, origin: &DeclOrigin) -> Unharvested {
+    Unharvested {
+        anchor: u32::try_from(stmt.expression().begin).unwrap_or(0),
+        origin: origin.clone(),
+        reason: unharvested_reason(stmt, param),
+    }
+}
+
+/// Classify a statement that produced no declaration. `param` is the hook
+/// parameter (`base`), or `None` inside `included do`, where macros are
+/// bare calls.
+fn unharvested_reason(stmt: &Node, param: Option<&str>) -> UnharvestedReason {
+    let call = match stmt {
+        Node::If(_)
+        | Node::IfMod(_)
+        | Node::IfTernary(_)
+        | Node::Case(_)
+        | Node::CaseMatch(_)
+        | Node::While(_)
+        | Node::WhilePost(_)
+        | Node::Until(_)
+        | Node::UntilPost(_)
+        | Node::For(_)
+        | Node::And(_)
+        | Node::Or(_) => return UnharvestedReason::ControlFlow,
+        Node::Def(_) | Node::Defs(_) => return UnharvestedReason::MethodDefinition,
+        Node::Send(s) => s,
+        Node::Block(b) => match &*b.call {
+            Node::Send(s) => s,
+            _ => return UnharvestedReason::Other,
+        },
+        _ => return UnharvestedReason::Other,
+    };
+    match call.recv.as_deref() {
+        None => UnharvestedReason::UnrecognizedCall,
+        Some(Node::Lvar(v)) if Some(v.name.as_str()) == param => {
+            let dynamic = matches!(
+                call.method_name.as_str(),
+                "send" | "public_send" | "__send__"
+            ) && !matches!(call.args.first(), Some(Node::Sym(_)));
+            if dynamic {
+                UnharvestedReason::DynamicSend
+            } else {
+                UnharvestedReason::UnrecognizedCall
+            }
+        }
+        Some(_) => UnharvestedReason::CallOnOtherReceiver,
     }
 }
 
@@ -1481,8 +1603,9 @@ fn line_at(src: &str, offset: u32) -> u32 {
 
 /// The module arm: body declarations in source order, with each direct
 /// `included do ... end` body walked right after its `Concern` marker.
-fn module_rails_arm(body: &Node, src: &str) -> Vec<RailsEvent> {
+fn module_rails_arm(body: &Node, src: &str) -> (Vec<RailsEvent>, Vec<Unharvested>) {
     let mut out = Vec::new();
+    let mut unharvested = Vec::new();
     let stmts: Vec<&Node> = match body {
         Node::Begin(b) => b.statements.iter().collect(),
         single => vec![single],
@@ -1493,16 +1616,16 @@ fn module_rails_arm(body: &Node, src: &str) -> Vec<RailsEvent> {
             let origin = DeclOrigin::Included {
                 line: line_at(src, anchor(stmt)),
             };
-            rails_arm_into(inner, &origin, &mut out);
+            include_time_into(inner, None, &origin, &mut out, &mut unharvested);
         }
         if let Some((param, inner)) = included_hook(stmt) {
             let origin = DeclOrigin::Included {
                 line: line_at(src, u32::try_from(stmt.expression().begin).unwrap_or(0)),
             };
-            included_hook_arm(&param, inner, &origin, &mut out);
+            included_hook_arm(&param, inner, &origin, &mut out, &mut unharvested);
         }
     }
-    out
+    (out, unharvested)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1567,7 +1690,8 @@ pub fn class_ore(iri: &str, name: &str, body: &Node, syms: &mut Symbols) -> Clas
 /// (`has_many`, `before_save`, `include`, `extend`, ...) are declarations,
 /// using the hook's actual parameter name. Nothing else in the hook is read:
 /// conditionals, `def`s, other receivers, and unrecognised `base.foo` calls
-/// are not guessed. `class_methods do` bodies
+/// are not guessed, and each such statement is listed in
+/// [`ClassOre::unharvested`] with its reason. `class_methods do` bodies
 /// are NOT walked (their declarations apply to the singleton, a documented
 /// gap); the `Declaration::Concern` markers are kept.
 #[must_use]
@@ -1579,8 +1703,10 @@ pub fn module_ore(
     file: &str,
     syms: &mut Symbols,
 ) -> ClassOre {
-    let declarations = module_rails_arm(body, src);
-    ore_with(iri, name, body, syms, declarations, OreKind::Module, file)
+    let (declarations, unharvested) = module_rails_arm(body, src);
+    let mut ore = ore_with(iri, name, body, syms, declarations, OreKind::Module, file);
+    ore.unharvested = unharvested;
+    ore
 }
 
 fn ore_with(
@@ -1692,6 +1818,7 @@ fn ore_with(
         file: file.to_string(),
         includes,
         superclass: None,
+        unharvested: Vec::new(),
     }
 }
 
@@ -1826,6 +1953,7 @@ fn empty_ore(
         file: file.to_string(),
         includes: Vec::new(),
         superclass,
+        unharvested: Vec::new(),
     }
 }
 
@@ -2768,6 +2896,60 @@ end");
         // Not invented: a call on a different receiver, an unrecognised
         // macro on the parameter, a conditional's body.
         assert_eq!(kinds, ["assoc:x", "cb:y", "Include:Other", "val:z"]);
+        // Conservation: the hook was only partly read, and every statement
+        // that yielded nothing is listed with its reason, in source order.
+        let p = by_name(&cs, "P");
+        let reasons: Vec<UnharvestedReason> = p.unharvested.iter().map(|u| u.reason).collect();
+        assert_eq!(
+            reasons,
+            [
+                UnharvestedReason::CallOnOtherReceiver, // base.has_many :not_mine
+                UnharvestedReason::UnrecognizedCall,    // receiver.some_helper
+                UnharvestedReason::UnrecognizedCall,    // receiver.instance_variable_set
+                UnharvestedReason::ControlFlow,         // if cond ... end
+                UnharvestedReason::CallOnOtherReceiver, // other.class_eval do ... end
+            ]
+        );
+        assert_eq!(
+            p.unharvested[3].anchor,
+            u32::try_from(src.find("if cond").unwrap()).unwrap()
+        );
+        assert!(
+            p.unharvested
+                .iter()
+                .all(|u| u.origin == DeclOrigin::Included { line: 2 })
+        );
+    }
+
+    #[test]
+    fn a_fully_read_hook_lists_nothing_unharvested() {
+        let (cs, _) = ore(STORAGES_PATCH);
+        assert!(!hook_events(by_name(&cs, "Patch")).is_empty());
+        assert_eq!(by_name(&cs, "Patch").unharvested, []);
+    }
+
+    #[test]
+    fn unread_statements_inside_class_eval_and_included_do_stay_listed() {
+        let src = "module Q\n  def self.included(base)\n    base.class_eval do\n      has_many :a\n      def helper; end\n      unless Rails.env.test?\n        has_many :b\n      end\n    end\n    base.send(name, :c)\n  end\nend\nmodule R\n  extend ActiveSupport::Concern\n  included do\n    belongs_to :d\n    after_save :e if enabled?\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let reasons = |n: &str| -> Vec<UnharvestedReason> {
+            by_name(&cs, n)
+                .unharvested
+                .iter()
+                .map(|u| u.reason)
+                .collect()
+        };
+        assert_eq!(
+            reasons("Q"),
+            [
+                UnharvestedReason::MethodDefinition,
+                UnharvestedReason::ControlFlow,
+                UnharvestedReason::DynamicSend,
+            ]
+        );
+        // The modifier `if` wraps the callback, so it is not read as one.
+        assert_eq!(reasons("R"), [UnharvestedReason::ControlFlow]);
+        assert_eq!(hook_events(by_name(&cs, "Q")).len(), 1);
     }
 
     #[test]
