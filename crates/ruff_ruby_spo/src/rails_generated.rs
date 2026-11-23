@@ -53,11 +53,21 @@
 //!
 //! `has_and_belongs_to_many` also registers the collection callbacks of an
 //! internal middle `has_many` first (`associations.rb:2020`), whose name is
-//! `[<class>.downcase.pluralize, <assoc>].sort.join("_")`
-//! (`builder/has_and_belongs_to_many.rb:59-61`). That needs `ActiveSupport`'s
-//! inflector, so the middle association's callbacks are [`Generated::Undecided`]
-//! and the visible `has_many` follows with `autosave:` and `validate:`
-//! forwarded as Rails does (`associations.rb:2038-2042`).
+//! `[<class>.downcase.pluralize, <assoc>].sort.join("_").gsub("::", "_")`
+//! (`builder/has_and_belongs_to_many.rb:59-61`). That needs the host class
+//! name and `ActiveSupport`'s inflector ([`crate::inflector`]). With the host
+//! given ([`derive_in`]) and the name pluralizable, the middle association is
+//! an ordinary collection (Rails passes it only `class_name:` and an optional
+//! `foreign_key:`, `has_and_belongs_to_many.rb:71-78`, so `validate?` holds)
+//! and its callbacks are derived like those of any `has_many`, under the
+//! middle name. Without a host ([`derive`]), or when the name cannot be
+//! pluralized, they are [`Generated::Undecided`]. The visible `has_many`
+//! follows with `autosave:` and `validate:` forwarded as Rails does
+//! (`associations.rb:2038-2042`).
+//!
+//! The host is the class the macro runs in: the class whose body holds the
+//! call, or the including class for a call in `included do` / a hook. The
+//! caller knows which; the declaration stream does not.
 //!
 //! # Undecided, never guessed
 //!
@@ -214,7 +224,21 @@ pub fn line_of(src: &str, anchor: u32) -> u32 {
 /// Derive the generated callbacks of a class body, in registration order.
 #[must_use]
 pub fn derive(events: &[RailsEvent], defaults: RailsDefaults) -> Vec<Generated> {
+    derive_in(None, events, defaults)
+}
+
+/// [`derive`] for a body whose macros run in the class `host` (its fully
+/// qualified name). The host decides the name of a
+/// `has_and_belongs_to_many` middle association; with `None` that rule stays
+/// [`Generated::Undecided`].
+#[must_use]
+pub fn derive_in(
+    host: Option<&str>,
+    events: &[RailsEvent],
+    defaults: RailsDefaults,
+) -> Vec<Generated> {
     let mut walk = Derive {
+        host: host.map(str::to_string),
         defaults,
         out: Vec::new(),
         validated: HashSet::new(),
@@ -277,6 +301,7 @@ fn not_literal(key: &str, value: &str) -> String {
 }
 
 struct Derive {
+    host: Option<String>,
     defaults: RailsDefaults,
     out: Vec<Generated>,
     /// Names whose `validate_associated_records_for_<name>` is defined
@@ -295,14 +320,36 @@ impl Derive {
                 self.association(event, decl, decl.kind);
             }
             AssocKind::HasAndBelongsToMany => {
-                self.undecided(
-                    event,
-                    &decl.name,
-                    format!("{ASSOCIATIONS}:2020"),
-                    "the internal middle has_many registers the collection callbacks first; \
-                     its name needs ActiveSupport pluralize of the class name"
-                        .to_string(),
-                );
+                match self.host.as_deref().map(|h| middle_name(h, &decl.name)) {
+                    Some(Some(middle)) => {
+                        // `has_many middle, class_name: ...` : no `validate:` or
+                        // `autosave:`, so it is a plain collection.
+                        let middle = AssocDecl {
+                            kind: AssocKind::HasMany,
+                            name: middle,
+                            options: Vec::new(),
+                            option_splats: Vec::new(),
+                        };
+                        self.association(event, &middle, AssocKind::HasMany);
+                    }
+                    Some(None) => self.undecided(
+                        event,
+                        &decl.name,
+                        format!("{ASSOCIATIONS}:2020"),
+                        "the internal middle has_many is named from the host class name, \
+                         which ActiveSupport's default plural rules cannot decide (not ASCII)"
+                            .to_string(),
+                    ),
+                    None => self.undecided(
+                        event,
+                        &decl.name,
+                        format!("{ASSOCIATIONS}:2020"),
+                        "the internal middle has_many registers the collection callbacks first; \
+                         its name needs ActiveSupport pluralize of the host class name, and no \
+                         host class was given"
+                            .to_string(),
+                    ),
+                }
                 // Only `autosave` and `validate` reach the visible has_many
                 // that matters here (`associations.rb:2038-2042`).
                 let forwarded: Vec<(String, String)> = decl
@@ -620,6 +667,17 @@ impl Derive {
     }
 }
 
+/// Name of the middle association of `has_and_belongs_to_many :<assoc>` in
+/// `host`: `[<host>.downcase.pluralize, <assoc>].sort.join("_")` with `::`
+/// turned into `_` (`builder/has_and_belongs_to_many.rb:59-61`). `None` when
+/// the host name cannot be pluralized by [`crate::inflector`].
+fn middle_name(host: &str, assoc: &str) -> Option<String> {
+    let plural = crate::inflector::pluralize(&host.to_ascii_lowercase())?;
+    let mut pair = [plural.as_str(), assoc];
+    pair.sort_unstable();
+    Some(pair.join("_").replace("::", "_"))
+}
+
 /// `reflection.validate?` (`reflection.rb:717-719`).
 fn validate_predicate(collection: bool, decl: &AssocDecl) -> Result<bool, String> {
     match option(decl, "validate")? {
@@ -752,6 +810,86 @@ mod tests {
         let got = lines(&run("has_and_belongs_to_many :roles, validate: false"));
         assert_eq!(got.len(), 4, "{got:?}");
         assert!(got.iter().all(|l| !l.contains("validate_associated")));
+    }
+
+    fn run_in(host: &str, body: &str) -> Vec<Generated> {
+        let src = format!("class M < ApplicationRecord\n{body}\nend\n");
+        let mut syms = Symbols::default();
+        let classes = source_ore(&src, "op", &mut syms);
+        derive_in(Some(host), &classes[0].declarations, ALL)
+    }
+
+    #[test]
+    fn habtm_with_its_host_derives_the_middle_association_then_the_visible_has_many() {
+        // `WorkPackage` -> `workpackages`; sorted with `changesets`.
+        let got = lines(&run_in(
+            "WorkPackage",
+            "has_and_belongs_to_many :changesets",
+        ));
+        let mut want = collection_set("changesets_workpackages");
+        want.extend(collection_set("changesets"));
+        assert_eq!(got, want);
+        // The middle association is what the callbacks are generated for.
+        let names: Vec<String> = run_in("WorkPackage", "has_and_belongs_to_many :changesets")
+            .iter()
+            .filter_map(|g| match g {
+                Generated::Callback(c) => Some(c.association.clone()),
+                Generated::Undecided(_) => None,
+            })
+            .collect();
+        assert_eq!(names[0], "changesets_workpackages");
+        assert_eq!(names[5], "changesets");
+    }
+
+    #[test]
+    fn the_middle_name_sorts_the_two_names_and_flattens_namespaces() {
+        // `roles` < `users`: the association sorts first.
+        assert_eq!(middle_name("User", "roles").as_deref(), Some("roles_users"));
+        // `users` < `workers`: the host's plural sorts first.
+        assert_eq!(
+            middle_name("User", "workers").as_deref(),
+            Some("users_workers")
+        );
+        // The host is downcased, not underscored; `::` becomes `_`.
+        assert_eq!(
+            middle_name("Admin::Account", "roles").as_deref(),
+            Some("admin_accounts_roles")
+        );
+        // An irregular plural: `Person` -> `people`.
+        assert_eq!(
+            middle_name("Person", "roles").as_deref(),
+            Some("people_roles")
+        );
+        // A host whose plural this table cannot decide is not guessed.
+        assert_eq!(middle_name("Caf\u{e9}", "roles"), None);
+    }
+
+    #[test]
+    fn habtm_is_undecided_without_a_host_or_with_one_that_cannot_be_pluralized() {
+        let got = lines(&run("has_and_belongs_to_many :roles"));
+        assert!(got[0].contains("no host class was given"), "{got:?}");
+        let got = lines(&run_in("Caf\u{e9}", "has_and_belongs_to_many :roles"));
+        assert!(got[0].contains("not ASCII"), "{got:?}");
+        // The visible has_many is derived either way.
+        assert_eq!(got[1..], collection_set("roles"));
+    }
+
+    #[test]
+    fn habtm_forwarded_validate_false_still_applies_to_the_visible_has_many_only() {
+        // The middle association never receives `validate:`, so its validation
+        // callback stays; the visible one is suppressed.
+        let got = lines(&run_in(
+            "WorkPackage",
+            "has_and_belongs_to_many :changesets, validate: false",
+        ));
+        assert!(
+            got.iter()
+                .any(|l| l.contains("validate_associated_records_for_changesets_workpackages"))
+        );
+        assert!(
+            !got.iter()
+                .any(|l| l.ends_with("validate_associated_records_for_changesets"))
+        );
     }
 
     #[test]

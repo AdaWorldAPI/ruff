@@ -41,6 +41,7 @@ mod class_macros;
 pub mod events;
 mod functions;
 mod guards;
+pub mod inflector;
 mod menu;
 mod menu_regions;
 mod navigation;
