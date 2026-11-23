@@ -38,6 +38,7 @@ mod actions;
 mod class_constants;
 mod class_functions;
 mod class_macros;
+mod contract_permissions;
 pub mod events;
 mod functions;
 mod guards;
@@ -65,6 +66,10 @@ pub use class_functions::{
     extract_class_functions,
 };
 pub use class_macros::{ClassMacroReport, ClassMacroRow, extract_class_macros};
+pub use contract_permissions::{
+    AliasDecl, ContractGap, ContractPermissions, DeclForm, DeclSource, DefaultPermissionDecl,
+    PermissionDecl, PermissionState, PermissionValue, extract_contract_permissions,
+};
 pub use guards::{
     ContractGuard, GuardExpr, GuardOutcome, GuardScanReport, extract_contract_guards,
     extract_contract_guards_with_report,
