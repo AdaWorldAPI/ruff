@@ -70,7 +70,8 @@ use lib_ruby_parser::nodes::Send as SendNode;
 use lib_ruby_parser::traverse::visitor::{Visitor, visit_send};
 
 use crate::guards::{
-    ClassEntry, Lowerer, MixinArg, Parsed, Scan, collect_rb, flat_source, line_of, parse,
+    ClassEntry, Lowerer, Mixin, MixinArg, Parsed, Scan, collect_rb, const_path, flat_source,
+    line_of, parse, snippet_of,
 };
 
 /// The name of the class `collect_ancestor_attributes` stops in front of.
@@ -204,10 +205,10 @@ impl ContractPermissions {
     pub fn lookup(&self, attribute: &str) -> PermissionState<'_> {
         let canonical = attribute.strip_suffix("_id").unwrap_or(attribute);
         let with_id = format!("{canonical}_id");
-        let found = self
-            .permissions
-            .get(canonical)
-            .or_else(|| self.permissions.get(&with_id));
+        let (found, via_id) = match self.permissions.get(canonical) {
+            Some(decl) => (Some(decl), false),
+            None => (self.permissions.get(&with_id), true),
+        };
         if let Some(decl) = found {
             if let PermissionValue::Unlowered {
                 reason,
@@ -216,6 +217,17 @@ impl ContractPermissions {
             {
                 return PermissionState::Unresolved {
                     reason: format!("{reason}: {source_text}"),
+                };
+            }
+            // Only the `_id` entry is known: an unreadable declaration of any
+            // position could supply the canonical entry, which is looked up
+            // first (base_contract.rb:251-255).
+            if via_id && let Some(gap) = self.gaps.first() {
+                return PermissionState::Unresolved {
+                    reason: format!(
+                        "an unreadable declaration may supply `{canonical}`, which takes precedence over `{with_id}`: {}",
+                        gap.reason
+                    ),
                 };
             }
             if let Some(gap) = self.gaps.iter().find(|g| g.order > decl.order) {
@@ -287,6 +299,12 @@ pub(crate) enum ContractEvent {
         mixin: usize,
         at: SrcRef,
     },
+    /// An `include` inside `included do … end`; `mixin` indexes
+    /// `ClassEntry::included_mixins`.
+    IncludeInIncluder {
+        mixin: usize,
+        at: SrcRef,
+    },
     Gap {
         reason: String,
         at: SrcRef,
@@ -309,6 +327,7 @@ pub(crate) fn record_statement(
     file: usize,
     src: &str,
     scope: &str,
+    ns: &[String],
     stmt: &Node,
 ) {
     let ctx = if entry.is_module {
@@ -328,10 +347,10 @@ pub(crate) fn record_statement(
         match block.body.as_deref() {
             Some(Node::Begin(b)) => {
                 for inner in &b.statements {
-                    classify(inner, file, src, scope, Ctx::IncludedBody, &mut out);
+                    included_statement(entry, file, src, scope, ns, inner, &mut out);
                 }
             }
-            Some(inner) => classify(inner, file, src, scope, Ctx::IncludedBody, &mut out),
+            Some(inner) => included_statement(entry, file, src, scope, ns, inner, &mut out),
             None => {}
         }
         entry.included_events.extend(out);
@@ -353,6 +372,52 @@ pub(crate) fn record_statement(
     entry.events.extend(out);
 }
 
+/// One statement of an `included do … end` block. An `include` there runs in
+/// the includer when the block runs, so it is expanded at that position.
+fn included_statement(
+    entry: &mut ClassEntry<'_>,
+    file: usize,
+    src: &str,
+    scope: &str,
+    ns: &[String],
+    stmt: &Node,
+    out: &mut Vec<ContractEvent>,
+) {
+    if let Node::Send(send) = stmt
+        && receiverless(send)
+        && send.method_name == "include"
+        && !send.args.is_empty()
+    {
+        let names = send
+            .args
+            .iter()
+            .map(|arg| match const_path(arg) {
+                Some(path) => MixinArg::Const(path),
+                None => MixinArg::Dynamic(format!(
+                    "dynamic `include` argument `{}`",
+                    snippet_of(src, arg)
+                )),
+            })
+            .collect();
+        entry.included_mixins.push(Mixin {
+            prepend: false,
+            ns: ns.to_vec(),
+            names,
+        });
+        out.push(ContractEvent::IncludeInIncluder {
+            mixin: entry.included_mixins.len() - 1,
+            at: src_ref(file, src, scope, stmt),
+        });
+        return;
+    }
+    classify(stmt, file, src, scope, Ctx::IncludedBody, out);
+}
+
+/// No receiver, or an explicit `self`: both call the class-level DSL method.
+fn receiverless(send: &SendNode) -> bool {
+    matches!(send.recv.as_deref(), None | Some(Node::Self_(_)))
+}
+
 fn src_ref(file: usize, src: &str, scope: &str, node: &Node) -> SrcRef {
     SrcRef {
         file,
@@ -371,16 +436,26 @@ fn classify(
 ) {
     match stmt {
         Node::Def(_) | Node::Class(_) | Node::Module(_) | Node::Defs(_) => {}
-        Node::Send(send) if send.recv.is_none() => {
+        Node::Send(send) if receiverless(send) => {
             if DSL.contains(&send.method_name.as_str()) {
                 dsl_call(send, stmt, file, src, scope, ctx, out);
             } else if !matches!(send.method_name.as_str(), "include" | "prepend") {
                 nested_gaps(&send.args, file, src, scope, out);
+            } else if send.recv.is_some() || ctx == Ctx::IncludedBody {
+                // The scan expands only a receiverless `include` of a class or
+                // module body (and of an `included` block, handled above).
+                out.push(ContractEvent::Gap {
+                    reason: format!(
+                        "`{}` written here is not expanded; the module may declare permissions",
+                        flat_source(src, stmt)
+                    ),
+                    at: src_ref(file, src, scope, stmt),
+                });
             }
         }
         Node::Block(block) => {
             if let Node::Send(send) = &*block.call
-                && send.recv.is_none()
+                && receiverless(send)
                 && DSL.contains(&send.method_name.as_str())
             {
                 dsl_call(send, stmt, file, src, scope, ctx, out);
@@ -423,7 +498,7 @@ struct DslFinder<'s> {
 
 impl Visitor for DslFinder<'_> {
     fn on_send(&mut self, node: &SendNode) {
-        if node.recv.is_none()
+        if receiverless(node)
             && DSL.contains(&node.method_name.as_str())
             && can_carry_permission(node)
         {
@@ -759,7 +834,7 @@ impl State<'_, '_> {
                 );
             }
             ContractEvent::Gap { reason, at } => self.gap(reason.clone(), at),
-            ContractEvent::Include { .. } => {}
+            ContractEvent::Include { .. } | ContractEvent::IncludeInIncluder { .. } => {}
         }
     }
 
@@ -772,22 +847,14 @@ impl State<'_, '_> {
             match event {
                 ContractEvent::Include { mixin, at } => {
                     let mut stack = Vec::new();
-                    self.include(entry, *mixin, at, class, &mut stack);
+                    self.include(&entry.mixins[*mixin], at, class, &mut stack);
                 }
                 other => self.apply(other, class),
             }
         }
     }
 
-    fn include(
-        &mut self,
-        owner: &ClassEntry<'_>,
-        mixin: usize,
-        at: &SrcRef,
-        applied_in: &str,
-        stack: &mut Vec<String>,
-    ) {
-        let mixin = &owner.mixins[mixin];
+    fn include(&mut self, mixin: &Mixin, at: &SrcRef, applied_in: &str, stack: &mut Vec<String>) {
         // Ruby includes the arguments of one call in reverse order.
         for arg in mixin.names.iter().rev() {
             match arg {
@@ -817,13 +884,18 @@ impl State<'_, '_> {
         for event in &entry.events {
             match event {
                 ContractEvent::Include { mixin, at } => {
-                    self.include(entry, *mixin, at, applied_in, stack);
+                    self.include(&entry.mixins[*mixin], at, applied_in, stack);
                 }
                 other => self.apply(other, applied_in),
             }
         }
         for event in &entry.included_events {
-            self.apply(event, applied_in);
+            match event {
+                ContractEvent::IncludeInIncluder { mixin, at } => {
+                    self.include(&entry.included_mixins[*mixin], at, applied_in, stack);
+                }
+                other => self.apply(other, applied_in),
+            }
         }
         stack.pop();
     }
@@ -1175,6 +1247,79 @@ mod tests {
         assert!(matches!(
             class(&all, "L").lookup("known"),
             PermissionState::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn an_id_entry_is_unresolved_when_any_gap_could_supply_the_canonical_entry() {
+        // The gap runs BEFORE the `_id` declaration, yet it could declare
+        // `:status`, which is looked up before `:status_id`.
+        let early = "class C < BaseContract\n  include Elsewhere::Unscanned\n  attribute :status_id, permission: :public\nend\n";
+        let all = scan("id_gap", &[("c.rb", early)]);
+        let c = class(&all, "C");
+        assert!(matches!(
+            c.lookup("status_id"),
+            PermissionState::Unresolved { .. }
+        ));
+        assert!(matches!(
+            c.lookup("status"),
+            PermissionState::Unresolved { .. }
+        ));
+        // An early gap does not shadow a canonical entry declared after it.
+        let canonical = "class C < BaseContract\n  include Elsewhere::Unscanned\n  attribute :status, permission: :public\nend\n";
+        let all = scan("canon_gap", &[("c.rb", canonical)]);
+        assert_eq!(
+            explicit(class(&all, "C"), "status_id").value,
+            any_of(&["public"])
+        );
+        // Without any gap the `_id` entry decides.
+        let clean = "class C < BaseContract\n  attribute :status_id, permission: :public\nend\n";
+        let all = scan("id_clean", &[("c.rb", clean)]);
+        assert_eq!(
+            explicit(class(&all, "C"), "status").value,
+            any_of(&["public"])
+        );
+    }
+
+    #[test]
+    fn an_include_inside_an_included_block_is_expanded_in_the_includer() {
+        let mods = "module Inner\n  extend ActiveSupport::Concern\n  included do\n    attribute :secret, permission: :admin\n  end\nend\nmodule Outer\n  extend ActiveSupport::Concern\n  included do\n    include Inner\n  end\nend\n";
+        let class_src = "class C < BaseContract\n  include Outer\nend\n";
+        let all = scan("nested_include", &[("m.rb", mods), ("c.rb", class_src)]);
+        let c = class(&all, "C");
+        let d = explicit(c, "secret");
+        assert_eq!(d.value, any_of(&["admin"]));
+        assert_eq!(d.source.scope, "Inner");
+        assert!(c.gaps.is_empty(), "{:?}", c.gaps);
+        // An unresolvable include there is a gap, never proven absence.
+        let unknown = "module Outer\n  extend ActiveSupport::Concern\n  included do\n    include Elsewhere::Unscanned\n  end\nend\nclass C < BaseContract\n  include Outer\nend\n";
+        let all = scan("nested_unknown", &[("m.rb", unknown)]);
+        assert!(matches!(
+            class(&all, "C").lookup("secret"),
+            PermissionState::Unresolved { .. }
+        ));
+    }
+
+    #[test]
+    fn an_explicit_self_receiver_declares_like_a_bare_call() {
+        let src = "class C < BaseContract\n  self.attribute :secret, permission: :admin\n  self.default_attribute_permission :edit\nend\n";
+        let all = scan("self_recv", &[("c.rb", src)]);
+        let c = class(&all, "C");
+        assert_eq!(explicit(c, "secret").value, any_of(&["admin"]));
+        assert!(matches!(c.lookup("other"), PermissionState::Default(_)));
+        // `self.include` is not expanded, so it is a gap.
+        let inc = "class C < BaseContract\n  self.include Elsewhere::Unscanned\nend\n";
+        let all = scan("self_include", &[("c.rb", inc)]);
+        assert!(matches!(
+            class(&all, "C").lookup("x"),
+            PermissionState::Unresolved { .. }
+        ));
+        // A receiver other than `self` is not the contract's DSL.
+        let other = "class C < BaseContract\n  Other.attribute :secret, permission: :admin\nend\n";
+        let all = scan("other_recv", &[("c.rb", other)]);
+        assert!(matches!(
+            class(&all, "C").lookup("secret"),
+            PermissionState::ProvenAbsent
         ));
     }
 

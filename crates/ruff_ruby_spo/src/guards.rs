@@ -258,6 +258,10 @@ pub(crate) struct ClassEntry<'a> {
     pub(crate) events: Vec<ContractEvent>,
     /// Body of the module's `included do … end` block (`ActiveSupport::Concern`).
     pub(crate) included_events: Vec<ContractEvent>,
+    /// `include` calls written inside that block. They run in the includer,
+    /// so they are kept apart from `mixins`, which guard lowering reads as the
+    /// module's own ancestors.
+    pub(crate) included_mixins: Vec<Mixin>,
 }
 
 impl ClassEntry<'_> {
@@ -269,6 +273,7 @@ impl ClassEntry<'_> {
             is_module,
             events: Vec::new(),
             included_events: Vec::new(),
+            included_mixins: Vec::new(),
         }
     }
 }
@@ -365,7 +370,7 @@ impl<'a> Scan<'a> {
 
     fn statement(&mut self, file: usize, src: &str, class: &str, ns: &[String], stmt: &'a Node) {
         if let Some(entry) = self.classes.get_mut(class) {
-            record_statement(entry, file, src, class, stmt);
+            record_statement(entry, file, src, class, ns, stmt);
         }
         match stmt {
             Node::Def(def) => self.add_def(file, class, def),
@@ -875,7 +880,7 @@ pub(crate) fn flat_source(src: &str, node: &Node) -> String {
 }
 
 /// Source text of `node`, whitespace-flattened and cut to [`SNIPPET_MAX_CHARS`].
-fn snippet_of(src: &str, node: &Node) -> String {
+pub(crate) fn snippet_of(src: &str, node: &Node) -> String {
     let flat = flat_source(src, node);
     if flat.chars().count() > SNIPPET_MAX_CHARS {
         let head: String = flat.chars().take(SNIPPET_MAX_CHARS).collect();
