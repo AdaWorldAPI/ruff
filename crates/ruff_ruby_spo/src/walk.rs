@@ -115,7 +115,7 @@ pub(crate) fn hook_eval_body<'a>(param: &str, node: &'a Node) -> Option<&'a Node
 /// `OpenProject` registration macros that `route_send` recognises by name
 /// and keeps as a `DslCall`, as opposed to the fallback that wraps any
 /// unrecognised name.
-fn is_promoted_op_registration(name: &str) -> bool {
+pub(crate) fn is_promoted_op_registration(name: &str) -> bool {
     matches!(
         name,
         "register_journal_formatter"
@@ -535,6 +535,16 @@ fn emit_validates_helper(method: &str, args: &[Node], out: &mut Vec<Declaration>
         return;
     };
     let pairs: &[Node] = args.iter().find_map(hash_pairs_of).unwrap_or_default();
+    // `**opts` may carry `if:`, `on:` or `allow_nil:`, so the helper cannot
+    // be promoted to a validation whose options look complete. It stays a
+    // `DslCall`, whose args keep the `**<expr>` marker.
+    if pairs.iter().any(|n| !matches!(n, Node::Pair(_))) {
+        out.push(Declaration::DslCall(DslCall {
+            name: method.to_string(),
+            args: format_args(args),
+        }));
+        return;
+    }
     let (shared, own): (Vec<&Node>, Vec<&Node>) = pairs
         .iter()
         .filter(|n| matches!(n, Node::Pair(_)))

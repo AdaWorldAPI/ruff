@@ -504,6 +504,9 @@ pub enum UnharvestedReason {
     UnrecognizedCall,
     /// `base.send(expr, ...)` whose method name is not a literal symbol.
     DynamicSend,
+    /// A block whose call was kept only as an unrecognised `DslCall`; its
+    /// body was not read (`foo do; has_many :x; end`).
+    UnreadBlockBody,
     /// Any other statement shape.
     Other,
 }
@@ -1524,10 +1527,57 @@ fn include_time_into(
     for stmt in stmts {
         let mut decls = Vec::new();
         crate::walk::walk_class_body(stmt, None, &mut decls);
-        if decls.is_empty() {
-            unharvested.push(unharvested_at(stmt, param, origin));
-        }
+        record_unread(stmt, &decls, param, origin, unharvested);
         push_decls(decls, anchor(stmt), origin, out);
+    }
+}
+
+/// Record what `stmt` left unread, given the declarations it yielded.
+///
+/// A statement with no declaration is unread. A `with_options` block yields
+/// its wrapper `DslCall` even when an inner statement is skipped, so its body
+/// is checked statement by statement. Any other block that yielded only an
+/// unrecognised `DslCall` had its body dropped.
+fn record_unread(
+    stmt: &Node,
+    decls: &[Declaration],
+    param: Option<&str>,
+    origin: &DeclOrigin,
+    unharvested: &mut Vec<Unharvested>,
+) {
+    if decls.is_empty() {
+        unharvested.push(unharvested_at(stmt, param, origin));
+        return;
+    }
+    let Node::Block(blk) = stmt else { return };
+    let Node::Send(call) = &*blk.call else { return };
+    if call.recv.is_some() {
+        return;
+    }
+    let Some(body) = blk.body.as_deref() else {
+        return;
+    };
+    if call.method_name == "with_options" {
+        let inner: Vec<&Node> = match body {
+            Node::Begin(b) => b.statements.iter().collect(),
+            single => vec![single],
+        };
+        for s in inner {
+            let mut d = Vec::new();
+            crate::walk::walk_class_body(s, None, &mut d);
+            record_unread(s, &d, param, origin, unharvested);
+        }
+        return;
+    }
+    let fallback_only = matches!(decls, [Declaration::DslCall(c)]
+        if c.name == call.method_name
+            && !crate::walk::is_promoted_op_registration(&c.name));
+    if fallback_only {
+        unharvested.push(Unharvested {
+            anchor: u32::try_from(stmt.expression().begin).unwrap_or(0),
+            origin: origin.clone(),
+            reason: UnharvestedReason::UnreadBlockBody,
+        });
     }
 }
 
@@ -2950,6 +3000,25 @@ end");
         // The modifier `if` wraps the callback, so it is not read as one.
         assert_eq!(reasons("R"), [UnharvestedReason::ControlFlow]);
         assert_eq!(hook_events(by_name(&cs, "Q")).len(), 1);
+    }
+
+    #[test]
+    fn unread_statements_inside_grouping_blocks_stay_listed() {
+        let src = "module G\n  extend ActiveSupport::Concern\n  included do\n    with_options dependent: :destroy do\n      has_many :a\n      after_save :x if enabled?\n    end\n    some_dsl do\n      has_many :hidden\n    end\n    with_options presence: true do\n      validates :b\n    end\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let g = by_name(&cs, "G");
+        let reasons: Vec<UnharvestedReason> = g.unharvested.iter().map(|u| u.reason).collect();
+        assert_eq!(
+            reasons,
+            [
+                UnharvestedReason::ControlFlow,
+                UnharvestedReason::UnreadBlockBody
+            ]
+        );
+        assert_eq!(
+            g.unharvested[0].anchor,
+            u32::try_from(src.find("after_save").unwrap()).unwrap()
+        );
     }
 
     #[test]

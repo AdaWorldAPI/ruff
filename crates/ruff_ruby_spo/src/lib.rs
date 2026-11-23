@@ -1910,6 +1910,26 @@ end
     }
 
     #[test]
+    fn a_validates_helper_with_a_splat_is_not_promoted() {
+        // `**opts` could hold `if:`, so no unconditional validation is made.
+        let classes =
+            extract_from_source("class M\n  validates_numericality_of :amount, **opts\nend\n");
+        let decls = &classes[0].declarations;
+        assert!(
+            !decls
+                .iter()
+                .any(|d| matches!(d, Declaration::Validation(_)))
+        );
+        assert_eq!(
+            dsl_args(
+                "class M\n  validates_numericality_of :amount, **opts\nend\n",
+                "validates_numericality_of"
+            ),
+            [":amount, {**<expr>}"]
+        );
+    }
+
+    #[test]
     fn a_keyword_splat_stays_visible_and_unresolved() {
         // `**opts` must not read as an empty hash or a complete option set.
         let splat_only = dsl_args(
