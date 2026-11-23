@@ -183,6 +183,12 @@ pub fn extract_attribute_blocks(
                     Node::Send(send) => (send, Some(blk.body.as_deref())),
                     _ => return,
                 },
+                // `attribute :a do validate_x(_1) end` parses as a numbered-
+                // parameter block; its body is the same kind of statement list.
+                Node::Numblock(blk) => match blk.call.as_ref() {
+                    Node::Send(send) => (send, Some(Some(blk.body.as_ref()))),
+                    _ => return,
+                },
                 _ => return,
             };
             if send.recv.is_some() || send.method_name != "attribute" {
@@ -300,7 +306,11 @@ impl Read<'_> {
     ) {
         let text = flat_source(self.src, cond);
         let lowered = self.lower(cond);
-        for (body, negate) in [(if_true, false), (if_false, true)] {
+        // Visit the bodies in source order: for `unless c; a; else; b; end`
+        // the parser stores `b` in `if_true` and `a` in `if_false`.
+        let mut bodies = [(if_true, false), (if_false, true)];
+        bodies.sort_by_key(|(body, _)| body.map_or(usize::MAX, |b| b.expression().begin));
+        for (body, negate) in bodies {
             if body.is_none() {
                 continue;
             }
@@ -598,5 +608,73 @@ end
         assert!(blocks.is_empty(), "{blocks:?}");
         assert_eq!(report.files_unparsed, 1);
         assert_eq!(report.files_scanned, 0);
+    }
+
+    #[test]
+    fn unless_else_keeps_source_order() {
+        let body = "class C < BaseContract\n  attribute :a do\n    unless model.ready?\n      validate_first\n    else\n      validate_second\n    end\n  end\nend\n";
+        let (blocks, _) = scan("unless_else", body);
+        let names: Vec<_> = blocks[0].calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["validate_first", "validate_second"]);
+        assert_eq!(
+            lowered(&blocks[0].calls[0]),
+            &GuardExpr::Not(Box::new(Fact("model.ready?".to_string())))
+        );
+        assert_eq!(
+            lowered(&blocks[0].calls[1]),
+            &Fact("model.ready?".to_string())
+        );
+    }
+
+    #[test]
+    fn numbered_parameter_blocks_are_read() {
+        let body = "class C < BaseContract\n  attribute :a do\n    validate_x(_1)\n  end\nend\n";
+        let (blocks, report) = scan("numblock", body);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert_eq!(blocks[0].attribute, "a");
+        assert_eq!(blocks[0].calls[0].name, "validate_x");
+        assert_eq!(report.blocks_found, 1);
+    }
+
+    #[test]
+    fn expression_level_conditions_lower_exactly() {
+        let f = |s: &str| Box::new(Fact(s.to_string()));
+        let cases: &[(&str, Result<GuardExpr, &str>)] = &[
+            (
+                "model.a? && model.b?",
+                Ok(GuardExpr::And(f("model.a?"), f("model.b?"))),
+            ),
+            (
+                "model.a? || user.admin?",
+                Ok(GuardExpr::Or(f("model.a?"), f("user.admin?"))),
+            ),
+            ("!model.a?", Ok(GuardExpr::Not(f("model.a?")))),
+            ("(model.a?)", Ok(Fact("model.a?".to_string()))),
+            ("true", Ok(GuardExpr::Const(true))),
+            (
+                "model.parent&.closed?",
+                Ok(Fact("model.parent&.closed?".to_string())),
+            ),
+            ("model.allowed?(:x)", Err("call with arguments")),
+            ("leaf?", Err("receiver-less call is not inlined")),
+        ];
+        for (cond, want) in cases {
+            let body = format!(
+                "class C < BaseContract\n  attribute :a do\n    check if {cond}\n  end\nend\n"
+            );
+            let (blocks, _) = scan("lower", &body);
+            let got = &blocks[0].calls[0]
+                .condition
+                .as_ref()
+                .expect("guarded")
+                .outcome;
+            match (want, got) {
+                (Ok(e), GuardOutcome::Lowered(g)) => assert_eq!(g, e, "{cond}"),
+                (Err(why), GuardOutcome::Unlowered { reason }) => {
+                    assert!(reason.contains(why), "{cond}: {reason}");
+                }
+                _ => panic!("{cond}: got {got:?}"),
+            }
+        }
     }
 }
