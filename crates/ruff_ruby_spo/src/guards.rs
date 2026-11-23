@@ -177,6 +177,9 @@ pub(crate) struct Parsed {
     pub(crate) rel: String,
     pub(crate) src: String,
     pub(crate) ast: Option<Node>,
+    /// The file could not be read, or the parser reported an error. Its AST,
+    /// if any, may be missing whole class bodies.
+    pub(crate) parse_failed: bool,
 }
 
 pub(crate) fn collect_rb(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -206,17 +209,25 @@ pub(crate) fn parse(root: &Path, path: &Path) -> Parsed {
             rel,
             src: String::new(),
             ast: None,
+            parse_failed: true,
         };
     };
     let options = ParserOptions {
         buffer_name: path.display().to_string(),
         ..Default::default()
     };
-    let ast = Parser::new(src.as_bytes().to_vec(), options)
-        .do_parse()
-        .ast
-        .map(|boxed| *boxed);
-    Parsed { rel, src, ast }
+    let result = Parser::new(src.as_bytes().to_vec(), options).do_parse();
+    let parse_failed = result
+        .diagnostics
+        .iter()
+        .any(lib_ruby_parser::Diagnostic::is_error);
+    let ast = result.ast.map(|boxed| *boxed);
+    Parsed {
+        rel,
+        src,
+        ast,
+        parse_failed,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -235,8 +246,9 @@ pub(crate) struct Mixin {
 
 /// One argument of an `include` / `prepend` call.
 pub(crate) enum MixinArg {
-    /// A constant path such as `A::B`.
-    Const(String),
+    /// A constant path such as `A::B`. `absolute` is true for `::A::B`, which
+    /// Ruby looks up from the top level, never through the lexical nesting.
+    Const { path: String, absolute: bool },
     /// Anything else (`Object.const_get(:M)`, `*mods`, a local variable): the
     /// module is only known at run time, so it may define anything. Holds a
     /// short source snippet for the report.
@@ -247,6 +259,15 @@ pub(crate) enum MixinArg {
 pub(crate) struct ClassEntry<'a> {
     /// Superclass as written, with the module nesting it was written in.
     pub(crate) superclass: Option<(Vec<String>, String)>,
+    /// A superclass expression that is not a constant path
+    /// (`class C < Object.const_get(:P)`), as source text. The class has a
+    /// superclass the scan cannot name, which is not the same as having none.
+    pub(crate) dynamic_superclass: Option<String>,
+    /// The module body calls `extend ActiveSupport::Concern`.
+    pub(crate) is_concern: bool,
+    /// Singleton methods the module defines that Ruby calls on `include`
+    /// (`self.included`, `self.append_features`), with where they are written.
+    pub(crate) include_hooks: Vec<(String, SrcRef)>,
     defs: HashMap<String, DefRef<'a>>,
     /// In declaration order.
     pub(crate) mixins: Vec<Mixin>,
@@ -268,6 +289,9 @@ impl ClassEntry<'_> {
     fn new(is_module: bool) -> Self {
         Self {
             superclass: None,
+            dynamic_superclass: None,
+            is_concern: false,
+            include_hooks: Vec::new(),
             defs: HashMap::new(),
             mixins: Vec::new(),
             is_module,
@@ -293,6 +317,9 @@ pub(crate) struct Scan<'a> {
     pub(crate) classes: HashMap<String, ClassEntry<'a>>,
     pending: Vec<Pending<'a>>,
     attribute_calls: usize,
+    /// Also record contract-permission events. Off for guard extraction,
+    /// which never reads them and would only pay for computing them.
+    pub(crate) record_permissions: bool,
 }
 
 impl<'a> Scan<'a> {
@@ -337,12 +364,20 @@ impl<'a> Scan<'a> {
                     };
                     Some((nesting, path))
                 });
+                let dynamic_superclass = c
+                    .superclass
+                    .as_deref()
+                    .filter(|sup| const_path(sup).is_none())
+                    .map(|sup| snippet_of(src, sup));
                 let entry = self
                     .classes
                     .entry(qualified.clone())
                     .or_insert_with(|| ClassEntry::new(false));
                 if entry.superclass.is_none() {
                     entry.superclass = superclass;
+                }
+                if entry.dynamic_superclass.is_none() {
+                    entry.dynamic_superclass = dynamic_superclass;
                 }
                 let mut nested = ns.to_vec();
                 nested.push(qualified.clone());
@@ -369,7 +404,9 @@ impl<'a> Scan<'a> {
     }
 
     fn statement(&mut self, file: usize, src: &str, class: &str, ns: &[String], stmt: &'a Node) {
-        if let Some(entry) = self.classes.get_mut(class) {
+        if self.record_permissions
+            && let Some(entry) = self.classes.get_mut(class)
+        {
             record_statement(entry, file, src, class, ns, stmt);
         }
         match stmt {
@@ -386,7 +423,10 @@ impl<'a> Scan<'a> {
                         .args
                         .iter()
                         .map(|arg| match const_path(arg) {
-                            Some(path) => MixinArg::Const(path),
+                            Some(path) => MixinArg::Const {
+                                path,
+                                absolute: is_absolute(arg),
+                            },
                             None => MixinArg::Dynamic(format!(
                                 "dynamic `{}` argument `{}`",
                                 send.method_name,
@@ -402,7 +442,7 @@ impl<'a> Scan<'a> {
                             ns: ns.to_vec(),
                             names,
                         });
-                        if send.method_name == "include" {
+                        if self.record_permissions && send.method_name == "include" {
                             entry.events.push(ContractEvent::Include {
                                 mixin: entry.mixins.len() - 1,
                                 at: SrcRef {
@@ -517,7 +557,7 @@ pub(crate) fn const_path(node: &Node) -> Option<String> {
 }
 
 /// True when the constant path is rooted at `::`.
-fn is_absolute(node: &Node) -> bool {
+pub(crate) fn is_absolute(node: &Node) -> bool {
     match node {
         Node::Const(c) => match c.scope.as_deref() {
             Some(Node::Cbase(_)) => true,
@@ -833,12 +873,25 @@ impl Lowerer<'_> {
     fn collect_mixin(&self, mixin: &Mixin, order: &mut Vec<Ancestor>, seen: &mut HashSet<String>) {
         for arg in &mixin.names {
             match arg {
-                MixinArg::Const(module) => match self.resolve(&mixin.ns, module) {
+                // Guard ancestry keeps its lexical lookup even for `::M`, so
+                // guard output does not change; contract permissions use
+                // `resolve_arg`.
+                MixinArg::Const { path: module, .. } => match self.resolve(&mixin.ns, module) {
                     Some(found) => self.collect_ancestors(&found, order, seen),
                     None => note_unresolved(order, format!("module `{module}`")),
                 },
                 MixinArg::Dynamic(what) => note_unresolved(order, what.clone()),
             }
+        }
+    }
+
+    /// Resolve one mixin argument: an absolute path (`::A`) skips the lexical
+    /// nesting and is looked up from the top level only.
+    pub(crate) fn resolve_arg(&self, ns: &[String], path: &str, absolute: bool) -> Option<String> {
+        if absolute {
+            self.resolve(&[], path)
+        } else {
+            self.resolve(ns, path)
         }
     }
 

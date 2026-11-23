@@ -62,7 +62,7 @@
 //!
 //! Reopened classes are merged in sorted file order, not Ruby's load order.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use lib_ruby_parser::Node;
@@ -71,11 +71,15 @@ use lib_ruby_parser::traverse::visitor::{Visitor, visit_send};
 
 use crate::guards::{
     ClassEntry, Lowerer, Mixin, MixinArg, Parsed, Scan, collect_rb, const_path, flat_source,
-    line_of, parse, snippet_of,
+    is_absolute, line_of, parse, snippet_of,
 };
 
 /// The name of the class `collect_ancestor_attributes` stops in front of.
 const ROOT_CONTRACT: &str = "BaseContract";
+
+/// The key `default_attribute_permission` writes (base_contract.rb:92-94).
+/// `attribute_permission :default_permission, …` writes the same key.
+const DEFAULT_KEY: &str = "default_permission";
 
 /// DSL calls this arm reads.
 const DSL: [&str; 4] = [
@@ -173,6 +177,12 @@ pub struct ContractPermissions {
     pub aliases: BTreeMap<String, AliasDecl>,
     /// Undeterminable contributions, in application order.
     pub gaps: Vec<ContractGap>,
+    /// Keys written both as a symbol and as a string somewhere in the chain.
+    /// `with_indifferent_access` (`base_contract.rb:184, 210`) then keeps the
+    /// value of whichever key comes last in the merged hash, which depends on
+    /// first-insertion positions, not on the last write; lookups of these
+    /// keys are unresolved.
+    pub mixed_spelling: BTreeSet<String>,
 }
 
 /// The four outcomes of [`ContractPermissions::lookup`], never collapsed.
@@ -205,8 +215,27 @@ impl ContractPermissions {
     pub fn lookup(&self, attribute: &str) -> PermissionState<'_> {
         let canonical = attribute.strip_suffix("_id").unwrap_or(attribute);
         let with_id = format!("{canonical}_id");
+        if self.mixed_spelling.contains(canonical) {
+            return mixed(canonical);
+        }
+        // The default lives under `:default_permission`, which a lookup of
+        // that very name finds first (base_contract.rb:253).
+        if canonical == DEFAULT_KEY
+            && let Some(default) = &self.default
+        {
+            if let Some(gap) = self.gaps.iter().find(|g| g.order > default.order) {
+                return PermissionState::Unresolved {
+                    reason: format!(
+                        "a later unreadable declaration may override: {}",
+                        gap.reason
+                    ),
+                };
+            }
+            return default_state(default);
+        }
         let (found, via_id) = match self.permissions.get(canonical) {
             Some(decl) => (Some(decl), false),
+            None if self.mixed_spelling.contains(&with_id) => return mixed(&with_id),
             None => (self.permissions.get(&with_id), true),
         };
         if let Some(decl) = found {
@@ -249,18 +278,33 @@ impl ContractPermissions {
                 reason: format!("an unreadable declaration may supply it: {}", gap.reason),
             };
         }
+        if self.mixed_spelling.contains(DEFAULT_KEY) {
+            return mixed(DEFAULT_KEY);
+        }
         match &self.default {
-            Some(default) => match &default.value {
-                PermissionValue::AnyOf(_) => PermissionState::Default(default),
-                PermissionValue::Unlowered {
-                    reason,
-                    source_text,
-                } => PermissionState::Unresolved {
-                    reason: format!("default permission {reason}: {source_text}"),
-                },
-            },
+            Some(default) => default_state(default),
             None => PermissionState::ProvenAbsent,
         }
+    }
+}
+
+fn default_state(default: &DefaultPermissionDecl) -> PermissionState<'_> {
+    match &default.value {
+        PermissionValue::AnyOf(_) => PermissionState::Default(default),
+        PermissionValue::Unlowered {
+            reason,
+            source_text,
+        } => PermissionState::Unresolved {
+            reason: format!("default permission {reason}: {source_text}"),
+        },
+    }
+}
+
+fn mixed(key: &str) -> PermissionState<'static> {
+    PermissionState::Unresolved {
+        reason: format!(
+            "`{key}` is written both as a symbol and as a string; `with_indifferent_access` keeps the entry that sits last in the merged hash"
+        ),
     }
 }
 
@@ -281,6 +325,8 @@ pub(crate) struct SrcRef {
 pub(crate) enum ContractEvent {
     Permission {
         attribute: String,
+        /// Written as a string (`"a"`), not a symbol.
+        string_key: bool,
         value: PermissionValue,
         form: DeclForm,
         at: SrcRef,
@@ -356,20 +402,57 @@ pub(crate) fn record_statement(
         entry.included_events.extend(out);
         return;
     }
-    // `def self.included(base)` runs arbitrary code in the includer.
-    if ctx == Ctx::ModuleBody
-        && let Node::Defs(def) = stmt
-        && def.name == "included"
-    {
-        entry.events.push(ContractEvent::Gap {
-            reason: "module defines `self.included`, which can declare attributes".to_string(),
-            at: src_ref(file, src, scope, stmt),
-        });
-        return;
+    if ctx == Ctx::ModuleBody {
+        if let Node::Send(send) = stmt
+            && receiverless(send)
+            && send.method_name == "extend"
+            && send
+                .args
+                .iter()
+                .any(|arg| const_path(arg).as_deref() == Some("ActiveSupport::Concern"))
+        {
+            entry.is_concern = true;
+        }
+        // Singleton methods Ruby calls on `include`; they are applied at the
+        // include point (see `State::module`).
+        if let Node::Defs(def) = stmt
+            && is_include_hook(&def.name)
+        {
+            entry
+                .include_hooks
+                .push((def.name.clone(), src_ref(file, src, scope, stmt)));
+            return;
+        }
+        if let Node::SClass(sclass) = stmt
+            && matches!(&*sclass.expr, Node::Self_(_))
+        {
+            let body: Vec<&Node> = match sclass.body.as_deref() {
+                Some(Node::Begin(b)) => b.statements.iter().collect(),
+                Some(other) => vec![other],
+                None => Vec::new(),
+            };
+            for inner in body {
+                if let Node::Def(def) = inner
+                    && is_include_hook(&def.name)
+                {
+                    entry
+                        .include_hooks
+                        .push((def.name.clone(), src_ref(file, src, scope, inner)));
+                }
+            }
+        }
     }
     let mut out = Vec::new();
     classify(stmt, file, src, scope, ctx, &mut out);
     entry.events.extend(out);
+}
+
+/// `Module#include` calls `append_features` and then `included` on the
+/// module; a module that defines either decides what including it does.
+/// (`prepended` / `prepend_features` run only on `prepend`, which is never
+/// expanded.)
+fn is_include_hook(name: &str) -> bool {
+    matches!(name, "included" | "append_features")
 }
 
 /// One statement of an `included do … end` block. An `include` there runs in
@@ -392,7 +475,10 @@ fn included_statement(
             .args
             .iter()
             .map(|arg| match const_path(arg) {
-                Some(path) => MixinArg::Const(path),
+                Some(path) => MixinArg::Const {
+                    path,
+                    absolute: is_absolute(arg),
+                },
                 None => MixinArg::Dynamic(format!(
                     "dynamic `include` argument `{}`",
                     snippet_of(src, arg)
@@ -441,9 +527,14 @@ fn classify(
                 dsl_call(send, stmt, file, src, scope, ctx, out);
             } else if !matches!(send.method_name.as_str(), "include" | "prepend") {
                 nested_gaps(&send.args, file, src, scope, out);
-            } else if send.recv.is_some() || ctx == Ctx::IncludedBody {
+            } else if send.recv.is_some()
+                || ctx == Ctx::IncludedBody
+                || send.method_name == "prepend"
+            {
                 // The scan expands only a receiverless `include` of a class or
-                // module body (and of an `included` block, handled above).
+                // module body (and of an `included` block, handled above). A
+                // `prepend` runs `prepend_features` / `prepended` hooks and a
+                // Concern's `prepended` block, none of which is read.
                 out.push(ContractEvent::Gap {
                     reason: format!(
                         "`{}` written here is not expanded; the module may declare permissions",
@@ -498,9 +589,12 @@ struct DslFinder<'s> {
 
 impl Visitor for DslFinder<'_> {
     fn on_send(&mut self, node: &SendNode) {
+        let name = node.method_name.as_str();
+        // A hidden `include` / `prepend` can install a module whose hooks
+        // declare permissions.
         if receiverless(node)
-            && DSL.contains(&node.method_name.as_str())
-            && can_carry_permission(node)
+            && ((DSL.contains(&name) && can_carry_permission(node))
+                || matches!(name, "include" | "prepend"))
         {
             self.found.push((
                 node.method_name.clone(),
@@ -520,18 +614,56 @@ fn can_carry_permission(send: &SendNode) -> bool {
     }
     match send.args.as_slice() {
         [_] => false,
-        [_, .., Node::Kwargs(k)] => k.pairs.iter().any(is_permission_or_splat),
-        [_, .., Node::Hash(h)] => h.pairs.iter().any(is_permission_or_splat),
+        [_, .., Node::Kwargs(k)] => k.pairs.iter().any(|p| option_key(p) != OptionKey::Other),
+        [_, .., Node::Hash(h)] => h.pairs.iter().any(|p| option_key(p) != OptionKey::Other),
         _ => true,
     }
 }
 
-fn is_permission_or_splat(pair: &Node) -> bool {
+/// What one entry of an `attribute` options hash is, for `options[:permission]`
+/// (`base_contract.rb:87`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptionKey {
+    /// The literal key `:permission`.
+    Permission,
+    /// A literal key that is not `:permission`. A string key (even
+    /// `"permission"`) is never read: the options hash is a plain `Hash` and
+    /// is indexed with the symbol.
+    Other,
+    /// A `**` splat or a computed key: it may be `:permission`.
+    Dynamic,
+}
+
+fn option_key(pair: &Node) -> OptionKey {
     match pair {
-        Node::Pair(p) => {
-            !matches!(&*p.key, Node::Sym(k) if k.name.to_string_lossy() != "permission")
-        }
-        _ => true,
+        Node::Pair(p) => match &*p.key {
+            Node::Sym(k) if k.name.to_string_lossy() == "permission" => OptionKey::Permission,
+            Node::Sym(_) | Node::Str(_) => OptionKey::Other,
+            _ => OptionKey::Dynamic,
+        },
+        _ => OptionKey::Dynamic,
+    }
+}
+
+/// Why a [`OptionKey::Dynamic`] entry may be `permission:`.
+fn dynamic_option_reason(src: &str, pair: &Node, attribute: &str) -> String {
+    match pair {
+        Node::Pair(p) => format!(
+            "computed option key `{}` in `attribute {attribute}` may be `:permission`",
+            snippet_of(src, &p.key)
+        ),
+        _ => format!("`**` splat in `attribute {attribute}` may carry `permission:`"),
+    }
+}
+
+/// A literal attribute name and whether it is a string. `"a"` and `:a` are
+/// the same key at lookup (`with_indifferent_access`,
+/// `base_contract.rb:184, 210`).
+fn literal_name(node: Option<&Node>) -> Option<(String, bool)> {
+    match node {
+        Some(Node::Sym(s)) => Some((s.name.to_string_lossy(), false)),
+        Some(Node::Str(s)) => Some((s.value.to_string_lossy(), true)),
+        _ => None,
     }
 }
 
@@ -605,7 +737,7 @@ fn dsl_call(
     };
     match send.method_name.as_str() {
         "attribute" => {
-            let name = sym(send.args.first());
+            let name = literal_name(send.args.first());
             let pairs = match send.args.last() {
                 Some(Node::Kwargs(k)) if send.args.len() >= 2 => Some(&k.pairs),
                 Some(Node::Hash(h)) if send.args.len() >= 2 => Some(&h.pairs),
@@ -620,21 +752,23 @@ fn dsl_call(
                 }
                 return;
             };
-            let found = pairs.iter().enumerate().rev().find_map(|(i, pair)| match pair {
-                Node::Pair(p)
-                    if matches!(&*p.key, Node::Sym(k) if k.name.to_string_lossy() == "permission") =>
-                {
-                    Some((i, &*p.value))
-                }
-                _ => None,
-            });
-            let splat_after = |from: usize| {
+            let found = pairs
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, pair)| match pair {
+                    Node::Pair(p) if option_key(pair) == OptionKey::Permission => {
+                        Some((i, &*p.value))
+                    }
+                    _ => None,
+                });
+            let dynamic_after = |from: usize| {
                 pairs[from..]
                     .iter()
-                    .any(|pair| matches!(pair, Node::Kwsplat(_)))
+                    .find(|pair| option_key(pair) == OptionKey::Dynamic)
             };
-            let Some(name) = name else {
-                if found.is_some() || splat_after(0) {
+            let Some((name, string_key)) = name else {
+                if found.is_some() || dynamic_after(0).is_some() {
                     out.push(gap(format!(
                         "`attribute` with a non-literal name may carry a permission: {}",
                         flat_source(src, whole)
@@ -642,26 +776,39 @@ fn dsl_call(
                 }
                 return;
             };
+            let written = if string_key {
+                format!("\"{name}\"")
+            } else {
+                format!(":{name}")
+            };
             match found {
-                None if splat_after(0) => out.push(gap(format!(
-                    "`**` splat in `attribute :{name}` may carry `permission:`"
-                ))),
-                None => {}
-                Some((i, value)) if splat_after(i + 1) => {
-                    out.push(ContractEvent::Permission {
-                        attribute: name,
-                        value: PermissionValue::Unlowered {
-                            reason: "a `**` splat after `permission:` can override it".to_string(),
-                            source_text: flat_source(src, value),
-                        },
-                        form: DeclForm::AttributeOption,
-                        at,
-                    });
+                None => {
+                    if let Some(pair) = dynamic_after(0) {
+                        out.push(gap(dynamic_option_reason(src, pair, &written)));
+                    }
                 }
-                Some((_, value)) => {
-                    if let Lowered::Value(value) = lower_permission(value, src) {
+                Some((i, value)) => {
+                    if let Some(pair) = dynamic_after(i + 1) {
+                        let reason = match pair {
+                            Node::Pair(_) => {
+                                "a computed option key after `permission:` can override it"
+                            }
+                            _ => "a `**` splat after `permission:` can override it",
+                        };
                         out.push(ContractEvent::Permission {
                             attribute: name,
+                            string_key,
+                            value: PermissionValue::Unlowered {
+                                reason: reason.to_string(),
+                                source_text: flat_source(src, value),
+                            },
+                            form: DeclForm::AttributeOption,
+                            at,
+                        });
+                    } else if let Lowered::Value(value) = lower_permission(value, src) {
+                        out.push(ContractEvent::Permission {
+                            attribute: name,
+                            string_key,
                             value,
                             form: DeclForm::AttributeOption,
                             at,
@@ -670,11 +817,12 @@ fn dsl_call(
                 }
             }
         }
-        "attribute_permission" => match (send.args.as_slice(), sym(send.args.first())) {
-            ([_, value], Some(name)) => {
+        "attribute_permission" => match (send.args.as_slice(), literal_name(send.args.first())) {
+            ([_, value], Some((name, string_key))) => {
                 if let Lowered::Value(value) = lower_permission(value, src) {
                     out.push(ContractEvent::Permission {
                         attribute: name,
+                        string_key,
                         value,
                         form: DeclForm::AttributePermission,
                         at,
@@ -729,11 +877,19 @@ pub fn extract_contract_permissions(root: &Path) -> Vec<ContractPermissions> {
     paths.sort();
     let files: Vec<Parsed> = paths.iter().map(|p| parse(root, p)).collect();
     let mut scan = Scan::default();
+    scan.record_permissions = true;
     for (index, file) in files.iter().enumerate() {
         if let Some(ast) = &file.ast {
             scan.walk(index, &file.src, ast, &[]);
         }
     }
+    // A file that did not parse could reopen any class or module.
+    let unparsed: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.parse_failed)
+        .map(|(i, _)| i)
+        .collect();
     let lowerer = Lowerer {
         files: &files,
         classes: &scan.classes,
@@ -747,7 +903,7 @@ pub fn extract_contract_permissions(root: &Path) -> Vec<ContractPermissions> {
     names.sort();
     names
         .into_iter()
-        .map(|name| resolve_class(&lowerer, name))
+        .map(|name| resolve_class(&lowerer, name, &unparsed))
         .collect()
 }
 
@@ -755,6 +911,18 @@ struct State<'l, 'a> {
     lowerer: &'l Lowerer<'a>,
     out: ContractPermissions,
     order: usize,
+    /// Modules already in the ancestry of the class being resolved, across
+    /// its superclass chain. Including one again installs nothing:
+    /// `ActiveSupport::Concern#append_features` returns early when
+    /// `base < self` (so neither its dependencies nor its `included` block run
+    /// again), and `Module#append_features` skips a module that is already an
+    /// ancestor. `Module#include` still calls the module's `included` hook.
+    /// Kept apart from the recursion `stack`, which only breaks cycles.
+    installed: HashSet<String>,
+    /// Per key: written as a symbol, written as a string.
+    spellings: BTreeMap<String, (bool, bool)>,
+    /// Every scanned class and module whose body contributed.
+    touched: BTreeSet<String>,
 }
 
 impl State<'_, '_> {
@@ -785,16 +953,38 @@ impl State<'_, '_> {
         });
     }
 
+    fn spelled(&mut self, key: &str, string_key: bool) {
+        let entry = self.spellings.entry(key.to_string()).or_default();
+        if string_key {
+            entry.1 = true;
+        } else {
+            entry.0 = true;
+        }
+    }
+
     fn apply(&mut self, event: &ContractEvent, applied_in: &str) {
         match event {
             ContractEvent::Permission {
                 attribute,
+                string_key,
                 value,
                 form,
                 at,
             } => {
+                self.spelled(attribute, *string_key);
                 let source = self.source(at);
                 let order = self.tick();
+                if attribute == DEFAULT_KEY {
+                    // Same hash entry as `default_attribute_permission`
+                    // (base_contract.rb:93): the later write wins.
+                    self.out.default = Some(DefaultPermissionDecl {
+                        value: value.clone(),
+                        source,
+                        applied_in: applied_in.to_string(),
+                        order,
+                    });
+                    return;
+                }
                 // Plain assignment: a later declaration replaces the earlier
                 // one whole (base_contract.rb:99).
                 self.out.permissions.insert(
@@ -810,6 +1000,7 @@ impl State<'_, '_> {
                 );
             }
             ContractEvent::Default { value, at } => {
+                self.spelled(DEFAULT_KEY, false);
                 let source = self.source(at);
                 let order = self.tick();
                 self.out.default = Some(DefaultPermissionDecl {
@@ -858,8 +1049,11 @@ impl State<'_, '_> {
         // Ruby includes the arguments of one call in reverse order.
         for arg in mixin.names.iter().rev() {
             match arg {
-                MixinArg::Const(name) => match self.lowerer.resolve(&mixin.ns, name) {
-                    Some(found) => self.module(&found, applied_in, stack),
+                MixinArg::Const {
+                    path: name,
+                    absolute,
+                } => match self.lowerer.resolve_arg(&mixin.ns, name, *absolute) {
+                    Some(found) => self.module(&found, at, applied_in, stack),
                     None => self.gap(
                         format!(
                             "module `{name}` is not scanned; an `included` hook could declare permissions"
@@ -872,47 +1066,113 @@ impl State<'_, '_> {
         }
     }
 
-    fn module(&mut self, name: &str, applied_in: &str, stack: &mut Vec<String>) {
+    /// Include module `name` into `applied_in`; `at` is the `include` call.
+    fn module(&mut self, name: &str, at: &SrcRef, applied_in: &str, stack: &mut Vec<String>) {
         if stack.iter().any(|n| n == name) {
             return;
         }
         let Some(entry) = self.lowerer.classes.get(name) else {
             return;
         };
+        self.touched.insert(name.to_string());
+        let hook = |wanted: &str| entry.include_hooks.iter().find(|(h, _)| h == wanted);
+        let replaced = hook("append_features");
+        let included = hook("included");
+        if self.installed.contains(name) {
+            // Already an ancestor: nothing is installed again, but a
+            // singleton `append_features` or `included` this module defines
+            // is still called.
+            if let Some((hook_name, hook_at)) = replaced.or(included) {
+                let def = self.source(hook_at);
+                self.gap(
+                    format!(
+                        "module `{name}` is already included, but its `self.{hook_name}` ({}:{}) runs again",
+                        def.file, def.line
+                    ),
+                    at,
+                );
+            }
+            return;
+        }
         stack.push(name.to_string());
-        // Concern dependencies first, then the `included` block.
+        // Concern dependencies first, then the `included` block. An own
+        // `append_features` replaces the code that installs both.
         for event in &entry.events {
             match event {
                 ContractEvent::Include { mixin, at } => {
-                    self.include(&entry.mixins[*mixin], at, applied_in, stack);
+                    if replaced.is_none() {
+                        self.include(&entry.mixins[*mixin], at, applied_in, stack);
+                    }
                 }
                 other => self.apply(other, applied_in),
             }
         }
-        for event in &entry.included_events {
-            match event {
-                ContractEvent::IncludeInIncluder { mixin, at } => {
-                    self.include(&entry.included_mixins[*mixin], at, applied_in, stack);
+        if let Some((_, hook_at)) = replaced {
+            let def = self.source(hook_at);
+            self.gap(
+                format!(
+                    "module `{name}` defines `self.append_features` ({}:{}), which decides what including it does",
+                    def.file, def.line
+                ),
+                at,
+            );
+        } else if let Some((_, hook_at)) = included {
+            // The hook runs after `append_features`, so it can override the
+            // block; written before `included do`, it also keeps the block
+            // from being stored. Neither is read: one gap stands for both.
+            self.installed.insert(name.to_string());
+            let def = self.source(hook_at);
+            self.gap(
+                format!(
+                    "module `{name}` defines `self.included` ({}:{}), which can declare attributes and decides whether its `included` block runs",
+                    def.file, def.line
+                ),
+                at,
+            );
+        } else if !entry.is_concern && !entry.included_events.is_empty() {
+            // `included do … end` stores the block only through
+            // `ActiveSupport::Concern#included`; without `extend
+            // ActiveSupport::Concern` the call reaches some other `included`.
+            self.installed.insert(name.to_string());
+            self.gap(
+                format!(
+                    "module `{name}` has an `included do` block but does not `extend ActiveSupport::Concern`; whether the block runs is not known"
+                ),
+                at,
+            );
+        } else {
+            self.installed.insert(name.to_string());
+            for event in &entry.included_events {
+                match event {
+                    ContractEvent::IncludeInIncluder { mixin, at } => {
+                        self.include(&entry.included_mixins[*mixin], at, applied_in, stack);
+                    }
+                    other => self.apply(other, applied_in),
                 }
-                other => self.apply(other, applied_in),
             }
         }
         stack.pop();
     }
 }
 
-fn resolve_class(lowerer: &Lowerer<'_>, class: &str) -> ContractPermissions {
+fn resolve_class(lowerer: &Lowerer<'_>, class: &str, unparsed: &[usize]) -> ContractPermissions {
     // The superclass chain, subclass first, stopping before `BaseContract`
     // (base_contract.rb:203-205).
     let mut chain = vec![class.to_string()];
     let mut seen: HashSet<String> = HashSet::from([class.to_string()]);
     let mut unscanned: Option<(String, String)> = None;
     let mut current = class.to_string();
-    while let Some((ns, sup)) = lowerer
-        .classes
-        .get(&current)
-        .and_then(|e| e.superclass.clone())
-    {
+    while let Some(entry) = lowerer.classes.get(&current) {
+        if let Some(text) = &entry.dynamic_superclass {
+            unscanned = Some((
+                current.clone(),
+                format!("superclass `{text}` is not a constant path; it may declare permissions"),
+            ));
+            break;
+        }
+        let Some((ns, sup)) = entry.superclass.clone() else {
+            break;
+        };
         match lowerer.resolve(&ns, &sup) {
             Some(found) if found == ROOT_CONTRACT => break,
             Some(found) => {
@@ -924,7 +1184,10 @@ fn resolve_class(lowerer: &Lowerer<'_>, class: &str) -> ContractPermissions {
             }
             None => {
                 if sup != ROOT_CONTRACT {
-                    unscanned = Some((current.clone(), sup));
+                    unscanned = Some((
+                        current.clone(),
+                        format!("superclass `{sup}` is not scanned; it may declare permissions"),
+                    ));
                 }
                 break;
             }
@@ -939,10 +1202,14 @@ fn resolve_class(lowerer: &Lowerer<'_>, class: &str) -> ContractPermissions {
             default: None,
             aliases: BTreeMap::new(),
             gaps: Vec::new(),
+            mixed_spelling: BTreeSet::new(),
         },
         order: 0,
+        installed: HashSet::new(),
+        spellings: BTreeMap::new(),
+        touched: chain.iter().cloned().collect(),
     };
-    if let Some((from, sup)) = unscanned {
+    if let Some((from, reason)) = unscanned {
         // Root-most position: applied before everything else.
         // No file or line: the text lives outside the scan (`file` is empty).
         let at = SrcRef {
@@ -950,16 +1217,71 @@ fn resolve_class(lowerer: &Lowerer<'_>, class: &str) -> ContractPermissions {
             scope: from,
             line: 0,
         };
-        state.gap(
-            format!("superclass `{sup}` is not scanned; it may declare permissions"),
-            &at,
-        );
+        state.gap(reason, &at);
     }
     // Root-most first, so a subclass key overwrites: `reverse_merge!` semantics.
     for name in chain.iter().rev() {
         state.apply_class(name);
     }
+    unparsed_gaps(&mut state, unparsed);
+    state.out.mixed_spelling = state
+        .spellings
+        .iter()
+        .filter(|(_, (sym, string))| *sym && *string)
+        .map(|(key, _)| key.clone())
+        .collect();
     state.out
+}
+
+/// A file that did not parse may reopen a class or module of the chain. It
+/// can only do that by naming it, so it counts when its text mentions every
+/// segment of one contributing name (or when its text could not be read).
+///
+/// The reopening's position in the merge is unknown, so the gap takes the
+/// last position: it can override every declaration that was read, so no
+/// lookup of that class is proven. A file that names nothing of the chain is
+/// not counted: a parsed file reaching a class without naming it
+/// (`const_get`, a constant alias) is equally outside the scan.
+fn unparsed_gaps(state: &mut State<'_, '_>, unparsed: &[usize]) {
+    for &file in unparsed {
+        let Some(parsed) = state.lowerer.files.get(file) else {
+            continue;
+        };
+        let named = state.touched.iter().find(|name| {
+            name.split("::")
+                .all(|segment| mentions_word(&parsed.src, segment))
+        });
+        let reason = match (parsed.src.is_empty(), named) {
+            (true, _) => format!(
+                "`{}` could not be read; it may reopen any class",
+                parsed.rel
+            ),
+            (false, Some(name)) => format!(
+                "`{}` did not parse and names `{name}`; it may reopen it",
+                parsed.rel
+            ),
+            (false, None) => continue,
+        };
+        let order = state.tick();
+        state.out.gaps.push(ContractGap {
+            reason,
+            source: DeclSource {
+                scope: state.out.class.clone(),
+                file: parsed.rel.clone(),
+                line: 0,
+            },
+            order,
+        });
+    }
+}
+
+/// `word` occurs in `src` with no identifier character on either side.
+fn mentions_word(src: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    src.match_indices(word).any(|(at, _)| {
+        !src[..at].chars().next_back().is_some_and(ident)
+            && !src[at + word.len()..].chars().next().is_some_and(ident)
+    })
 }
 
 #[cfg(test)]
@@ -1186,7 +1508,7 @@ mod tests {
 
     #[test]
     fn mixin_order_follows_ruby() {
-        let mods = "module One\n  included do\n    attribute :a, permission: :one\n  end\nend\nmodule Two\n  included do\n    attribute :a, permission: :two\n  end\nend\n";
+        let mods = "module One\n  extend ActiveSupport::Concern\n  included do\n    attribute :a, permission: :one\n  end\nend\nmodule Two\n  extend ActiveSupport::Concern\n  included do\n    attribute :a, permission: :two\n  end\nend\n";
         // `include One, Two`: Two runs first, One last, so One wins.
         let one_call = "class C < BaseContract\n  include One, Two\nend\n";
         let all = scan("mix_call", &[("m.rb", mods), ("c.rb", one_call)]);
@@ -1405,6 +1727,336 @@ mod tests {
     /// nexgen's line scanner (`crates/op-contracts/src/work_packages/
     /// generated_create_admission.rs` at nexgen `b70b3e0`), canonical
     /// attribute name -> alternatives.
+    fn unresolved(c: &ContractPermissions, attr: &str) -> String {
+        match c.lookup(attr) {
+            PermissionState::Unresolved { reason } => reason,
+            other => panic!("{attr}: expected Unresolved, got {other:?}"),
+        }
+    }
+
+    fn default_of<'a>(c: &'a ContractPermissions, attr: &str) -> &'a DefaultPermissionDecl {
+        match c.lookup(attr) {
+            PermissionState::Default(d) => d,
+            other => panic!("{attr}: expected Default, got {other:?}"),
+        }
+    }
+
+    const CONCERN_EXTRA: &str = "module Extra\n  extend ActiveSupport::Concern\n  included do\n    attribute :a, permission: :mixin\n  end\nend\n";
+
+    #[test]
+    fn a_superclass_that_is_not_a_constant_path_is_a_root_most_gap() {
+        let src = "class C < Object.const_get(:Parent)\n  attribute :a, permission: :x\nend\n";
+        let all = scan("dyn_super", &[("c.rb", src)]);
+        let c = class(&all, "C");
+        // Root-most: the class's own declaration still wins over it ...
+        assert_eq!(explicit(c, "a").value, any_of(&["x"]));
+        // ... but anything else could come from the unknown superclass.
+        let reason = unresolved(c, "other");
+        assert!(reason.contains("Object.const_get(:Parent)"), "{reason}");
+        assert_eq!(c.gaps.len(), 1);
+        assert_eq!(c.gaps[0].order, 1);
+    }
+
+    #[test]
+    fn an_omitted_or_resolved_root_superclass_is_not_a_gap() {
+        let src = "class Omitted\n  attribute :a, permission: :x\nend\nclass Rooted < ::BaseContract\n  attribute :a, permission: :x\nend\n";
+        let all = scan("dyn_super_twin", &[("c.rb", src)]);
+        for name in ["Omitted", "Rooted"] {
+            let c = class(&all, name);
+            assert!(c.gaps.is_empty(), "{name}: {:?}", c.gaps);
+            assert_eq!(c.lookup("other"), PermissionState::ProvenAbsent);
+        }
+    }
+
+    #[test]
+    fn an_own_self_included_keeps_the_included_block_uncertain() {
+        let defs = "module Hooked\n  extend ActiveSupport::Concern\n  def self.included(base)\n    super\n  end\n  included do\n    attribute :a, permission: :blk\n  end\nend\n";
+        let sclass = "module Hooked\n  extend ActiveSupport::Concern\n  class << self\n    def included(base)\n      super\n    end\n  end\n  included do\n    attribute :a, permission: :blk\n  end\nend\n";
+        let class_src = "class C < BaseContract\n  include Hooked\nend\n";
+        for (case, module) in [("hook_defs", defs), ("hook_sclass", sclass)] {
+            let all = scan(case, &[("m.rb", module), ("c.rb", class_src)]);
+            let reason = unresolved(class(&all, "C"), "a");
+            assert!(reason.contains("`self.included`"), "{case}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_concern_without_a_hook_replays_its_included_block() {
+        let module = "module Plain\n  extend ActiveSupport::Concern\n  included do\n    attribute :a, permission: :blk\n  end\nend\n";
+        let all = scan(
+            "hook_twin",
+            &[
+                ("m.rb", module),
+                ("c.rb", "class C < BaseContract\n  include Plain\nend\n"),
+            ],
+        );
+        let c = class(&all, "C");
+        assert!(c.gaps.is_empty(), "{:?}", c.gaps);
+        assert_eq!(explicit(c, "a").value, any_of(&["blk"]));
+    }
+
+    #[test]
+    fn an_included_block_without_concern_is_a_gap() {
+        let module =
+            "module NotConcern\n  included do\n    attribute :a, permission: :blk\n  end\nend\n";
+        let all = scan(
+            "no_concern",
+            &[
+                ("m.rb", module),
+                (
+                    "c.rb",
+                    "class C < BaseContract\n  include NotConcern\nend\n",
+                ),
+            ],
+        );
+        let reason = unresolved(class(&all, "C"), "a");
+        assert!(reason.contains("ActiveSupport::Concern"), "{reason}");
+    }
+
+    #[test]
+    fn an_own_append_features_is_a_gap_at_the_include() {
+        let module = "module Replaced\n  extend ActiveSupport::Concern\n  def self.append_features(base)\n    super\n  end\n  included do\n    attribute :a, permission: :blk\n  end\nend\n";
+        let all = scan(
+            "append_features",
+            &[
+                ("m.rb", module),
+                ("c.rb", "class C < BaseContract\n  include Replaced\nend\n"),
+            ],
+        );
+        let c = class(&all, "C");
+        let reason = unresolved(c, "a");
+        assert!(reason.contains("`self.append_features`"), "{reason}");
+        assert_eq!(c.gaps[0].source.file, "c.rb");
+        assert_eq!(c.gaps[0].source.line, 2);
+    }
+
+    #[test]
+    fn a_prepended_hook_does_not_run_on_include_but_prepend_is_a_gap() {
+        // `Module#include` calls `append_features` and `included` only.
+        let module = "module Pre\n  extend ActiveSupport::Concern\n  def self.prepended(base)\n    base.attribute :a, permission: :pre\n  end\n  included do\n    attribute :a, permission: :blk\n  end\nend\n";
+        let all = scan(
+            "prepended_include",
+            &[
+                ("m.rb", module),
+                ("c.rb", "class C < BaseContract\n  include Pre\nend\n"),
+            ],
+        );
+        let c = class(&all, "C");
+        assert!(c.gaps.is_empty(), "{:?}", c.gaps);
+        assert_eq!(explicit(c, "a").value, any_of(&["blk"]));
+        let all = scan(
+            "prepended_prepend",
+            &[
+                ("m.rb", module),
+                ("c.rb", "class C < BaseContract\n  prepend Pre\nend\n"),
+            ],
+        );
+        let reason = unresolved(class(&all, "C"), "a");
+        assert!(reason.contains("prepend Pre"), "{reason}");
+    }
+
+    #[test]
+    fn computed_option_keys_may_be_permission() {
+        let src = "class Hash1 < BaseContract\n  attribute :a, { key => :view }\nend\n\
+                   class After < BaseContract\n  attribute :secret, permission: :public, key => :admin\nend\n\
+                   class Before < BaseContract\n  attribute :secret, key => :admin, permission: :public\nend\n\
+                   class Literal < BaseContract\n  attribute :secret, permission: :public, writable: false, \"permission\" => :admin\nend\n";
+        let all = scan("computed_keys", &[("c.rb", src)]);
+        let reason = unresolved(class(&all, "Hash1"), "a");
+        assert!(reason.contains("computed option key"), "{reason}");
+        let reason = unresolved(class(&all, "After"), "secret");
+        assert!(reason.contains("computed option key"), "{reason}");
+        // A later literal `permission:` settles it.
+        assert_eq!(
+            explicit(class(&all, "Before"), "secret").value,
+            any_of(&["public"])
+        );
+        // Literal keys, including the string "permission", are never read.
+        let literal = class(&all, "Literal");
+        assert!(literal.gaps.is_empty(), "{:?}", literal.gaps);
+        assert_eq!(explicit(literal, "secret").value, any_of(&["public"]));
+    }
+
+    #[test]
+    fn mixin_calls_the_scan_does_not_expand_are_gaps() {
+        let cases = [
+            (
+                "mix_if",
+                "class C < BaseContract\n  include Extra if flag?\nend\n",
+            ),
+            (
+                "mix_loop",
+                "class C < BaseContract\n  [Extra].each { |m| include m }\nend\n",
+            ),
+            (
+                "mix_prepend",
+                "class C < BaseContract\n  prepend Extra\nend\n",
+            ),
+        ];
+        for (case, class_src) in cases {
+            let all = scan(case, &[("m.rb", CONCERN_EXTRA), ("c.rb", class_src)]);
+            let c = class(&all, "C");
+            assert_eq!(c.gaps.len(), 1, "{case}: {:?}", c.gaps);
+            assert_eq!(c.gaps[0].source.line, 2, "{case}");
+            unresolved(c, "a");
+        }
+        // The direct include keeps its expansion: no gap.
+        let all = scan(
+            "mix_direct",
+            &[
+                ("m.rb", CONCERN_EXTRA),
+                ("c.rb", "class C < BaseContract\n  include Extra\nend\n"),
+            ],
+        );
+        let c = class(&all, "C");
+        assert!(c.gaps.is_empty(), "{:?}", c.gaps);
+        assert_eq!(explicit(c, "a").value, any_of(&["mixin"]));
+    }
+
+    #[test]
+    fn default_permission_has_one_precedence_path() {
+        let first = "class C < BaseContract\n  default_attribute_permission :edit\n  attribute_permission :default_permission, :manage\nend\n";
+        let all = scan("default_one_a", &[("c.rb", first)]);
+        let c = class(&all, "C");
+        let d = default_of(c, "anything");
+        assert_eq!(d.value, any_of(&["manage"]));
+        assert_eq!(d.source.line, 3);
+        assert_eq!(
+            default_of(c, "default_permission").value,
+            any_of(&["manage"])
+        );
+        assert!(c.permissions.is_empty());
+
+        let second = "class C < BaseContract\n  attribute_permission :default_permission, :manage\n  default_attribute_permission :edit\nend\n";
+        let all = scan("default_one_b", &[("c.rb", second)]);
+        let d = default_of(class(&all, "C"), "anything");
+        assert_eq!(d.value, any_of(&["edit"]));
+        assert_eq!(d.source.line, 3);
+
+        // Across the chain the subclass wins whichever form it uses.
+        let chain = "class P < BaseContract\n  default_attribute_permission :edit\nend\nclass C < P\n  attribute :default_permission, permission: :manage\nend\n";
+        let all = scan("default_one_chain", &[("c.rb", chain)]);
+        let d = default_of(class(&all, "C"), "anything");
+        assert_eq!(d.value, any_of(&["manage"]));
+        assert_eq!(d.applied_in, "C");
+    }
+
+    #[test]
+    fn unparsed_files_naming_the_class_keep_every_lookup_open() {
+        let good = "class Widget < BaseContract\n  default_attribute_permission :d\n  attribute :a, permission: :x\nend\n";
+        let bad = "class Widget < BaseContract\n  def (\nend\n";
+        let all = scan("unparsed", &[("a.rb", good), ("bad.rb", bad)]);
+        let c = class(&all, "Widget");
+        for attr in ["a", "other"] {
+            let reason = unresolved(c, attr);
+            assert!(reason.contains("bad.rb"), "{attr}: {reason}");
+        }
+    }
+
+    #[test]
+    fn unparsed_files_naming_nothing_of_the_chain_change_nothing() {
+        let good = "class Widget < BaseContract\n  default_attribute_permission :d\n  attribute :a, permission: :x\nend\n";
+        let bad = "class Gadget\n  def (\nend\n";
+        let all = scan("unparsed_twin", &[("a.rb", good), ("bad.rb", bad)]);
+        let c = class(&all, "Widget");
+        assert!(c.gaps.is_empty(), "{:?}", c.gaps);
+        assert_eq!(explicit(c, "a").value, any_of(&["x"]));
+        assert_eq!(default_of(c, "other").value, any_of(&["d"]));
+    }
+
+    #[test]
+    fn string_keys_match_symbols_unless_both_spellings_are_written() {
+        let src = "class S < BaseContract\n  attribute_permission \"a\", :edit\n  attribute \"b\", permission: :view\nend\n\
+                   class M < BaseContract\n  attribute_permission :a, :one\n  attribute_permission \"a\", :two\nend\n\
+                   class P < BaseContract\n  attribute_permission \"a\", :one\nend\nclass Q < P\n  attribute_permission :a, :two\nend\n";
+        let all = scan("string_keys", &[("c.rb", src)]);
+        let s = class(&all, "S");
+        assert_eq!(explicit(s, "a").value, any_of(&["edit"]));
+        assert_eq!(explicit(s, "a_id").value, any_of(&["edit"]));
+        assert_eq!(explicit(s, "b").value, any_of(&["view"]));
+        for name in ["M", "Q"] {
+            let reason = unresolved(class(&all, name), "a");
+            assert!(
+                reason.contains("symbol and as a string"),
+                "{name}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_concern_already_in_the_ancestry_is_not_installed_again() {
+        let same = "class C < BaseContract\n  include Extra\n  attribute :a, permission: :mine\n  include Extra\nend\n";
+        let chain = "class P < BaseContract\n  include Extra\nend\nclass C < P\n  attribute :a, permission: :mine\n  include Extra\nend\n";
+        for (case, src) in [("idem_same", same), ("idem_chain", chain)] {
+            let all = scan(case, &[("m.rb", CONCERN_EXTRA), ("c.rb", src)]);
+            let c = class(&all, "C");
+            assert!(c.gaps.is_empty(), "{case}: {:?}", c.gaps);
+            assert_eq!(explicit(c, "a").value, any_of(&["mine"]), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_different_module_or_a_hook_still_applies_after_an_include() {
+        let other = "module Other\n  extend ActiveSupport::Concern\n  included do\n    attribute :a, permission: :other\n  end\nend\n";
+        let src = "class C < BaseContract\n  include Extra\n  attribute :a, permission: :mine\n  include Other\nend\n";
+        let all = scan(
+            "idem_other",
+            &[("m.rb", CONCERN_EXTRA), ("o.rb", other), ("c.rb", src)],
+        );
+        assert_eq!(explicit(class(&all, "C"), "a").value, any_of(&["other"]));
+        // A plain module's `self.included` runs on every `include`.
+        let hooked = "module Hooked\n  def self.included(base)\n  end\nend\n";
+        let src = "class C < BaseContract\n  include Hooked\n  attribute :a, permission: :mine\n  include Hooked\nend\n";
+        let all = scan("idem_hook", &[("h.rb", hooked), ("c.rb", src)]);
+        let reason = unresolved(class(&all, "C"), "a");
+        assert!(reason.contains("runs again"), "{reason}");
+    }
+
+    #[test]
+    fn an_absolute_include_resolves_from_the_top_level() {
+        let inner = "module N\n  module Extra\n    extend ActiveSupport::Concern\n    included do\n      attribute :a, permission: :inner\n    end\n  end\nend\n";
+        let top = "module Extra\n  extend ActiveSupport::Concern\n  included do\n    attribute :a, permission: :top\n  end\nend\n";
+        let absolute = "module N\n  class C < BaseContract\n    include ::Extra\n  end\nend\n";
+        let relative = "module N\n  class C < BaseContract\n    include Extra\n  end\nend\n";
+        let all = scan("abs", &[("i.rb", inner), ("t.rb", top), ("c.rb", absolute)]);
+        assert_eq!(explicit(class(&all, "N::C"), "a").value, any_of(&["top"]));
+        let all = scan(
+            "abs_rel",
+            &[("i.rb", inner), ("t.rb", top), ("c.rb", relative)],
+        );
+        assert_eq!(explicit(class(&all, "N::C"), "a").value, any_of(&["inner"]));
+        // `::Extra` never falls back to `N::Extra`.
+        let all = scan("abs_missing", &[("i.rb", inner), ("c.rb", absolute)]);
+        let reason = unresolved(class(&all, "N::C"), "a");
+        assert!(reason.contains("not scanned"), "{reason}");
+    }
+
+    #[test]
+    fn guard_scans_do_not_record_permission_events() {
+        let root =
+            std::env::temp_dir().join(format!("ruff_ruby_spo_perms_{}_optin", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("c.rb");
+        fs::write(
+            &path,
+            "class C < BaseContract\n  include Extra\n  attribute :a, permission: :x\nend\n",
+        )
+        .unwrap();
+        let file = parse(&root, &path);
+        let _ = fs::remove_dir_all(&root);
+        let ast = file.ast.as_ref().unwrap();
+        let mut guard = Scan::default();
+        guard.walk(0, &file.src, ast, &[]);
+        let entry = &guard.classes["C"];
+        assert!(entry.events.is_empty());
+        assert_eq!(entry.mixins.len(), 1);
+        let mut perms = Scan::default();
+        perms.record_permissions = true;
+        perms.walk(0, &file.src, ast, &[]);
+        assert_eq!(perms.classes["C"].events.len(), 2);
+    }
+
     const NEXGEN_CREATE: &[(&str, &[&str])] = &[
         ("assigned_to", &["add_work_packages"]),
         ("author", &["add_work_packages"]),
