@@ -64,7 +64,7 @@ pub(crate) fn walk_hook_statement(
         return;
     }
     match node {
-        Node::Send(s) if is_on_param(&s.recv, param) => {
+        Node::Send(s) if is_on_param(s.recv.as_deref(), param) => {
             let (name, args): (String, &[Node]) =
                 match (s.method_name.as_str(), s.args.split_first()) {
                     ("send" | "public_send" | "__send__", Some((first, rest))) => {
@@ -89,8 +89,8 @@ pub(crate) fn walk_hook_statement(
 }
 
 /// Whether `recv` is the hook parameter itself (`base` in `base.has_many`).
-fn is_on_param(recv: &Option<Box<Node>>, param: &str) -> bool {
-    matches!(recv.as_deref(), Some(Node::Lvar(v)) if v.name == param)
+fn is_on_param(recv: Option<&Node>, param: &str) -> bool {
+    matches!(recv, Some(Node::Lvar(v)) if v.name == param)
 }
 
 /// The block body of `<param>.class_eval do ... end` (also `class_exec`
@@ -103,7 +103,8 @@ pub(crate) fn hook_eval_body<'a>(param: &str, node: &'a Node) -> Option<&'a Node
     let Node::Send(s) = &*blk.call else {
         return None;
     };
-    if is_on_param(&s.recv, param) && matches!(s.method_name.as_str(), "class_eval" | "class_exec")
+    if is_on_param(s.recv.as_deref(), param)
+        && matches!(s.method_name.as_str(), "class_eval" | "class_exec")
     {
         blk.body.as_deref()
     } else {
@@ -111,7 +112,7 @@ pub(crate) fn hook_eval_body<'a>(param: &str, node: &'a Node) -> Option<&'a Node
     }
 }
 
-/// OpenProject registration macros that `route_send` recognises by name
+/// `OpenProject` registration macros that `route_send` recognises by name
 /// and keeps as a `DslCall`, as opposed to the fallback that wraps any
 /// unrecognised name.
 fn is_promoted_op_registration(name: &str) -> bool {
