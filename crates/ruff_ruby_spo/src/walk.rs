@@ -231,9 +231,11 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut 
         // known grouping idioms to avoid double-counting from arbitrary
         // blocks (e.g. `5.times do; validates :foo; end` would NOT count
         // because that's runtime-only).
-        "with_options" => walk_with_options(blk, s, src, Some(&[]), &mut |g| match g {
-            Grouped::Stmt(_, d) | Grouped::Wrapper(d) => out.extend(d),
-        }),
+        "with_options" => {
+            walk_with_options(blk, s, src, &WrapperOptions::top(), &mut |g| match g {
+                Grouped::Stmt(_, d) | Grouped::Wrapper(d) => out.extend(d),
+            });
+        }
         other => {
             // Generic block: route the call as if it were a bare Send,
             // then drop the body. Conservative — keeps the call counted
@@ -308,13 +310,10 @@ fn walk_with_options<'n>(
     blk: &'n lib_ruby_parser::nodes::Block,
     call: &lib_ruby_parser::nodes::Send,
     src: Option<&str>,
-    outer: Option<&[Opt]>,
+    outer: &WrapperOptions,
     sink: &mut dyn FnMut(Grouped<'n>),
 ) {
-    let wrapper: Option<Vec<Opt>> = match (outer, literal_options(&call.args)) {
-        (Some(o), Some(w)) => Some(merge_opts(&w, o)),
-        _ => None,
-    };
+    let wrapper = outer.within(call);
     if let Some(body) = blk.body.as_deref() {
         let stmts: Vec<&Node> = match body {
             Node::Begin(b) => b.statements.iter().collect(),
@@ -329,28 +328,9 @@ fn walk_with_options<'n>(
                     let Node::Send(inner_call) = &*inner_blk.call else {
                         continue;
                     };
-                    walk_with_options(inner_blk, inner_call, src, wrapper.as_deref(), sink);
+                    walk_with_options(inner_blk, inner_call, src, &wrapper, sink);
                 }
-                Node::Send(s)
-                    if s.recv.is_none()
-                        && validates_helper_kind(&s.method_name).is_some()
-                        && wrapper.is_some() =>
-                {
-                    let mut inner = Vec::new();
-                    emit_validates_helper(
-                        &s.method_name,
-                        &s.args,
-                        wrapper.as_deref().unwrap_or(&[]),
-                        &mut inner,
-                    );
-                    sink(Grouped::Stmt(stmt, inner));
-                }
-                _ => {
-                    let mut inner = Vec::new();
-                    walk_statement(stmt, src, &mut inner);
-                    apply_grouping_options(&mut inner, wrapper.as_deref());
-                    sink(Grouped::Stmt(stmt, inner));
-                }
+                _ => sink(Grouped::Stmt(stmt, wrapper.statement(stmt, src))),
             }
         }
     }
@@ -358,6 +338,73 @@ fn walk_with_options<'n>(
     let mut own = Vec::new();
     route_send(call.method_name.as_str(), &call.args, src, &mut own);
     sink(Grouped::Wrapper(own));
+}
+
+/// The combined options of the `with_options` blocks around a statement:
+/// `None` inside is "not statically known" (see [`walk_with_options`]).
+///
+/// A statement under a `with_options` wrapper is read through
+/// [`WrapperOptions::statement`], whether it is a direct child of the block or
+/// sits in control flow nested in its body, so both receive the options the
+/// same way.
+#[derive(Clone)]
+pub(crate) struct WrapperOptions(Option<Vec<Opt>>);
+
+impl WrapperOptions {
+    /// No enclosing `with_options`: nothing to merge, nothing unknown.
+    pub(crate) fn top() -> Self {
+        Self(Some(Vec::new()))
+    }
+
+    /// The options in force inside `call`'s block, `call` being a
+    /// `with_options` nested in the blocks `self` describes.
+    pub(crate) fn within(&self, call: &lib_ruby_parser::nodes::Send) -> Self {
+        Self(match (self.0.as_deref(), literal_options(&call.args)) {
+            (Some(o), Some(w)) => Some(merge_opts(&w, o)),
+            _ => None,
+        })
+    }
+
+    /// The declarations of one statement under the wrapper, with its options
+    /// applied.
+    pub(crate) fn statement(&self, stmt: &Node, src: Option<&str>) -> Vec<Declaration> {
+        if let Some(decls) = self.helper_statement(stmt) {
+            return decls;
+        }
+        let mut inner = Vec::new();
+        walk_statement(stmt, src, &mut inner);
+        self.apply(&mut inner);
+        inner
+    }
+
+    /// A `validates_*_of` helper call, which takes the options before its own
+    /// are split into shared and validator-specific keys. `None` for any other
+    /// statement, and when the options are not statically known.
+    pub(crate) fn helper_statement(&self, stmt: &Node) -> Option<Vec<Declaration>> {
+        let (Node::Send(s), Some(w)) = (stmt, &self.0) else {
+            return None;
+        };
+        if s.recv.is_some() {
+            return None;
+        }
+        // A literal reflective call (`send(:validates_length_of, :name)`)
+        // names the helper it calls; resolve it before choosing the path.
+        let (name, args): (String, &[Node]) = match (s.method_name.as_str(), s.args.split_first()) {
+            ("send" | "public_send" | "__send__", Some((first, rest))) => {
+                (literal_method_name(first)?, rest)
+            }
+            (name, _) => (name.to_string(), &s.args),
+        };
+        validates_helper_kind(&name)?;
+        let mut inner = Vec::new();
+        emit_validates_helper(&name, args, w, &mut inner);
+        Some(inner)
+    }
+
+    /// Apply the options to declarations already read from a statement.
+    pub(crate) fn apply(&self, decls: &mut [Declaration]) {
+        apply_grouping_options(decls, self.0.as_deref());
+    }
 }
 
 /// One piece of a `with_options` block, as [`walk_with_options`] reads it.
@@ -384,7 +431,7 @@ pub(crate) fn walk_with_options_grouped<'n>(
     if call.recv.is_some() || call.method_name != "with_options" {
         return false;
     }
-    walk_with_options(blk, call, src, Some(&[]), sink);
+    walk_with_options(blk, call, src, &WrapperOptions::top(), sink);
     true
 }
 
