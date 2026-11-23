@@ -355,6 +355,16 @@ pub(crate) enum ContractEvent {
         reason: String,
         at: SrcRef,
     },
+    /// An `include` / `prepend` the scan does not expand (inside a
+    /// conditional or loop, on an explicit receiver, a `prepend`). It is a gap
+    /// and it may also put modules into the ancestry, which turns a later
+    /// `include` of one of them into a no-op. `modules` holds the constant
+    /// paths as written; empty means unknown (any module).
+    MaybeInstall {
+        modules: Vec<String>,
+        reason: String,
+        at: SrcRef,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -535,7 +545,8 @@ fn classify(
                 // module body (and of an `included` block, handled above). A
                 // `prepend` runs `prepend_features` / `prepended` hooks and a
                 // Concern's `prepended` block, none of which is read.
-                out.push(ContractEvent::Gap {
+                out.push(ContractEvent::MaybeInstall {
+                    modules: mixin_paths(&send.args),
                     reason: format!(
                         "`{}` written here is not expanded; the module may declare permissions",
                         flat_source(src, stmt)
@@ -568,23 +579,44 @@ fn nested_gaps(nodes: &[Node], file: usize, src: &str, scope: &str, out: &mut Ve
     for node in nodes {
         finder.visit(node);
     }
-    for (name, line) in finder.found {
-        out.push(ContractEvent::Gap {
-            reason: format!(
-                "`{name}` is called inside a conditional, loop or other construct this arm does not unwrap"
-            ),
-            at: SrcRef {
-                file,
-                scope: scope.to_string(),
-                line,
+    for (name, line, mixin) in finder.found {
+        let reason = format!(
+            "`{name}` is called inside a conditional, loop or other construct this arm does not unwrap"
+        );
+        let at = SrcRef {
+            file,
+            scope: scope.to_string(),
+            line,
+        };
+        out.push(match mixin {
+            Some(modules) => ContractEvent::MaybeInstall {
+                modules,
+                reason,
+                at,
             },
+            None => ContractEvent::Gap { reason, at },
         });
     }
 }
 
+/// Constant paths of `include` / `prepend` arguments, as written; empty when
+/// any argument is not a constant path (the module is then unknown).
+fn mixin_paths(args: &[Node]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for arg in args {
+        match const_path(arg) {
+            Some(path) => paths.push(path),
+            None => return Vec::new(),
+        }
+    }
+    paths
+}
+
 struct DslFinder<'s> {
     src: &'s str,
-    found: Vec<(String, usize)>,
+    /// DSL call or mixin call, its line, and for a mixin call the modules it
+    /// may install ([`mixin_paths`]).
+    found: Vec<(String, usize, Option<Vec<String>>)>,
 }
 
 impl Visitor for DslFinder<'_> {
@@ -596,9 +628,11 @@ impl Visitor for DslFinder<'_> {
             && ((DSL.contains(&name) && can_carry_permission(node))
                 || matches!(name, "include" | "prepend"))
         {
+            let mixin = matches!(name, "include" | "prepend").then(|| mixin_paths(&node.args));
             self.found.push((
                 node.method_name.clone(),
                 line_of(self.src, node.expression_l.begin),
+                mixin,
             ));
         }
         visit_send(self, node);
@@ -919,6 +953,19 @@ struct State<'l, 'a> {
     /// ancestor. `Module#include` still calls the module's `included` hook.
     /// Kept apart from the recursion `stack`, which only breaks cycles.
     installed: HashSet<String>,
+    /// Modules that an unexpanded `include` / `prepend` may have put into the
+    /// ancestry (constant paths as written).
+    possibly_installed: Vec<String>,
+    /// Something the scan could not read may have put any module into the
+    /// ancestry (a dynamic or unscanned include, an include hook).
+    ancestry_unknown: bool,
+    /// A library module the scan cannot read was included. It may install
+    /// other library modules, but a library cannot name an application
+    /// constant, so it cannot install a module of the scanned tree.
+    library_ancestry_unknown: bool,
+    /// Files that did not parse and reopen the root contract: a module they
+    /// name may already be an ancestor.
+    root_unparsed: Vec<usize>,
     /// Per key: written as a symbol, written as a string.
     spellings: BTreeMap<String, (bool, bool)>,
     /// Every scanned class and module whose body contributed.
@@ -1025,6 +1072,14 @@ impl State<'_, '_> {
                 );
             }
             ContractEvent::Gap { reason, at } => self.gap(reason.clone(), at),
+            ContractEvent::MaybeInstall {
+                modules,
+                reason,
+                at,
+            } => {
+                self.gap(reason.clone(), at);
+                self.mark_possibly_installed(modules);
+            }
             ContractEvent::Include { .. } | ContractEvent::IncludeInIncluder { .. } => {}
         }
     }
@@ -1054,14 +1109,20 @@ impl State<'_, '_> {
                     absolute,
                 } => match self.lowerer.resolve_arg(&mixin.ns, name, *absolute) {
                     Some(found) => self.module(&found, at, applied_in, stack),
-                    None => self.gap(
-                        format!(
-                            "module `{name}` is not scanned; an `included` hook could declare permissions"
-                        ),
-                        at,
-                    ),
+                    None => {
+                        self.unscanned_installed(name);
+                        self.gap(
+                            format!(
+                                "module `{name}` is not scanned; an `included` hook could declare permissions"
+                            ),
+                            at,
+                        );
+                    }
                 },
-                MixinArg::Dynamic(what) => self.gap(what.clone(), at),
+                MixinArg::Dynamic(what) => {
+                    self.ancestry_unknown = true;
+                    self.gap(what.clone(), at);
+                }
             }
         }
     }
@@ -1094,6 +1155,10 @@ impl State<'_, '_> {
             }
             return;
         }
+        // An unexpanded include may already have installed this module, in
+        // which case this include is a no-op. Both outcomes stay open: the
+        // replay is applied, then a gap follows it.
+        let maybe_noop = self.may_be_installed(name);
         stack.push(name.to_string());
         // Concern dependencies first, then the `included` block. An own
         // `append_features` replaces the code that installs both.
@@ -1108,6 +1173,7 @@ impl State<'_, '_> {
             }
         }
         if let Some((_, hook_at)) = replaced {
+            self.ancestry_unknown = true;
             let def = self.source(hook_at);
             self.gap(
                 format!(
@@ -1121,6 +1187,7 @@ impl State<'_, '_> {
             // block; written before `included do`, it also keeps the block
             // from being stored. Neither is read: one gap stands for both.
             self.installed.insert(name.to_string());
+            self.ancestry_unknown = true;
             let def = self.source(hook_at);
             self.gap(
                 format!(
@@ -1134,6 +1201,7 @@ impl State<'_, '_> {
             // `ActiveSupport::Concern#included`; without `extend
             // ActiveSupport::Concern` the call reaches some other `included`.
             self.installed.insert(name.to_string());
+            self.ancestry_unknown = true;
             self.gap(
                 format!(
                     "module `{name}` has an `included do` block but does not `extend ActiveSupport::Concern`; whether the block runs is not known"
@@ -1151,7 +1219,135 @@ impl State<'_, '_> {
                 }
             }
         }
+        if maybe_noop {
+            self.gap(
+                format!(
+                    "this include of `{name}` may be a no-op: something the scan could not expand may already have included it"
+                ),
+                at,
+            );
+        }
         stack.pop();
+    }
+
+    /// An unscanned module was included. One in a namespace the scan defines
+    /// nothing under is library code; anything else may be application code
+    /// and may install any module.
+    fn unscanned_installed(&mut self, path: &str) {
+        if self.is_application_namespace(path) {
+            self.ancestry_unknown = true;
+        } else {
+            self.library_ancestry_unknown = true;
+        }
+    }
+
+    /// Whether the outermost segment of `path` names a class or module that
+    /// the scan defines, or a namespace one of them lives under.
+    fn is_application_namespace(&self, path: &str) -> bool {
+        let first = path
+            .trim_start_matches("::")
+            .split("::")
+            .next()
+            .unwrap_or("");
+        self.lowerer
+            .classes
+            .keys()
+            .any(|name| name.split("::").next() == Some(first))
+    }
+
+    fn mark_possibly_installed(&mut self, modules: &[String]) {
+        if modules.is_empty() {
+            self.ancestry_unknown = true;
+        } else {
+            self.possibly_installed.extend(modules.iter().cloned());
+        }
+    }
+
+    /// Whether `name` (fully qualified) may already be an ancestor although
+    /// the scan did not see it installed.
+    fn may_be_installed(&self, name: &str) -> bool {
+        if self.ancestry_unknown
+            || (self.library_ancestry_unknown && !self.is_application_namespace(name))
+        {
+            return true;
+        }
+        let written_as = |path: &String| {
+            let path = path.trim_start_matches("::");
+            name == path || name.ends_with(&format!("::{path}"))
+        };
+        if self.possibly_installed.iter().any(written_as) {
+            return true;
+        }
+        self.root_unparsed.iter().any(|&file| {
+            self.lowerer.files.get(file).is_some_and(|parsed| {
+                name.split("::")
+                    .all(|segment| mentions_word(&parsed.src, segment))
+            })
+        })
+    }
+
+    /// Record what the root contract puts into the ancestry, without applying
+    /// its declarations (they are excluded, `base_contract.rb:203-205`): a
+    /// module the root includes is already an ancestor of every subclass.
+    fn seed_root_ancestry(&mut self, name: &str) {
+        let Some(entry) = self.lowerer.classes.get(name) else {
+            return;
+        };
+        for event in &entry.events {
+            match event {
+                ContractEvent::Include { mixin, .. } => self.seed_mixin(&entry.mixins[*mixin]),
+                ContractEvent::MaybeInstall { modules, .. } => {
+                    self.mark_possibly_installed(modules);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn seed_mixin(&mut self, mixin: &Mixin) {
+        for arg in &mixin.names {
+            match arg {
+                MixinArg::Const { path, absolute } => {
+                    match self.lowerer.resolve_arg(&mixin.ns, path, *absolute) {
+                        Some(found) => self.seed_module(&found),
+                        None => self.unscanned_installed(path),
+                    }
+                }
+                MixinArg::Dynamic(_) => self.ancestry_unknown = true,
+            }
+        }
+    }
+
+    fn seed_module(&mut self, name: &str) {
+        if !self.installed.insert(name.to_string()) {
+            return;
+        }
+        let Some(entry) = self.lowerer.classes.get(name) else {
+            return;
+        };
+        if !entry.include_hooks.is_empty() {
+            self.ancestry_unknown = true;
+        }
+        for event in &entry.events {
+            match event {
+                ContractEvent::Include { mixin, .. } => self.seed_mixin(&entry.mixins[*mixin]),
+                ContractEvent::MaybeInstall { modules, .. } => {
+                    self.mark_possibly_installed(modules);
+                }
+                _ => {}
+            }
+        }
+        for event in &entry.included_events {
+            match event {
+                ContractEvent::IncludeInIncluder { mixin, .. } => {
+                    self.seed_mixin(&entry.included_mixins[*mixin]);
+                }
+                ContractEvent::MaybeInstall { modules, .. } => {
+                    self.mark_possibly_installed(modules);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1162,6 +1358,7 @@ fn resolve_class(lowerer: &Lowerer<'_>, class: &str, unparsed: &[usize]) -> Cont
     let mut seen: HashSet<String> = HashSet::from([class.to_string()]);
     let mut unscanned: Option<(String, String)> = None;
     let mut current = class.to_string();
+    let mut scanned_root = false;
     while let Some(entry) = lowerer.classes.get(&current) {
         if let Some(text) = &entry.dynamic_superclass {
             unscanned = Some((
@@ -1174,7 +1371,10 @@ fn resolve_class(lowerer: &Lowerer<'_>, class: &str, unparsed: &[usize]) -> Cont
             break;
         };
         match lowerer.resolve(&ns, &sup) {
-            Some(found) if found == ROOT_CONTRACT => break,
+            Some(found) if found == ROOT_CONTRACT => {
+                scanned_root = true;
+                break;
+            }
             Some(found) => {
                 if !seen.insert(found.clone()) {
                     break;
@@ -1206,6 +1406,10 @@ fn resolve_class(lowerer: &Lowerer<'_>, class: &str, unparsed: &[usize]) -> Cont
         },
         order: 0,
         installed: HashSet::new(),
+        possibly_installed: Vec::new(),
+        ancestry_unknown: false,
+        library_ancestry_unknown: false,
+        root_unparsed: Vec::new(),
         spellings: BTreeMap::new(),
         touched: chain.iter().cloned().collect(),
     };
@@ -1218,6 +1422,21 @@ fn resolve_class(lowerer: &Lowerer<'_>, class: &str, unparsed: &[usize]) -> Cont
             line: 0,
         };
         state.gap(reason, &at);
+    }
+    // The root's own ancestry. An unscanned root is assumed to install
+    // nothing a subclass includes again, as its declarations are excluded.
+    if scanned_root {
+        state.seed_root_ancestry(ROOT_CONTRACT);
+        state.root_unparsed = unparsed
+            .iter()
+            .copied()
+            .filter(|&file| {
+                lowerer
+                    .files
+                    .get(file)
+                    .is_some_and(|parsed| parsed.src.contains(&format!("class {ROOT_CONTRACT}")))
+            })
+            .collect();
     }
     // Root-most first, so a subclass key overwrites: `reverse_merge!` semantics.
     for name in chain.iter().rev() {
@@ -2010,6 +2229,96 @@ mod tests {
         let all = scan("idem_hook", &[("h.rb", hooked), ("c.rb", src)]);
         let reason = unresolved(class(&all, "C"), "a");
         assert!(reason.contains("runs again"), "{reason}");
+    }
+
+    #[test]
+    fn an_include_after_an_unexpanded_include_of_the_same_module_stays_open() {
+        // The final include is a no-op when `flag?` is true (`:mine` wins)
+        // and replays the block when it is false (`:mixin` wins).
+        let src = "class C < BaseContract\n  include Extra if flag?\n  attribute :a, permission: :mine\n  include Extra\nend\n";
+        let all = scan("maybe_same", &[("m.rb", CONCERN_EXTRA), ("c.rb", src)]);
+        let reason = unresolved(class(&all, "C"), "a");
+        assert!(reason.contains("may be a no-op"), "{reason}");
+        // A dynamic include may have installed any module.
+        let src = "class C < BaseContract\n  include mods.first\n  attribute :a, permission: :mine\n  include Extra\nend\n";
+        let all = scan("maybe_dyn", &[("m.rb", CONCERN_EXTRA), ("c.rb", src)]);
+        assert!(unresolved(class(&all, "C"), "a").contains("may be a no-op"));
+    }
+
+    #[test]
+    fn an_unexpanded_include_of_a_different_module_does_not_open_a_later_include() {
+        let other = "module Other\n  extend ActiveSupport::Concern\nend\n";
+        let src = "class C < BaseContract\n  include Other if flag?\n  attribute :a, permission: :mine\n  include Extra\nend\n";
+        let all = scan(
+            "maybe_other",
+            &[("m.rb", CONCERN_EXTRA), ("o.rb", other), ("c.rb", src)],
+        );
+        let c = class(&all, "C");
+        assert_eq!(explicit(c, "a").value, any_of(&["mixin"]));
+        assert!(
+            c.gaps.iter().all(|g| !g.reason.contains("may be a no-op")),
+            "{:?}",
+            c.gaps
+        );
+    }
+
+    #[test]
+    fn a_module_the_scanned_root_includes_is_not_installed_again() {
+        let root = "class BaseContract\n  include Extra\nend\n";
+        let src =
+            "class C < BaseContract\n  attribute :a, permission: :mine\n  include Extra\nend\n";
+        let all = scan(
+            "root_seed",
+            &[("m.rb", CONCERN_EXTRA), ("b.rb", root), ("c.rb", src)],
+        );
+        let c = class(&all, "C");
+        assert!(c.gaps.is_empty(), "{:?}", c.gaps);
+        assert_eq!(explicit(c, "a").value, any_of(&["mine"]));
+        // Without the root's include, the block replays and wins.
+        let root = "class BaseContract\nend\n";
+        let all = scan(
+            "root_seed_none",
+            &[("m.rb", CONCERN_EXTRA), ("b.rb", root), ("c.rb", src)],
+        );
+        assert_eq!(explicit(class(&all, "C"), "a").value, any_of(&["mixin"]));
+    }
+
+    #[test]
+    fn an_unparsed_root_naming_a_module_keeps_its_later_include_open() {
+        // Ruby 3.2 anonymous argument forwarding: the parser reports an error.
+        let src =
+            "class C < BaseContract\n  attribute :a, permission: :mine\n  include Extra\nend\n";
+        let naming =
+            "class BaseContract\n  # include Extra\n  def validate(*)\n    valid?(*)\n  end\nend\n";
+        let all = scan(
+            "root_unparsed_naming",
+            &[("m.rb", CONCERN_EXTRA), ("b.rb", naming), ("c.rb", src)],
+        );
+        assert!(unresolved(class(&all, "C"), "a").contains("may be a no-op"));
+        let silent = "class BaseContract\n  def validate(*)\n    valid?(*)\n  end\nend\n";
+        let all = scan(
+            "root_unparsed_silent",
+            &[("m.rb", CONCERN_EXTRA), ("b.rb", silent), ("c.rb", src)],
+        );
+        assert_eq!(explicit(class(&all, "C"), "a").value, any_of(&["mixin"]));
+    }
+
+    #[test]
+    fn an_unscanned_library_module_cannot_install_an_application_module() {
+        // `ActiveModel` is defined nowhere in the scan: library code.
+        let root = "class BaseContract\n  include ActiveModel::Validations\nend\n";
+        let src =
+            "class C < BaseContract\n  attribute :a, permission: :mine\n  include Extra\nend\n";
+        let all = scan(
+            "lib_root",
+            &[("m.rb", CONCERN_EXTRA), ("b.rb", root), ("c.rb", src)],
+        );
+        assert_eq!(explicit(class(&all, "C"), "a").value, any_of(&["mixin"]));
+        // An unscanned module in an application namespace may be anything.
+        let app = "module Extra\n  extend ActiveSupport::Concern\n  included do\n    attribute :a, permission: :mixin\n  end\nend\nmodule Shared\nend\n";
+        let root = "class BaseContract\n  include Shared::Missing\nend\n";
+        let all = scan("app_root", &[("m.rb", app), ("b.rb", root), ("c.rb", src)]);
+        assert!(unresolved(class(&all, "C"), "a").contains("may be a no-op"));
     }
 
     #[test]
