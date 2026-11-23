@@ -234,7 +234,7 @@ fn walk_block(blk: &lib_ruby_parser::nodes::Block, src: Option<&str>, out: &mut 
         "with_options" => {
             walk_with_options(blk, s, src, &WrapperOptions::top(), &mut |g| match g {
                 Grouped::Stmt(_, d) | Grouped::Wrapper(d) => out.extend(d),
-            })
+            });
         }
         other => {
             // Generic block: route the call as if it were a bare Send,
@@ -368,19 +368,28 @@ impl WrapperOptions {
     /// The declarations of one statement under the wrapper, with its options
     /// applied.
     pub(crate) fn statement(&self, stmt: &Node, src: Option<&str>) -> Vec<Declaration> {
-        let mut inner = Vec::new();
-        match (stmt, &self.0) {
-            (Node::Send(s), Some(w))
-                if s.recv.is_none() && validates_helper_kind(&s.method_name).is_some() =>
-            {
-                emit_validates_helper(&s.method_name, &s.args, w, &mut inner);
-            }
-            _ => {
-                walk_statement(stmt, src, &mut inner);
-                self.apply(&mut inner);
-            }
+        if let Some(decls) = self.helper_statement(stmt) {
+            return decls;
         }
+        let mut inner = Vec::new();
+        walk_statement(stmt, src, &mut inner);
+        self.apply(&mut inner);
         inner
+    }
+
+    /// A `validates_*_of` helper call, which takes the options before its own
+    /// are split into shared and validator-specific keys. `None` for any other
+    /// statement, and when the options are not statically known.
+    pub(crate) fn helper_statement(&self, stmt: &Node) -> Option<Vec<Declaration>> {
+        let (Node::Send(s), Some(w)) = (stmt, &self.0) else {
+            return None;
+        };
+        if s.recv.is_some() || validates_helper_kind(&s.method_name).is_none() {
+            return None;
+        }
+        let mut inner = Vec::new();
+        emit_validates_helper(&s.method_name, &s.args, w, &mut inner);
+        Some(inner)
     }
 
     /// Apply the options to declarations already read from a statement.

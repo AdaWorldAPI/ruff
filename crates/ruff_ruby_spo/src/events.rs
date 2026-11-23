@@ -1912,13 +1912,10 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
         // Under a `with_options` wrapper the class walk would have merged the
         // wrapper's options into this statement, so merge them here too.
         if let Some(wrap) = scan.wrap {
-            found = match leaf {
-                Node::Send(_) => wrap.statement(leaf, scan.src),
-                _ => {
-                    wrap.apply(&mut found);
-                    found
-                }
-            };
+            found = wrap.helper_statement(leaf).unwrap_or_else(|| {
+                wrap.apply(&mut found);
+                found
+            });
         }
     }
     if let Some(p) = scan.param {
@@ -4379,6 +4376,15 @@ end");
             "{direct:?}"
         );
         assert_eq!(opts("name"), Some(direct));
+    }
+
+    #[test]
+    fn a_reflective_send_in_with_options_is_listed_not_dropped() {
+        let cbs = callbacks(&hidden_decls(
+            "      with_options({}) do\n        after_save :known\n        send(:before_save, :audit)\n      end",
+        ));
+        let targets: Vec<&str> = cbs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(targets, ["known", "audit"]);
     }
 
     #[test]
