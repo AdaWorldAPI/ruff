@@ -4940,6 +4940,8 @@ end
   klass = self
   Installer.call(klass)
   Installer.call(other)
+  klass = self if again
+  Installer.call(klass)
  end
  def replaced
   klass = self
@@ -4960,7 +4962,7 @@ end
                 .filter(|s| *s == "delegate")
                 .count()
         };
-        assert_eq!(delegates("kept"), 3);
+        assert_eq!(delegates("kept"), 4);
         assert_eq!(delegates("replaced"), 1);
         assert_eq!(delegates("branch"), 0);
     }
