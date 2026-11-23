@@ -396,17 +396,38 @@ fn occurrences_that_interleave_make_the_answer_unknown() {
     // A repeated name is not ambiguous while all its occurrences are on one side.
     assert_eq!(ask(&["a", "a", "b"]), Relation::Before);
     assert_eq!(ask(&["b", "a", "a"]), Relation::After);
-    // An `UNREAD` row is not an event: a name in it does not count as an
-    // occurrence. Read as an event it would make `b` interleave with `a`.
-    let unread = "#version 2\n#schema scope\tseq\tlane\tkind\tsubject\tobject\tanchor\n\
-        S\t0\tUNREAD\tOTHER\tb\t-\t0\n\
-        S\t0\tDECL\tCallback\tbefore_save\ta\t1\n\
+    // `included do; before_save :a; before_save :b; if c; before_save :a; end; end`:
+    // the unread conditional may register `a` again after `b`, so the read
+    // declarations alone prove nothing about the run order.
+    let header = "#version 2\n#schema scope\tseq\tlane\tkind\tsubject\tobject\tanchor\n";
+    let decls = "S\t0\tDECL\tCallback\tbefore_save\ta\t1\n\
         S\t1\tDECL\tCallback\tbefore_save\tb\t2\n";
-    fs::write(out.path().join("shop.events.tsv"), unread).unwrap();
+    let ask_text = |text: String| {
+        fs::write(out.path().join("shop.events.tsv"), text).unwrap();
+        relation(out.path(), "shop", "S", "a", "b").unwrap()
+    };
+    assert_eq!(ask_text(format!("{header}{decls}")), Relation::Before);
     assert_eq!(
-        relation(out.path(), "shop", "S", "a", "b").unwrap(),
+        ask_text(format!(
+            "{header}{decls}S\t0\tUNREAD\tCONTROL_FLOW\tincluded:1\t-\t3\n"
+        )),
+        Relation::Unknown
+    );
+    // An unread statement in another scope does not touch this one.
+    assert_eq!(
+        ask_text(format!(
+            "{header}{decls}T\t0\tUNREAD\tCONTROL_FLOW\tincluded:1\t-\t3\n"
+        )),
         Relation::Before
     );
+    // A v1 file is refused, never read with v2 assumptions.
+    fs::write(
+        out.path().join("shop.events.tsv"),
+        format!("#version 1\n{}{decls}", &header["#version 2\n".len()..]),
+    )
+    .unwrap();
+    let err = relation(out.path(), "shop", "S", "a", "b").unwrap_err();
+    assert!(err.to_string().contains("#version 2"), "{err}");
 }
 
 #[test]

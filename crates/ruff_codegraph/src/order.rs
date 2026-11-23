@@ -33,7 +33,10 @@ impl Relation {
 /// A name matches an event when it equals the event's subject or object cell.
 /// The answer is `Unknown` when the receipt says the order lane was not
 /// written, when either name matches no event of the scope, when the two names
-/// are the same, and when the occurrences interleave. The structural rows are
+/// are the same, when the occurrences interleave, and when the scope has any
+/// `UNREAD` row: a statement that was not read (a conditional, a dynamic
+/// send, a dropped block body) may register a callback again and move it, so
+/// no order inside that scope is proven. The structural rows are
 /// never consulted: they hold no order, so a guess from them would be a guess.
 ///
 /// # Errors
@@ -76,14 +79,19 @@ pub fn relation(
     }
     let (mut at_a, mut at_b) = (Vec::new(), Vec::new());
     let mut position = 0usize;
+    let mut unread = false;
     for (i, line) in lines.enumerate() {
         let cells: Vec<&str> = line.split('\t').collect();
         let [row_scope, _seq, lane, _kind, subject, object, _anchor] = cells[..] else {
             return Err(bad(format!("line {}: expected 7 cells", i + 3)));
         };
-        // `UNREAD` rows record statements that were not read, not events
-        // with a position in the run order.
-        if row_scope != scope || lane == "UNREAD" {
+        if row_scope != scope {
+            continue;
+        }
+        // An `UNREAD` row is not an event with a run position, but it voids
+        // every order answer for its scope.
+        if lane == "UNREAD" {
+            unread = true;
             continue;
         }
         if subject == a || object == a {
@@ -93,6 +101,9 @@ pub fn relation(
             at_b.push(position);
         }
         position += 1;
+    }
+    if unread {
+        return Ok(Relation::Unknown);
     }
     let (Some(&first_a), Some(&last_a), Some(&first_b), Some(&last_b)) =
         (at_a.first(), at_a.last(), at_b.first(), at_b.last())
