@@ -1942,9 +1942,24 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
     });
     if with_options {
         if let Some(body) = block.and_then(|b| b.body.as_deref()) {
-            let mut inner = Branches::default();
-            collect_registering(body, scan, &mut inner);
-            out.unread.extend(inner.unread);
+            // The wrapper's direct children came back above, with the
+            // inherited options merged in. Control flow nested in the body is
+            // not part of that walk, so what its branches could register is
+            // taken from the recursive read; a leaf's declarations are not,
+            // or they would be listed twice.
+            let statements: Vec<&Node> = match body {
+                Node::Begin(b) => b.statements.iter().collect(),
+                Node::KwBegin(b) => b.statements.iter().collect(),
+                single => vec![single],
+            };
+            for st in statements {
+                let mut inner = Branches::default();
+                collect_registering(st, scan, &mut inner);
+                if is_branching(st) {
+                    out.decls.extend(inner.decls);
+                }
+                out.unread.extend(inner.unread);
+            }
         }
         return;
     }
@@ -1955,6 +1970,33 @@ fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
         // block is a DSL body that was not read.
         unread(HiddenUnreadReason::UnreadBlockBody);
     }
+}
+
+/// Whether `collect_registering` walks into `node`'s branches rather than
+/// reading it as a leaf statement.
+fn is_branching(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::If(_)
+            | Node::IfMod(_)
+            | Node::IfTernary(_)
+            | Node::Case(_)
+            | Node::When(_)
+            | Node::CaseMatch(_)
+            | Node::InPattern(_)
+            | Node::Rescue(_)
+            | Node::RescueBody(_)
+            | Node::Ensure(_)
+            | Node::While(_)
+            | Node::WhilePost(_)
+            | Node::Until(_)
+            | Node::UntilPost(_)
+            | Node::For(_)
+            | Node::And(_)
+            | Node::Or(_)
+            | Node::Begin(_)
+            | Node::KwBegin(_)
+    )
 }
 
 /// The body of `class_eval do ... end` / `self.class_eval do ... end` (also
@@ -4188,6 +4230,33 @@ end");
                 "    if a\n      with_options dependent: :destroy do\n        has_many :x\n        unknown_call\n      end\n    end"
             ),
             (false, vec![HiddenUnreadReason::UnrecognizedCall])
+        );
+    }
+
+    #[test]
+    fn with_options_keeps_registrations_from_its_nested_conditionals() {
+        // The wrapper's direct child and the callback in a conditional nested
+        // in its body are both listed, each once.
+        let src = "module H\n  extend ActiveSupport::Concern\n  included do\n    if a\n      with_options dependent: :destroy do\n        has_many :items\n        if inner\n          after_save :audit\n        end\n      end\n    end\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let u = &by_name(&cs, "H").unharvested;
+        assert_eq!(u.len(), 1);
+        assert!(u[0].hidden_complete());
+        let names: Vec<String> = u[0]
+            .hidden
+            .iter()
+            .map(|e| format!("{:?}", e.decl))
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| n.contains("items")).count(),
+            1,
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| n.contains("audit")).count(),
+            1,
+            "{names:?}"
         );
     }
 
