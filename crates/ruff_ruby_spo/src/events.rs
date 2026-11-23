@@ -493,6 +493,73 @@ pub struct Unharvested {
     /// so a consumer can tell which callbacks a skipped branch could add or
     /// re-register. Empty for every other reason.
     pub hidden: Vec<RailsEvent>,
+    /// For [`UnharvestedReason::ControlFlow`]: every statement inside the
+    /// skipped branches that was neither listed in [`Self::hidden`] nor one
+    /// ruff positively knows cannot register anything, in source order, each
+    /// with its anchor. Empty for every other reason; see
+    /// [`Self::hidden_complete`].
+    pub hidden_unread: Vec<HiddenUnread>,
+}
+
+impl Unharvested {
+    /// Whether [`Self::hidden`] is the whole of what the skipped branches could
+    /// register: `true` only for [`UnharvestedReason::ControlFlow`] whose every
+    /// branch statement was either a declaration listed in `hidden` or a
+    /// statement ruff positively knows registers nothing (a literal, a local
+    /// assignment of a literal, `return` / `next` / `break` of literals, a
+    /// local read). A condition, a `case` subject or a `when` pattern is an
+    /// expression, not a branch statement, and is not read. Any other reason is
+    /// `false`: its statement was not read as a branch at all.
+    #[must_use]
+    pub fn hidden_complete(&self) -> bool {
+        self.reason == UnharvestedReason::ControlFlow && self.hidden_unread.is_empty()
+    }
+}
+
+/// A statement inside a skipped branch that was not read in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HiddenUnread {
+    /// Byte offset of the statement.
+    pub anchor: u32,
+    pub reason: HiddenUnreadReason,
+}
+
+/// Why a statement in a skipped branch is not known to register nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenUnreadReason {
+    /// A call on the class (or hook parameter) whose name is not recognised.
+    UnrecognizedCall,
+    /// `send(expr, ...)` whose method name is not a literal.
+    DynamicSend,
+    /// A call on a receiver other than the class or hook parameter.
+    CallOnOtherReceiver,
+    /// A block whose body was not read (`foo do ... end`, `has_many :x do ...
+    /// end`, a `with_options`-less DSL block).
+    UnreadBlockBody,
+    /// A `def` / `def self.x`.
+    MethodDefinition,
+    /// A recognised declaration that is not listed in `hidden`: an `extend`, an
+    /// attribute, a scope, a delegation, an unpromoted `DslCall`. It may still
+    /// hook in (`extend` runs `extended`), so it is not known to be inert.
+    NonRegisteringDeclaration,
+    /// Any other statement shape.
+    Other,
+}
+
+impl HiddenUnreadReason {
+    /// A stable spelling for serialized output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnrecognizedCall => "UNRECOGNIZED_CALL",
+            Self::DynamicSend => "DYNAMIC_SEND",
+            Self::CallOnOtherReceiver => "CALL_ON_OTHER_RECEIVER",
+            Self::UnreadBlockBody => "UNREAD_BLOCK_BODY",
+            Self::MethodDefinition => "METHOD_DEFINITION",
+            Self::NonRegisteringDeclaration => "NON_REGISTERING_DECLARATION",
+            Self::Other => "OTHER",
+        }
+    }
 }
 
 /// Why an include-time statement produced no declaration.
@@ -1657,6 +1724,7 @@ fn record_unread(
             origin: origin.clone(),
             reason: UnharvestedReason::UnreadBlockBody,
             hidden: Vec::new(),
+            hidden_unread: Vec::new(),
         });
     }
 }
@@ -1692,19 +1760,18 @@ fn unharvested_in(stmt: &Node, scan: Scan<'_>, origin: &DeclOrigin) -> Unharvest
     let anchor = u32::try_from(stmt.expression().begin).unwrap_or(0);
     let reason = unharvested_reason(stmt, scan);
     let mut hidden = Vec::new();
+    let mut hidden_unread = Vec::new();
     if reason == UnharvestedReason::ControlFlow {
-        push_decls(
-            registering_declarations(stmt, scan),
-            anchor,
-            origin,
-            &mut hidden,
-        );
+        let read = read_branches(stmt, scan);
+        push_decls(read.decls, anchor, origin, &mut hidden);
+        hidden_unread = read.unread;
     }
     Unharvested {
         anchor,
         origin: origin.clone(),
         reason,
         hidden,
+        hidden_unread,
     }
 }
 
@@ -1732,7 +1799,7 @@ fn unharvested_reason(stmt: &Node, scan: Scan<'_>) -> UnharvestedReason {
         | Node::Rescue(_)
         | Node::Ensure(_)
         | Node::KwBegin(_) => {
-            return if registering_declarations(stmt, scan).is_empty() {
+            return if read_branches(stmt, scan).decls.is_empty() {
                 UnharvestedReason::ControlFlowWithoutDeclaration
             } else {
                 UnharvestedReason::ControlFlow
@@ -1780,10 +1847,114 @@ fn unharvested_reason(stmt: &Node, scan: Scan<'_>) -> UnharvestedReason {
 /// [`Bare::OnOtherReceiver`] only calls on `param` count. A `class_eval`
 /// block on the class (on `param`, or bare when bare calls are the class's)
 /// is a class body, read with its own conditions descended into.
-fn registering_declarations(node: &Node, scan: Scan<'_>) -> Vec<Declaration> {
-    let mut out = Vec::new();
+fn read_branches(node: &Node, scan: Scan<'_>) -> Branches {
+    let mut out = Branches::default();
     collect_registering(node, scan, &mut out);
     out
+}
+
+/// What reading the branches of a control-flow statement found: the
+/// declarations that can register a callback, and the statements that are
+/// neither those nor known to register nothing.
+#[derive(Default)]
+struct Branches {
+    decls: Vec<Declaration>,
+    unread: Vec<HiddenUnread>,
+}
+
+/// A statement that cannot register anything: a scalar literal, a local read,
+/// a local assignment of one, or `return` / `next` / `break` of such values.
+fn is_inert_statement(node: &Node) -> bool {
+    match node {
+        Node::Lvasgn(a) => a.value.as_deref().is_some_and(is_inert_value),
+        Node::Return(r) => r.args.iter().all(is_inert_value),
+        Node::Next(r) => r.args.iter().all(is_inert_value),
+        Node::Break(r) => r.args.iter().all(is_inert_value),
+        other => is_inert_value(other),
+    }
+}
+
+fn is_inert_value(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Int(_)
+            | Node::Float(_)
+            | Node::Rational(_)
+            | Node::Complex(_)
+            | Node::Str(_)
+            | Node::Sym(_)
+            | Node::True(_)
+            | Node::False(_)
+            | Node::Nil(_)
+            | Node::Self_(_)
+            | Node::Lvar(_)
+    )
+}
+
+/// The leaf of a skipped branch: record what it registers, and whether it was
+/// read in full.
+fn read_branch_leaf(leaf: &Node, scan: Scan<'_>, out: &mut Branches) {
+    if is_inert_statement(leaf) {
+        return;
+    }
+    let at = anchor(leaf);
+    let mut found = Vec::new();
+    if scan.bare == Bare::OnClass {
+        read_class_statement(leaf, scan.src, &mut found);
+    }
+    if let Some(p) = scan.param {
+        crate::walk::walk_hook_statement(p, leaf, scan.src, &mut found);
+    }
+    let (registering, other): (Vec<Declaration>, Vec<Declaration>) =
+        found.into_iter().partition(can_register_a_callback);
+    let deferred_body_only = !registering.is_empty()
+        && registering
+            .iter()
+            .all(|d| matches!(d, Declaration::Callback(_) | Declaration::Validation(_)));
+    // An unrecognised bare call is kept as an unpromoted `DslCall` fallback:
+    // that is "not recognised", not a recognised non-registering declaration.
+    let all_found_empty =
+        registering.is_empty() && other.iter().all(|d| matches!(d, Declaration::DslCall(_)));
+    out.decls.extend(registering);
+    let mut unread = |reason| out.unread.push(HiddenUnread { anchor: at, reason });
+    let block = match leaf {
+        Node::Block(b) => Some(b),
+        _ => None,
+    };
+    if all_found_empty {
+        unread(if block.is_some() {
+            HiddenUnreadReason::UnreadBlockBody
+        } else {
+            match unharvested_reason(leaf, scan) {
+                UnharvestedReason::MethodDefinition => HiddenUnreadReason::MethodDefinition,
+                UnharvestedReason::CallOnOtherReceiver => HiddenUnreadReason::CallOnOtherReceiver,
+                UnharvestedReason::UnrecognizedCall => HiddenUnreadReason::UnrecognizedCall,
+                UnharvestedReason::DynamicSend => HiddenUnreadReason::DynamicSend,
+                _ => HiddenUnreadReason::Other,
+            }
+        });
+        return;
+    }
+    // `with_options ... do ... end` yields a wrapper call plus its body's
+    // declarations; its body is read statement by statement below instead.
+    let with_options = block.is_some_and(|b| {
+        matches!(&*b.call, Node::Send(s) if s.recv.is_none() && s.method_name == "with_options")
+    });
+    if with_options {
+        if let Some(body) = block.and_then(|b| b.body.as_deref()) {
+            let mut inner = Branches::default();
+            collect_registering(body, scan, &mut inner);
+            out.unread.extend(inner.unread);
+        }
+        return;
+    }
+    if !other.is_empty() {
+        unread(HiddenUnreadReason::NonRegisteringDeclaration);
+    } else if block.is_some_and(|b| b.body.is_some()) && !deferred_body_only {
+        // A callback or validation block is code that runs later; any other
+        // block is a DSL body that was not read.
+        unread(HiddenUnreadReason::UnreadBlockBody);
+    }
 }
 
 /// The body of `class_eval do ... end` / `self.class_eval do ... end` (also
@@ -1802,8 +1973,8 @@ fn own_class_eval_body(node: &Node) -> Option<&Node> {
     }
 }
 
-fn collect_registering(node: &Node, scan: Scan<'_>, out: &mut Vec<Declaration>) {
-    let opt = |n: Option<&Node>, out: &mut Vec<Declaration>| {
+fn collect_registering(node: &Node, scan: Scan<'_>, out: &mut Branches) {
+    let opt = |n: Option<&Node>, out: &mut Branches| {
         if let Some(n) = n {
             collect_registering(n, scan, out);
         }
@@ -1892,14 +2063,7 @@ fn collect_registering(node: &Node, scan: Scan<'_>, out: &mut Vec<Declaration>) 
                 collect_registering(body, inner, out);
                 return;
             }
-            let mut found = Vec::new();
-            if scan.bare == Bare::OnClass {
-                read_class_statement(leaf, scan.src, &mut found);
-            }
-            if let Some(p) = scan.param {
-                crate::walk::walk_hook_statement(p, leaf, scan.src, &mut found);
-            }
-            out.extend(found.into_iter().filter(can_register_a_callback));
+            read_branch_leaf(leaf, scan, out);
         }
     }
 }
@@ -3858,6 +4022,207 @@ end");
             .collect();
         assert_eq!(hidden, ["assoc:a", "before_save:b"]);
         assert!(u[1].hidden.is_empty() && u[2].hidden.is_empty());
+    }
+
+    /// `(reason, complete, unread reasons)` of every unharvested statement of
+    /// the module `P` whose `included do` body is `body`.
+    fn completeness(body: &str) -> Vec<(UnharvestedReason, bool, Vec<HiddenUnreadReason>)> {
+        let src = format!(
+            "module P\n  extend ActiveSupport::Concern\n  included do\n{body}\n  end\nend\n"
+        );
+        let (cs, _) = ore(&src);
+        by_name(&cs, "P")
+            .unharvested
+            .iter()
+            .map(|u| {
+                (
+                    u.reason,
+                    u.hidden_complete(),
+                    u.hidden_unread.iter().map(|h| h.reason).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn one(body: &str) -> (bool, Vec<HiddenUnreadReason>) {
+        let v = completeness(body);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].0, UnharvestedReason::ControlFlow, "{v:?}");
+        (v[0].1, v[0].2.clone())
+    }
+
+    #[test]
+    fn a_branch_of_recognised_declarations_is_complete() {
+        assert_eq!(
+            one("    if cond\n      after_save :a\n      has_many :b\n    end"),
+            (true, vec![])
+        );
+        // A literal send names the call it routes to, so it is read.
+        assert_eq!(
+            one("    if cond\n      after_save :a\n      send(:before_save, :b)\n    end"),
+            (true, vec![])
+        );
+    }
+
+    #[test]
+    fn provably_inert_statements_do_not_make_a_branch_incomplete() {
+        assert_eq!(
+            one("    if cond\n      after_save :a\n      x = 1\n      :sym\n      return\n    end"),
+            (true, vec![])
+        );
+        assert_eq!(
+            one("    unless cond\n      before_save :a\n    else\n      y = \"s\"\n    end"),
+            (true, vec![])
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_statement_makes_a_branch_incomplete() {
+        assert_eq!(
+            one("    if cond\n      after_save :a\n      some_macro :x\n    end"),
+            (false, vec![HiddenUnreadReason::UnrecognizedCall])
+        );
+        assert_eq!(
+            one("    if cond\n      after_save :a\n      send(name, :b)\n    end"),
+            (false, vec![HiddenUnreadReason::DynamicSend])
+        );
+        assert_eq!(
+            one("    if cond\n      after_save :a\n      Other.register :x\n    end"),
+            (false, vec![HiddenUnreadReason::CallOnOtherReceiver])
+        );
+        assert_eq!(
+            one("    if cond\n      after_save :a\n      def helper; end\n    end"),
+            (false, vec![HiddenUnreadReason::MethodDefinition])
+        );
+        // Not a literal assignment: the right-hand side is a call.
+        assert_eq!(
+            one("    if cond\n      after_save :a\n      x = build\n    end"),
+            (false, vec![HiddenUnreadReason::Other])
+        );
+    }
+
+    #[test]
+    fn a_recognised_declaration_that_is_not_listed_makes_a_branch_incomplete() {
+        for stmt in ["extend Helpers", "attribute :x", "scope :s, -> { all }"] {
+            assert_eq!(
+                one(&format!(
+                    "    if cond\n      after_save :a\n      {stmt}\n    end"
+                )),
+                (false, vec![HiddenUnreadReason::NonRegisteringDeclaration]),
+                "{stmt}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dsl_block_body_is_unread_but_a_callback_block_is_not() {
+        assert_eq!(
+            one(
+                "    if cond\n      after_save :a\n      some_dsl do\n        has_many :x\n      end\n    end"
+            ),
+            (false, vec![HiddenUnreadReason::UnreadBlockBody])
+        );
+        // A block-form `validate` is a registration whose body runs later.
+        assert_eq!(
+            one("    if cond\n      validate do\n        errors.add(:base)\n      end\n    end"),
+            (true, vec![])
+        );
+        // A block-form callback body runs later, like a validation's.
+        assert_eq!(
+            one(
+                "    if cond\n      after_save :a\n      after_save do\n        touch\n      end\n    end"
+            ),
+            (true, vec![])
+        );
+        // An association's extension block is a body that was not read.
+        assert_eq!(
+            one("    if cond\n      has_many :x do\n        def recent; end\n      end\n    end"),
+            (false, vec![HiddenUnreadReason::UnreadBlockBody])
+        );
+    }
+
+    #[test]
+    fn nested_control_flow_is_read_through() {
+        assert_eq!(
+            one("    if a\n      if b\n        after_save :x\n      end\n    end"),
+            (true, vec![])
+        );
+        assert_eq!(
+            one(
+                "    if a\n      if b\n        after_save :x\n        unknown_call\n      end\n    end"
+            ),
+            (false, vec![HiddenUnreadReason::UnrecognizedCall])
+        );
+    }
+
+    #[test]
+    fn unless_and_case_branches_are_read() {
+        assert_eq!(
+            one("    unless a\n      after_save :x\n    else\n      weird_call\n    end"),
+            (false, vec![HiddenUnreadReason::UnrecognizedCall])
+        );
+        assert_eq!(
+            one(
+                "    case mode\n    when :a\n      after_save :x\n    when :b\n      before_save :y\n    else\n      nil\n    end"
+            ),
+            (true, vec![])
+        );
+        assert_eq!(
+            one(
+                "    case mode\n    when :a\n      after_save :x\n    else\n      weird_call\n    end"
+            ),
+            (false, vec![HiddenUnreadReason::UnrecognizedCall])
+        );
+    }
+
+    #[test]
+    fn with_options_in_a_branch_is_read_statement_by_statement() {
+        assert_eq!(
+            one(
+                "    if a\n      with_options dependent: :destroy do\n        has_many :x\n      end\n    end"
+            ),
+            (true, vec![])
+        );
+        assert_eq!(
+            one(
+                "    if a\n      with_options dependent: :destroy do\n        has_many :x\n        unknown_call\n      end\n    end"
+            ),
+            (false, vec![HiddenUnreadReason::UnrecognizedCall])
+        );
+    }
+
+    #[test]
+    fn a_hook_conditional_reports_completeness_too() {
+        let src = "module H\n  def self.included(base)\n    base.class_eval do\n      if flag?\n        has_many :a\n      end\n    end\n    if base.respond_to?(:x)\n      base.before_save :b\n      base.helper :c\n    end\n  end\nend\n";
+        let (cs, _) = ore(src);
+        let u = &by_name(&cs, "H").unharvested;
+        assert_eq!(u.len(), 2);
+        assert!(u[0].hidden_complete());
+        assert!(!u[1].hidden_complete());
+        assert_eq!(u[1].hidden_unread.len(), 1);
+    }
+
+    #[test]
+    fn only_control_flow_reports_completeness() {
+        let v = completeness(
+            "    if flag?\n      return\n    end\n    def helper; end\n    send(name, :x)\n    some_dsl do\n      has_many :x\n    end\n    if cond\n      after_save :a\n    end",
+        );
+        let reasons: Vec<UnharvestedReason> = v.iter().map(|r| r.0).collect();
+        assert_eq!(
+            reasons,
+            [
+                UnharvestedReason::ControlFlowWithoutDeclaration,
+                UnharvestedReason::MethodDefinition,
+                UnharvestedReason::DynamicSend,
+                UnharvestedReason::UnreadBlockBody,
+                UnharvestedReason::ControlFlow,
+            ]
+        );
+        // Every reason but the last carries no completeness claim.
+        for r in &v[..4] {
+            assert!(!r.1 && r.2.is_empty(), "{r:?}");
+        }
+        assert!(v[4].1);
     }
 
     // ── macro bodies ────────────────────────────────────────────────────
